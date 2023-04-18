@@ -1,4 +1,13 @@
-from . import (
+from determined.cli._util import (
+    output_format_args,
+    make_pagination_args,
+    default_pagination_args,
+    setup_session,
+    require_feature_flag,
+    login_sdk_client,
+    print_warnings,
+)
+from determined.cli import (
     agent,
     checkpoint,
     cli,
@@ -7,6 +16,8 @@ from . import (
     master,
     model,
     notebook,
+    project,
+    rbac,
     remote,
     render,
     resources,
@@ -15,4 +26,5 @@ from . import (
     tensorboard,
     trial,
     user,
+    workspace,
 )

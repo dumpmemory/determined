@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -8,12 +9,12 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/determined-ai/determined/master/internal/db"
-	"github.com/determined-ai/determined/master/internal/sproto"
 	"github.com/determined-ai/determined/master/internal/telemetry"
+	"github.com/determined-ai/determined/master/internal/user"
+	"github.com/determined-ai/determined/master/internal/webhooks"
 	"github.com/determined-ai/determined/master/pkg/actor"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/master/pkg/schemas"
-	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 	"github.com/determined-ai/determined/master/pkg/searcher"
 )
 
@@ -26,9 +27,10 @@ const experimentSnapshotVersion = 5
 // trial workload sequencer, to the trial, and finally to the experiment. Any event that the
 // trial or trial workload sequencer processes that would trigger a change to the state of the
 // experiment is:
-//   1. Propagated atomically, within a single message, to ensure the experiment handles it all
-//      or nothing
-//   2. With a snapshot affixed to it, to mark that it should trigger a snapshot
+//  1. Propagated atomically, within a single message, to ensure the experiment handles it all
+//     or nothing
+//  2. With a snapshot affixed to it, to mark that it should trigger a snapshot
+//
 // Upon receipt, the experiment handles the event entirely, snapshots its state and saves it
 // along with all the snapshots it has received, atomically.
 //
@@ -53,37 +55,58 @@ const experimentSnapshotVersion = 5
 // the experiment snapshots them and re-sends them).
 func (m *Master) restoreExperiment(expModel *model.Experiment) error {
 	// Experiments which were trying to stop need to be marked as terminal in the database.
+	activeConfig, err := m.db.ActiveExperimentConfig(expModel.ID)
+	if err != nil {
+		return errors.Errorf("cannot restore experiment %d with unparsable config", expModel.ID)
+	}
 	if terminal, ok := model.StoppingToTerminalStates[expModel.State]; ok {
-		if err := m.db.TerminateExperimentInRestart(expModel.ID, terminal); err != nil {
+		if err = m.db.TerminateExperimentInRestart(expModel.ID, terminal); err != nil {
 			return errors.Wrapf(err, "terminating experiment %d", expModel.ID)
 		}
 		expModel.State = terminal
 		telemetry.ReportExperimentStateChanged(m.system, m.db, *expModel)
+		if err := webhooks.ReportExperimentStateChanged(
+			context.TODO(), *expModel, activeConfig,
+		); err != nil {
+			log.WithError(err).Error("failed to send experiment state change webhook in restore")
+		}
 		return nil
 	} else if _, ok := model.RunningStates[expModel.State]; !ok {
 		return errors.Errorf(
 			"cannot restore experiment %d from state %v", expModel.ID, expModel.State,
 		)
-	} else if err := expModel.Config.Searcher().AssertCurrent(); err != nil {
+	} else if err = activeConfig.Searcher().AssertCurrent(); err != nil {
 		return errors.Errorf(
 			"cannot restore experiment %d with legacy searcher", expModel.ID,
 		)
 	}
 
-	poolName, err := sproto.GetResourcePool(
+	poolName, err := m.rm.ResolveResourcePool(
 		m.system,
-		expModel.Config.Resources().ResourcePool(),
-		expModel.Config.Resources().SlotsPerTrial(),
-		false,
+		activeConfig.Resources().ResourcePool(),
+		activeConfig.Resources().SlotsPerTrial(),
 	)
 	if err != nil {
-		return errors.Wrap(err, "invalid resource configuration")
+		return fmt.Errorf("invalid resource configuration: %w", err)
 	}
-
-	taskContainerDefaults := m.getTaskContainerDefaults(poolName)
+	if err = m.rm.ValidateResources(
+		m.system,
+		poolName,
+		activeConfig.Resources().SlotsPerTrial(),
+		false); err != nil {
+		return fmt.Errorf("validating resources: %v", err)
+	}
+	taskContainerDefaults, err := m.rm.TaskContainerDefaults(
+		m.system,
+		poolName,
+		m.config.TaskContainerDefaults,
+	)
+	if err != nil {
+		return fmt.Errorf("error getting TaskContainerDefaults: %w", err)
+	}
 	taskSpec := *m.taskSpec
 	taskSpec.TaskContainerDefaults = taskContainerDefaults
-	owner, err := m.db.UserByUsername(expModel.Username)
+	owner, err := user.UserByUsername(expModel.Username)
 	if err != nil {
 		return errors.Wrapf(err, "retrieving full user on restart")
 	}
@@ -94,7 +117,7 @@ func (m *Master) restoreExperiment(expModel *model.Experiment) error {
 	if err != nil {
 		return errors.Wrapf(err, "failed to restore experiment %d", expModel.ID)
 	}
-	e, err := newExperiment(m, expModel, &taskSpec)
+	e, _, err := newExperiment(m, expModel, activeConfig, &taskSpec)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create experiment %d from model", expModel.ID)
 	}
@@ -105,7 +128,10 @@ func (m *Master) restoreExperiment(expModel *model.Experiment) error {
 		e.restored = true
 	}
 
-	m.system.ActorOf(actor.Addr("experiments", e.ID), e)
+	experimentActor, _ := m.system.ActorOf(actor.Addr("experiments", e.ID), e)
+	// Wait for experiment to run PreStart, which waits for trial PreStarts,
+	// which in turn waits for allocations to be initialized.
+	m.system.Ask(experimentActor, actor.Ping{}).Get()
 	return nil
 }
 
@@ -148,10 +174,10 @@ func (e *experiment) restoreTrial(
 		return
 	}
 
-	config := schemas.Copy(e.Config).(expconf.ExperimentConfig)
+	config := schemas.Copy(e.activeConfig)
 	t := newTrial(
 		e.logCtx, trialTaskID(e.ID, searcher.Create.RequestID), e.JobID, e.StartTime, e.ID, e.State,
-		searcher, e.rm, e.taskLogger, e.db, config, ckpt, e.taskSpec,
+		searcher, e.taskLogger, e.rm, e.db, config, ckpt, e.taskSpec, true,
 	)
 	if trialID != nil {
 		t.id = *trialID
@@ -162,7 +188,9 @@ func (e *experiment) restoreTrial(
 			})
 		}
 	}
-	ctx.ActorOf(searcher.Create.RequestID, t)
+	trialActor, _ := ctx.ActorOf(searcher.Create.RequestID, t)
+	ctx.Ask(trialActor, actor.Ping{}).Get()
+
 	l.Debug("restored trial")
 }
 

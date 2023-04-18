@@ -394,6 +394,49 @@ func filtersToElastic(fs []api.Filter) []jsonObj {
 						"should": inTerms,
 					},
 				})
+		case api.FilterOperationInOrNull:
+			// used to specify value matches int[] or is nil
+			// see https://stackoverflow.com/questions/48563275/
+			values, err := interfaceToSlice(f.Values)
+			if err != nil {
+				panic(fmt.Errorf("invalid IN OR NULL filter values: %w", err))
+			}
+			var inTerms []jsonObj
+			for _, v := range values {
+				switch v.(type) {
+				case string:
+					// See notes on FilterOperationIn
+					inTerms = append(inTerms,
+						jsonObj{
+							"term": jsonObj{
+								f.Field + ".keyword": v,
+							},
+						})
+				default:
+					inTerms = append(inTerms,
+						jsonObj{
+							"term": jsonObj{
+								f.Field: v,
+							},
+						})
+				}
+			}
+			inTerms = append(inTerms,
+				jsonObj{
+					"bool": jsonObj{
+						"must_not": jsonObj{
+							"exists": jsonObj{
+								"field": f.Field,
+							},
+						},
+					},
+				})
+			terms = append(terms,
+				jsonObj{
+					"bool": jsonObj{
+						"should": inTerms,
+					},
+				})
 		case api.FilterOperationLessThanEqual:
 			terms = append(terms,
 				jsonObj{
@@ -412,6 +455,16 @@ func filtersToElastic(fs []api.Filter) []jsonObj {
 						},
 					},
 				})
+		case api.FilterOperationStringContainment:
+			terms = append(terms,
+				jsonObj{
+					"wildcard": jsonObj{
+						f.Field: jsonObj{
+							"value": fmt.Sprintf("*%s*", f.Values),
+						},
+					},
+				})
+
 		default:
 			panic(fmt.Sprintf("unsupported filter operation: %d", f.Operation))
 		}

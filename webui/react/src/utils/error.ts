@@ -1,102 +1,19 @@
-import { notification as antdNotification } from 'antd';
-import { ArgsProps, NotificationApi } from 'antd/lib/notification';
+import { ArgsProps, NotificationInstance } from 'antd/lib/notification/interface';
 
 import { telemetryInstance } from 'hooks/useTelemetry';
-import history from 'routes/history';
-import { filterOutLoginLocation, paths } from 'routes/utils';
-import { isAborted } from 'services/utils';
-import Logger, { LoggerInterface } from 'utils/Logger';
-import { listToStr } from 'utils/string';
-
-import { isString } from './data';
-
-export interface DetErrorOptions {
-  id?: string; // slug unique to each place in the codebase that we will use this.
-  isUserTriggered?: boolean; // whether the error was triggered by an active interaction.
-  level?: ErrorLevel;
-  logger?: LoggerInterface;
-  payload?: unknown;
-  publicMessage?: string;
-  publicSubject?: string;
-  silent?: boolean;
-  type?: ErrorType;
-}
-
-export enum ErrorLevel {
-  Fatal = 'fatal',
-  Error = 'error',
-  Warn = 'warning',
-}
-
-export enum ErrorType {
-  Server = 'server', // internal apis and server errors.
-  Auth = 'auth',
-  Unknown = 'unknown',
-  Ui = 'ui',
-  Input = 'input', // the issue is caused by unexpected/invalid user input.
-  ApiBadResponse = 'apiBadResponse', // unexpected response structure.
-  Api = 'api', // third-party api
-}
-
-const ERROR_NAMESPACE = 'EH';
-const DEFAULT_ERROR_MESSAGE = 'Unknown error encountered.';
-const DEFAULT_LOGGER = new Logger(ERROR_NAMESPACE);
-
-export const isError = (error: unknown): error is Error => {
-  return error instanceof Error;
-};
-
-export const isDetError = (error: unknown): error is DetError => {
-  return error instanceof DetError;
-};
-
-const defaultErrOptions: DetErrorOptions = {
-  isUserTriggered: false,
-  level: ErrorLevel.Error,
-  logger: DEFAULT_LOGGER,
-  silent: false,
-  type: ErrorType.Unknown,
-};
-
-// An expected Error with supplemental information on
-// how it should be handled.
-export class DetError extends Error implements DetErrorOptions {
-  id?: string;
-  isUserTriggered: boolean;
-  level: ErrorLevel;
-  logger: LoggerInterface;
-  payload?: unknown;
-  publicMessage?: string;
-  publicSubject?: string;
-  silent: boolean;
-  type: ErrorType;
-  isHandled: boolean;
-
-  constructor(e?: unknown, options: DetErrorOptions = {}) {
-    const defaultMessage = isError(e) ? e.message : (isString(e) ? e : DEFAULT_ERROR_MESSAGE);
-    const message = options.publicSubject || options.publicMessage || defaultMessage;
-    super(message);
-
-    const eOpts: DetErrorOptions = isDetError(e) ? {
-      id: e.id,
-      isUserTriggered: e.isUserTriggered,
-      level: e.level,
-      logger: e.logger,
-      payload: e.payload,
-      publicMessage: e.publicMessage,
-      publicSubject: e.publicSubject,
-      silent: e.silent,
-      type: e.type,
-    } : {};
-
-    this.loadOptions({ ...defaultErrOptions, ...eOpts, ...options });
-    this.isHandled = false;
-  }
-
-  loadOptions(options: DetErrorOptions): void {
-    Object.assign(this, options);
-  }
-}
+import router from 'router';
+import { paths } from 'routes/utils';
+import {
+  DetError,
+  DetErrorOptions,
+  ERROR_NAMESPACE,
+  ErrorLevel,
+  isDetError,
+} from 'shared/utils/error';
+import { LoggerInterface } from 'shared/utils/Logger';
+import { isAborted, isAuthFailure } from 'shared/utils/service';
+import { listToStr } from 'shared/utils/string';
+import { notification as antdNotification } from 'utils/dialogApi';
 
 const errorLevelMap = {
   [ErrorLevel.Error]: 'error',
@@ -105,25 +22,34 @@ const errorLevelMap = {
 };
 
 const openNotification = (e: DetError) => {
-  const key = errorLevelMap[e.level] as keyof NotificationApi;
+  const key = errorLevelMap[e.level] as keyof NotificationInstance;
   const notification = antdNotification[key] as (args: ArgsProps) => void;
 
   notification?.({
     description: e.publicMessage || '',
-    message: e.publicSubject || listToStr([ e.type, e.level ]),
+    key: e.name,
+    message: e.publicSubject || listToStr([e.type, e.level]),
   });
 };
 
 const log = (e: DetError) => {
   const key = errorLevelMap[e.level] as keyof LoggerInterface;
-  const message = listToStr([ `${e.type}:`, e.publicMessage, e.message ]);
+  const message = listToStr([`${e.type}:`, e.publicMessage, e.message]);
   e.logger[key](message);
   e.logger[key](e);
 };
 
+// Handle a warning to the user in the UI
+export const handleWarning = (warningOptions: DetErrorOptions): void => {
+  // Error object is null because this is just a warning
+  const detWarning = new DetError(null, warningOptions);
+
+  openNotification(detWarning);
+};
+
 // Handle an error at the point that you'd want to stop bubbling it up. Avoid handling
 // and re-throwing.
-const handleError = (error: DetError | unknown, options?: DetErrorOptions): void => {
+const handleError = (error: DetError | unknown, options?: DetErrorOptions): DetError | void => {
   // Ignore request cancellation errors.
   if (isAborted(error)) return;
 
@@ -137,6 +63,7 @@ const handleError = (error: DetError | unknown, options?: DetErrorOptions): void
 
   if (e.isHandled) {
     if (process.env.IS_DEV) {
+      // eslint-disable-next-line no-console
       console.warn(`Error "${e.message}" is handled twice.`);
     }
     return;
@@ -144,12 +71,12 @@ const handleError = (error: DetError | unknown, options?: DetErrorOptions): void
   e.isHandled = true;
 
   // Redirect to logout if Auth failure detected (auth token is no longer valid).`
-  if (e.type === ErrorType.Auth) {
-    // This check accounts for requestes that had not been aborted properly prior
+  if (isAuthFailure(e)) {
+    // This check accounts for requests that had not been aborted properly prior
     // to the page dismount and end up throwing after the user is logged out.
     const path = window.location.pathname;
     if (!path.includes(paths.login()) && !path.includes(paths.logout())) {
-      history.push(paths.logout(), { loginRedirect: filterOutLoginLocation(window.location) });
+      router.getRouter().navigate(`/det${paths.logout()}`);
     }
   }
 
@@ -160,8 +87,7 @@ const handleError = (error: DetError | unknown, options?: DetErrorOptions): void
 
   // TODO generate stack trace if error is missing? http://www.stacktracejs.com/
 
-  // Log the error if needed.
-  if (!e.silent) log(e);
+  log(e);
 
   // TODO SEP handle transient failures? eg only take action IF.. (requires keeping state)
 
@@ -170,6 +96,8 @@ const handleError = (error: DetError | unknown, options?: DetErrorOptions): void
 
   // TODO SEP capture a screenshot or more context (generate a call stack)?
   // https://stackblitz.com/edit/react-screen-capture?file=index.js
+
+  return e;
 };
 
 export default handleError;

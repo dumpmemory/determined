@@ -15,14 +15,12 @@ type (
 	// AddAgent adds the agent to the cluster.
 	AddAgent struct {
 		Agent *actor.Ref
-		Label string
 		Slots int
 	}
 	// RemoveAgent removes the agent from the cluster.
 	RemoveAgent struct {
 		Agent *actor.Ref
 	}
-
 	// UpdateAgent notifies the RP on scheduling-related changes in the agent.
 	UpdateAgent struct {
 		Agent *actor.Ref

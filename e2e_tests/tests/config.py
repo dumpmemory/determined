@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Union
 
 from determined.common import util
 
@@ -13,22 +13,23 @@ MAX_TASK_SCHEDULED_SECS = 30
 MAX_TRIAL_BUILD_SECS = 90
 
 
-DEFAULT_TF1_CPU_IMAGE = "determinedai/environments:py-3.7-pytorch-1.7-tf-1.15-cpu-ed66d8a"
-DEFAULT_TF2_CPU_IMAGE = (
-    "determinedai/environments:py-3.8-pytorch-1.10-lightning-1.5-tf-2.8-cpu-ed66d8a"
-)
-DEFAULT_TF1_GPU_IMAGE = "determinedai/environments:cuda-10.2-pytorch-1.7-tf-1.15-gpu-ed66d8a"
-DEFAULT_TF2_GPU_IMAGE = (
-    "determinedai/environments:cuda-11.3-pytorch-1.10-lightning-1.5-tf-2.8-gpu-ed66d8a"
-)
+DEFAULT_TF1_CPU_IMAGE = "determinedai/environments:py-3.7-pytorch-1.7-tf-1.15-cpu-9b5db1b"
+DEFAULT_TF2_CPU_IMAGE = "determinedai/environments:py-3.8-pytorch-1.12-tf-2.8-cpu-9b5db1b"
+DEFAULT_TF1_GPU_IMAGE = "determinedai/environments:cuda-10.2-pytorch-1.7-tf-1.15-gpu-9b5db1b"
+DEFAULT_TF2_GPU_IMAGE = "determinedai/environments:cuda-11.3-pytorch-1.12-tf-2.8-gpu-9b5db1b"
+DEFAULT_PT_CPU_IMAGE = "determinedai/environments:py-3.8-pytorch-1.12-cpu-9b5db1b"
+DEFAULT_PT_GPU_IMAGE = "determinedai/environments:cuda-11.3-pytorch-1.12-gpu-9b5db1b"
 
 TF1_CPU_IMAGE = os.environ.get("TF1_CPU_IMAGE") or DEFAULT_TF1_CPU_IMAGE
 TF2_CPU_IMAGE = os.environ.get("TF2_CPU_IMAGE") or DEFAULT_TF2_CPU_IMAGE
 TF1_GPU_IMAGE = os.environ.get("TF1_GPU_IMAGE") or DEFAULT_TF1_GPU_IMAGE
 TF2_GPU_IMAGE = os.environ.get("TF2_GPU_IMAGE") or DEFAULT_TF2_GPU_IMAGE
+PT_CPU_IMAGE = os.environ.get("PT_CPU_IMAGE") or DEFAULT_PT_CPU_IMAGE
+PT_GPU_IMAGE = os.environ.get("PT_GPU_IMAGE") or DEFAULT_PT_GPU_IMAGE
 GPU_ENABLED = os.environ.get("DET_TEST_GPU_ENABLED", "1") not in ("0", "false")
 
 PROJECT_ROOT_PATH = Path(__file__).resolve().parents[2]
+EXAMPLES_PATH = PROJECT_ROOT_PATH / "examples"
 
 
 def fixtures_path(path: str) -> str:
@@ -55,6 +56,10 @@ def meta_learning_examples_path(path: str) -> str:
     return os.path.join(os.path.dirname(__file__), "../../examples/meta_learning", path)
 
 
+def diffusion_examples_path(path: str) -> str:
+    return os.path.join(os.path.dirname(__file__), "../../examples/diffusion", path)
+
+
 def gan_examples_path(path: str) -> str:
     return os.path.join(os.path.dirname(__file__), "../../examples/gan", path)
 
@@ -77,6 +82,14 @@ def graphs_examples_path(path: str) -> str:
 
 def deepspeed_examples_path(path: str) -> str:
     return os.path.join(os.path.dirname(__file__), "../../examples/deepspeed", path)
+
+
+def custom_search_method_examples_path(path: str) -> str:
+    return os.path.join(os.path.dirname(__file__), "../../examples/custom_search_method", path)
+
+
+def integrations_examples_path(path: str) -> str:
+    return os.path.join(os.path.dirname(__file__), "../../examples/integrations", path)
 
 
 def load_config(config_path: str) -> Any:
@@ -102,7 +115,9 @@ def set_slots_per_trial(config: Dict[Any, Any], slots: int) -> Dict[Any, Any]:
     return config
 
 
-def set_max_length(config: Dict[Any, Any], max_length: Dict[str, int]) -> Dict[Any, Any]:
+def set_max_length(
+    config: Dict[Any, Any], max_length: Union[Dict[str, int], int]
+) -> Dict[Any, Any]:
     config = config.copy()
     config["searcher"]["max_length"] = max_length
     return config
@@ -153,20 +168,8 @@ def set_tf2_image(config: Dict[Any, Any]) -> Dict[Any, Any]:
     return set_image(config, TF2_CPU_IMAGE, TF2_GPU_IMAGE)
 
 
-def set_shared_fs_data_layer(config: Dict[Any, Any]) -> Dict[Any, Any]:
-    config = config.copy()
-    config["data_layer"] = {}
-    config["data_layer"]["type"] = "shared_fs"
-    return config
-
-
-def set_s3_data_layer(config: Dict[Any, Any]) -> Dict[Any, Any]:
-    config = config.copy()
-    config["data_layer"] = {}
-    config["data_layer"]["type"] = "s3"
-    config["data_layer"]["bucket"] = "yogadl-test"
-    config["data_layer"]["bucket_directory_path"] = "determined_integration_tests"
-    return config
+def set_pt_image(config: Dict[Any, Any]) -> Dict[Any, Any]:
+    return set_image(config, PT_CPU_IMAGE, PT_GPU_IMAGE)
 
 
 def set_random_seed(config: Dict[Any, Any], seed: int) -> Dict[Any, Any]:
@@ -205,4 +208,12 @@ def set_profiling_enabled(config: Dict[Any, Any]) -> Dict[Any, Any]:
 def set_entrypoint(config: Dict[Any, Any], entrypoint: str) -> Dict[Any, Any]:
     config = config.copy()
     config["entrypoint"] = entrypoint
+    return config
+
+
+def set_environment_variables(
+    config: Dict[Any, Any], environment_variables: List[str]
+) -> Dict[Any, Any]:
+    config = config.copy()
+    config["environment"]["environment_variables"] = environment_variables
     return config

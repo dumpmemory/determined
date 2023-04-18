@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from hdfs.client import InsecureClient
 
@@ -29,11 +29,15 @@ class HDFSTensorboardManager(base.TensorboardManager):
         self.client = InsecureClient(self.hdfs_url, root=self.hdfs_path, user=self.user)
         self.client.makedirs(str(self.sync_path))
 
-    @util.preserve_random_state
-    def sync(self) -> None:
-        for path in self.to_sync():
-            file_name = str(self.sync_path.joinpath(path.name))
-
+    def _sync_impl(
+        self,
+        path_info_list: List[base.PathUploadInfo],
+    ) -> None:
+        for path_info in path_info_list:
+            path = path_info.path
+            mangled_relative_path = path_info.mangled_relative_path
+            mangled_path = self.sync_path.joinpath(mangled_relative_path)
+            file_name = str(mangled_path)
             logging.debug(f"Uploading {path} to {self.hdfs_path}")
 
             self.client.upload(file_name, str(path))

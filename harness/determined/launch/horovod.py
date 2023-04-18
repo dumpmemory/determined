@@ -19,7 +19,9 @@ from determined.common.api import certs
 from determined.constants import DTRAIN_SSH_PORT
 
 
-def create_sshd_worker_cmd(allocation_id: str, num_slot_ids: int) -> Tuple[List[str], List[str]]:
+def create_sshd_worker_cmd(
+    allocation_id: str, num_slot_ids: int, debug: bool = False
+) -> Tuple[List[str], List[str]]:
     # Wrap it in a pid_server to ensure that we can't hang if a worker fails.
     # TODO: After the upstream horovod bugfix (github.com/horovod/horovod/pull/3060) is in a
     # widely-used release of horovod, we should remove this pid_server layer, which just adds
@@ -31,7 +33,7 @@ def create_sshd_worker_cmd(allocation_id: str, num_slot_ids: int) -> Tuple[List[
         "--on-fail",
         "SIGTERM",
         "--on-exit",
-        "WAIT",
+        "SIGTERM",
         f"/tmp/pid_server-{allocation_id}",
         str(num_slot_ids),
         "--",
@@ -45,6 +47,8 @@ def create_sshd_worker_cmd(allocation_id: str, num_slot_ids: int) -> Tuple[List[
         "/run/determined/ssh/sshd_config",
         "-D",
     ]
+    if debug:
+        run_sshd_command.append("-e")
     return pid_server_cmd, run_sshd_command
 
 
@@ -76,8 +80,8 @@ def create_worker_wrapper_cmd(allocation_id: str) -> List[str]:
     log_redirect_cmd = [
         "python3",
         "-m",
-        "determined.exec.worker_process_wrapper",
-        "HOROVOD_RANK",
+        "determined.launch.wrap_rank",
+        "HOROVOD_RANK,OMPI_COMM_WORLD_RANK,PMI_RANK",
         "--",
     ]
 
@@ -91,9 +95,11 @@ def main(hvd_args: List[str], script: List[str], autohorovod: bool) -> int:
     assert info is not None, "must be run on-cluster"
     assert info.task_type == "TRIAL", f'must be run with task_type="TRIAL", not "{info.task_type}"'
 
-    # When --autohorovod was set, detect single-slot trials.
-    if autohorovod and len(info.container_addrs) == 1 and len(info.slot_ids) == 1:
-        return subprocess.Popen(script).wait()
+    # When --autohorovod was set, detect single-slot and zero-slot trials.
+    if autohorovod and len(info.container_addrs) == 1 and len(info.slot_ids) <= 1:
+        p = subprocess.Popen(script)
+        with det.util.forward_signals(p):
+            return p.wait()
 
     # Hack: get the resources id from the environment.
     resources_id = os.environ.get("DET_RESOURCES_ID")
@@ -103,8 +109,10 @@ def main(hvd_args: List[str], script: List[str], autohorovod: bool) -> int:
     experiment_config = info.trial._config
 
     debug = experiment_config.get("debug", False)
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    # TODO: refactor websocket, data_layer, and profiling to to not use the cli_cert.
+    # TODO: refactor websocket and profiling to to not use the cli_cert.
     cert = certs.default_load(info.master_url)
     certs.cli_cert = cert
 
@@ -120,7 +128,7 @@ def main(hvd_args: List[str], script: List[str], autohorovod: bool) -> int:
         # Non-chief machines just run sshd.
 
         # Mark sshd containers as daemon resources that the master should kill when all non-daemon
-        # contiainers (horovodrun, in this case) have exited.
+        # containers (horovodrun, in this case) have exited.
         api.post(
             info.master_url,
             path=f"/api/v1/allocations/{info.allocation_id}/resources/{resources_id}/daemon",
@@ -128,14 +136,16 @@ def main(hvd_args: List[str], script: List[str], autohorovod: bool) -> int:
         )
 
         pid_server_cmd, run_sshd_command = create_sshd_worker_cmd(
-            info.allocation_id, len(info.slot_ids)
+            info.allocation_id, len(info.slot_ids), debug=debug
         )
 
         logging.debug(
             f"Non-chief [{info.container_rank}] training process launch "
             f"command: {run_sshd_command}."
         )
-        return subprocess.Popen(pid_server_cmd + run_sshd_command).wait()
+        p = subprocess.Popen(pid_server_cmd + run_sshd_command)
+        with det.util.forward_signals(p):
+            return p.wait()
 
     # Chief machine waits for every worker's sshd to be available.  All machines should be pretty
     # close to in-step by now because all machines just finished synchronizing rendezvous info.
@@ -147,7 +157,7 @@ def main(hvd_args: List[str], script: List[str], autohorovod: bool) -> int:
     # - a top-level pid_server, which causes the whole container to exit if any local worker dies.
     # - horovodrun, which launches $slots_per_trial copies of the following layers:
     #     - a pid_client process to contact the local pid_server
-    #     - worker_process_wrapper, which redirects stdin/stdout to the local container
+    #     - wrap_rank, which redirects stdin/stdout to the local container
     #     - harness.py, which actually does the training for the worker
     #
     # It is a bug in horovod that causes us to have this pid_server/pid_client pair of layers.
@@ -159,9 +169,11 @@ def main(hvd_args: List[str], script: List[str], autohorovod: bool) -> int:
     # TODO: remove this (very old) hack when we have a configurable launch layer.
     hvd_optional_args = experiment_config.get("data", {}).get("__det_dtrain_args", [])
     hvd_optional_args += hvd_args
+    if debug:
+        hvd_optional_args += ["--mpi-args=-v --display-map"]
 
     hvd_cmd = horovod.create_run_command(
-        num_proc_per_machine=len(info.slot_ids),
+        host_slot_counts=info.container_slot_counts,
         ip_addresses=info.container_addrs,
         inter_node_network_interface=info.trial._inter_node_network_interface,
         optimizations=experiment_config["optimizations"],
@@ -175,7 +187,18 @@ def main(hvd_args: List[str], script: List[str], autohorovod: bool) -> int:
 
     os.environ["USE_HOROVOD"] = "1"
 
-    return subprocess.Popen(pid_server_cmd + hvd_cmd + worker_wrapper_cmd + script).wait()
+    # We now have environment images with built-in OpenMPI.   When invoked the
+    # SLURM_JOBID variable triggers integration with SLURM, however, we are
+    # running in a singularity container and SLURM may or may not have
+    # compatible configuration enabled.  We therefore clear the SLURM_JOBID variable
+    # before invoking mpi so that mpirun will honor the args passed via horvod
+    # run to it describing the hosts and process topology, otherwise mpi ends
+    # up wanting to launch all -np# processes on the local causing an oversubscription
+    # error ("There are not enough slots available in the system").
+    os.environ.pop("SLURM_JOBID", None)
+    p = subprocess.Popen(pid_server_cmd + hvd_cmd + worker_wrapper_cmd + script)
+    with det.util.forward_signals(p):
+        return p.wait()
 
 
 def parse_args(args: List[str]) -> Tuple[List[str], List[str], bool]:
@@ -217,7 +240,7 @@ def parse_args(args: List[str]) -> Tuple[List[str], List[str], bool]:
     )
 
     # --autohorovod is an internal-only flag.  What it does is it causes the code skip the
-    # horovodrun wrapper when slots_per_trial == 1.  This has two effects:
+    # horovodrun wrapper when slots_per_trial <= 1.  This has two effects:
     # 1. the execution stack for non-distributed training is simpler, because horovodrun would only
     #    add complexity, and
     # 2. the training code becomes more complex because it has to be aware of multi-vs-single-slot

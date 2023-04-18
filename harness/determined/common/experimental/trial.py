@@ -1,8 +1,116 @@
+import dataclasses
+import datetime
 import enum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
 
-from determined.common import check
-from determined.common.experimental import checkpoint, session
+from determined.common import api, util
+from determined.common.api import bindings, logs
+from determined.common.experimental import checkpoint
+
+
+class LogLevel(enum.Enum):
+    TRACE = bindings.v1LogLevel.TRACE.value
+    DEBUG = bindings.v1LogLevel.DEBUG.value
+    INFO = bindings.v1LogLevel.INFO.value
+    WARNING = bindings.v1LogLevel.WARNING.value
+    ERROR = bindings.v1LogLevel.ERROR.value
+    CRITICAL = bindings.v1LogLevel.CRITICAL.value
+
+    def _to_bindings(self) -> bindings.v1LogLevel:
+        return bindings.v1LogLevel(self.value)
+
+
+_csb = bindings.v1GetTrialCheckpointsRequestSortBy
+
+
+class CheckpointSortBy(enum.Enum):
+    """
+    Specifies the field to sort a list of checkpoints on.
+    """
+
+    END_TIME = _csb.END_TIME.value
+    STATE = _csb.STATE.value
+    UUID = _csb.UUID.value
+    BATCH_NUMBER = _csb.BATCH_NUMBER.value
+
+    def _to_bindings(self) -> bindings.v1GetTrialCheckpointsRequestSortBy:
+        return _csb(self.value)
+
+
+class CheckpointOrderBy(enum.Enum):
+    """
+    Specifies whether a sorted list of checkpoints should be in ascending or
+    descending order.
+    """
+
+    ASC = bindings.v1OrderBy.ASC.value
+    DESC = bindings.v1OrderBy.DESC.value
+
+    def _to_bindings(self) -> bindings.v1OrderBy:
+        return bindings.v1OrderBy(self.value)
+
+
+@dataclasses.dataclass
+class TrainingMetrics:
+    """
+    Specifies a training metric report that the trial reported.
+
+    Attributes:
+        trial_id
+        trial_run_id
+        steps_completed
+        end_time
+        metrics
+        batch_metrics
+    """
+
+    trial_id: int
+    trial_run_id: int
+    steps_completed: int
+    end_time: datetime.datetime
+    metrics: Dict[str, Any]
+    batch_metrics: Optional[List[Dict[str, Any]]] = None
+
+    @classmethod
+    def _from_bindings(cls, metric_report: bindings.v1MetricsReport) -> "TrainingMetrics":
+        return cls(
+            trial_id=metric_report.trialId,
+            trial_run_id=metric_report.trialRunId,
+            steps_completed=metric_report.totalBatches,
+            end_time=util.parse_protobuf_timestamp(metric_report.endTime),
+            metrics=metric_report.metrics["avg_metrics"],
+            batch_metrics=metric_report.metrics.get("batch_metrics", None),
+        )
+
+
+@dataclasses.dataclass
+class ValidationMetrics:
+    """
+    Specifies a validation metric report that the trial reported.
+
+    Attributes:
+        trial_id
+        trial_run_id
+        steps_completed
+        end_time
+        metrics
+    """
+
+    trial_id: int
+    trial_run_id: int
+    steps_completed: int
+    end_time: datetime.datetime
+    metrics: Dict[str, Any]
+
+    @classmethod
+    def _from_bindings(cls, metric_report: bindings.v1MetricsReport) -> "ValidationMetrics":
+        return cls(
+            trial_id=metric_report.trialId,
+            trial_run_id=metric_report.trialRunId,
+            steps_completed=metric_report.totalBatches,
+            end_time=util.parse_protobuf_timestamp(metric_report.endTime),
+            metrics=metric_report.metrics["validation_metrics"],
+        )
 
 
 class TrialReference:
@@ -14,12 +122,67 @@ class TrialReference:
     :class:`~determined.experimental.Checkpoint` instances.
     """
 
-    def __init__(self, trial_id: int, session: session.Session):
+    def __init__(self, trial_id: int, session: api.Session):
         self.id = trial_id
         self._session = session
 
+    def logs(
+        self,
+        follow: bool = False,
+        *,
+        head: Optional[int] = None,
+        tail: Optional[int] = None,
+        container_ids: Optional[List[str]] = None,
+        rank_ids: Optional[List[int]] = None,
+        stdtypes: Optional[List[str]] = None,
+        min_level: Optional[LogLevel] = None,
+    ) -> Iterable[str]:
+        """
+        Return an iterable of log lines from this trial meeting the specified criteria.
+
+        Arguments:
+            follow (bool, optional): If the iterable should block waiting for new logs to arrive.
+                Mutually exclusive with ``head`` and ``tail``.  Defaults to ``False``.
+            head (int, optional): When set, only fetches the first ``head`` lines.  Mutually
+                exclusive with ``follow`` and ``tail``.  Defaults to ``None``.
+            tail (int, optional): When set, only fetches the first ``head`` lines.  Mutually
+                exclusive with ``follow`` and ``head``.  Defaults to ``None``.
+            container_ids (List[str], optional): When set, only fetch logs from lines from
+                specific containers.  Defaults to ``None``.
+            rank_ids (List[int], optional): When set, only fetch logs from lines from
+                specific ranks.  Defaults to ``None``.
+            stdtypes (List[int], optional): When set, only fetch logs from lines from the given
+                stdio outputs.  Defaults to ``None`` (same as ``["stdout", "stderr"]``).
+            min_level: (LogLevel, optional): When set, defines the minimum log priority for lines
+                that will be returned.  Defaults to ``None`` (all logs returned).
+        """
+        if head is not None and head < 0:
+            raise ValueError(f"head must be non-negative, got {head}")
+        if tail is not None and tail < 0:
+            raise ValueError(f"tail must be non-negative, got {tail}")
+        for log in logs.trial_logs(
+            session=self._session,
+            trial_id=self.id,
+            head=head,
+            tail=tail,
+            follow=follow,
+            # TODO: Rename this to "node_id" and support it in the python sdk.
+            agent_ids=None,
+            container_ids=container_ids,
+            rank_ids=rank_ids,
+            # sources would be something like "originated from master" or "originated from task".
+            sources=None,
+            stdtypes=stdtypes,
+            min_level=None if min_level is None else min_level._to_bindings(),
+            # TODO: figure out what type is a good type to accept for timestamps.  Until then, be
+            # conservative with the public API and disallow it.
+            timestamp_before=None,
+            timestamp_after=None,
+        ):
+            yield log.message
+
     def kill(self) -> None:
-        self._session.post(f"/api/v1/trials/{self.id}/kill")
+        bindings.post_KillTrial(self._session, id=self.id)
 
     def top_checkpoint(
         self,
@@ -82,17 +245,11 @@ class TrialReference:
                 this parameter is ignored. By default, the value of ``smaller_is_better``
                 from the experiment's configuration is used.
         """
-        check.eq(
-            sum([int(latest), int(best), int(uuid is not None)]),
-            1,
-            "Exactly one of latest, best, or uuid must be set",
-        )
+        if sum([int(latest), int(best), int(uuid is not None)]) != 1:
+            raise AssertionError("Exactly one of latest, best, or uuid must be set")
 
-        check.eq(
-            sort_by is None,
-            smaller_is_better is None,
-            "sort_by and smaller_is_better must be set together",
-        )
+        if (sort_by is None) != (smaller_is_better is None):
+            raise AssertionError("sort_by and smaller_is_better must be set together")
 
         if sort_by is not None and not best:
             raise AssertionError(
@@ -100,81 +257,168 @@ class TrialReference:
             )
 
         if uuid:
-            resp = self._session.get("/api/v1/checkpoints/{}".format(uuid))
-            return checkpoint.Checkpoint._from_json(resp.json()["checkpoint"], self._session)
+            resp = bindings.get_GetCheckpoint(self._session, checkpointUuid=uuid)
+            return checkpoint.Checkpoint._from_bindings(resp.checkpoint, self._session)
 
-        r = self._session.get(
-            "/api/v1/trials/{}/checkpoints".format(self.id),
-            # The default sort order from the API is by batch number. The order
-            # by parameter indicates descending order.
-            params={"order_by": 2},
-        ).json()
-        checkpoints = r["checkpoints"]
+        order_by = None
+        if latest:
+            sort_by = CheckpointSortBy.BATCH_NUMBER  # type: ignore
+            order_by = CheckpointOrderBy.DESC
+
+        if sort_by:
+            order_by = CheckpointOrderBy.ASC if smaller_is_better else CheckpointOrderBy.DESC
+
+        checkpoints = self.get_checkpoints(sort_by=sort_by, order_by=order_by)
 
         if not checkpoints:
-            raise AssertionError("No checkpoint found for trial {}".format(self.id))
+            raise ValueError("No checkpoints found for criteria.")
+        return checkpoints[0]
 
-        if latest:
-            return checkpoint.Checkpoint._from_json(checkpoints[0], self._session)
+    def get_checkpoints(
+        self,
+        sort_by: Optional[Union[str, CheckpointSortBy]] = None,
+        order_by: Optional[CheckpointOrderBy] = None,
+    ) -> List[checkpoint.Checkpoint]:
+        """
+        Return a list of :class:`~determined.experimental.Checkpoint` instances for the current
+        trial.
 
+        Either ``sort_by`` and ``order_by`` are both specified or neither are.
+
+        Arguments:
+            sort_by (string, :class:`~determined.experimental.CheckpointSortBy`): Which field to
+                sort by. Strings are assumed to be validation metric names.
+            order_by (:class:`~determined.experimental.CheckpointOrderBy`): Whether to sort in
+                ascending or descending order.
+        """
+
+        if (sort_by is None) != (order_by is None):
+            raise AssertionError("sort_by and order_by must be set together")
+
+        def get_trial_checkpoints(offset: int) -> bindings.v1GetTrialCheckpointsResponse:
+            return bindings.get_GetTrialCheckpoints(
+                self._session,
+                id=self.id,
+                orderBy=order_by._to_bindings() if order_by else None,
+                sortBy=sort_by._to_bindings() if isinstance(sort_by, CheckpointSortBy) else None,
+                offset=offset,
+            )
+
+        resps = api.read_paginated(get_trial_checkpoints)
+
+        checkpoints = [
+            checkpoint.Checkpoint._from_bindings(c, self._session)
+            for r in resps
+            for c in r.checkpoints
+        ]
+
+        # If sort_by was a defined field, we already sorted and ordered.
+        if isinstance(sort_by, CheckpointSortBy) or not checkpoints:
+            return checkpoints
+
+        # If sort not specified, sort and order default to searcher configs.
         if not sort_by:
-            sort_by = checkpoints[0]["experimentConfig"]["searcher"]["metric"]
-            smaller_is_better = checkpoints[0]["experimentConfig"]["searcher"]["smaller_is_better"]
+            training = checkpoints[0].training
+            assert training
+            config = training.experiment_config
+            searcher_metric = config.get("searcher", {}).get("metric")
+            if not isinstance(searcher_metric, str):
+                raise ValueError(
+                    "no searcher.metric found in experiment config; please provide a sort_by metric"
+                )
+            sort_by = searcher_metric
+            smaller_is_better = config.get("searcher", {}).get("smaller_is_better", True)
+            order_by = CheckpointOrderBy.ASC if smaller_is_better else CheckpointOrderBy.DESC
 
-        best_checkpoint_func = min if smaller_is_better else max
-        key: Callable[[Dict], Any] = lambda x: x["metrics"]["validationMetrics"][sort_by]
-        return checkpoint.Checkpoint._from_json(
-            best_checkpoint_func(
-                [c for c in checkpoints if c["metrics"] is not None],
-                key=key,
-            ),
-            self._session,
-        )
+        assert sort_by is not None and order_by is not None, "sort_by and order_by not defined."
+
+        reverse = order_by == CheckpointOrderBy.DESC
+
+        def key(ckpt: checkpoint.Checkpoint) -> Any:
+            training = ckpt.training
+            assert training
+            metric = training.validation_metrics.get("avgMetrics") or {}
+            metric = metric.get(sort_by)
+
+            # Return a bool here to sort checkpoints that may have no validation metrics.
+            if reverse:
+                return metric is not None, metric
+            else:
+                return metric is None, metric
+
+        checkpoints.sort(reverse=reverse, key=key)
+
+        return checkpoints
 
     def __repr__(self) -> str:
         return "Trial(id={})".format(self.id)
+
+    def stream_training_metrics(self) -> Iterable[TrainingMetrics]:
+        """
+        Streams training metrics for this trial sorted by
+        trial_id, trial_run_id and steps_completed.
+        """
+        return _stream_training_metrics(self._session, [self.id])
+
+    def stream_validation_metrics(self) -> Iterable[ValidationMetrics]:
+        """
+        Streams validation metrics for this trial sorted by
+        trial_id, trial_run_id and steps_completed.
+        """
+        return _stream_validation_metrics(self._session, [self.id])
+
+
+# This is to shorten line lengths of the TrialSortBy definition.
+_tsb = bindings.v1GetExperimentTrialsRequestSortBy
 
 
 class TrialSortBy(enum.Enum):
     """
     Specifies the field to sort a list of trials on.
-
-    Attributes:
-        UNSPECIFIED
-        ID
-        START_TIME
-        END_TIME
-        STATE
-        BEST_VALIDATION_METRIC
-        LATEST_VALIDATION_METRIC
-        BATCHES_PROCESSED
-        DURATION
     """
 
-    UNSPECIFIED = 0
-    ID = 1
-    START_TIME = 4
-    END_TIME = 5
-    STATE = 6
-    BEST_VALIDATION_METRIC = 7
-    LATEST_VALIDATION_METRIC = 8
-    BATCHES_PROCESSED = 9
-    DURATION = 10
+    UNSPECIFIED = _tsb.UNSPECIFIED.value
+    ID = _tsb.ID.value
+    START_TIME = _tsb.START_TIME.value
+    END_TIME = _tsb.END_TIME.value
+    STATE = _tsb.STATE.value
+    BEST_VALIDATION_METRIC = _tsb.BEST_VALIDATION_METRIC.value
+    LATEST_VALIDATION_METRIC = _tsb.LATEST_VALIDATION_METRIC.value
+    BATCHES_PROCESSED = _tsb.BATCHES_PROCESSED.value
+    DURATION = _tsb.DURATION.value
+    RESTARTS = _tsb.RESTARTS.value
+    CHECKPOINT_SIZE = _tsb.CHECKPOINT_SIZE.value
+
+    def _to_bindings(self) -> bindings.v1GetExperimentTrialsRequestSortBy:
+        return _tsb(self.value)
 
 
 class TrialOrderBy(enum.Enum):
     """
     Specifies whether a sorted list of trials should be in ascending or
     descending order.
-
-    Attributes:
-        ASCENDING
-        ASC
-        DESCENDING
-        DESC
     """
 
-    ASCENDING = 1
-    ASC = 1
-    DESCENDING = 2
-    DESC = 2
+    ASCENDING = bindings.v1OrderBy.ASC.value
+    ASC = bindings.v1OrderBy.ASC.value
+    DESCENDING = bindings.v1OrderBy.DESC.value
+    DESC = bindings.v1OrderBy.DESC.value
+
+    def _to_bindings(self) -> bindings.v1OrderBy:
+        return bindings.v1OrderBy(self.value)
+
+
+def _stream_training_metrics(
+    session: api.Session, trial_ids: List[int]
+) -> Iterable[TrainingMetrics]:
+    for i in bindings.get_GetTrainingMetrics(session, trialIds=trial_ids):
+        for m in i.metrics:
+            yield TrainingMetrics._from_bindings(m)
+
+
+def _stream_validation_metrics(
+    session: api.Session, trial_ids: List[int]
+) -> Iterable[ValidationMetrics]:
+    for i in bindings.get_GetValidationMetrics(session, trialIds=trial_ids):
+        for m in i.metrics:
+            yield ValidationMetrics._from_bindings(m)

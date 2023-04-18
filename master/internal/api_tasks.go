@@ -3,8 +3,11 @@ package internal
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/pkg/errors"
+	"golang.org/x/exp/slices"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -12,10 +15,15 @@ import (
 	"github.com/hashicorp/go-multierror"
 
 	"github.com/determined-ai/determined/master/internal/api"
+	"github.com/determined-ai/determined/master/internal/command"
+	"github.com/determined-ai/determined/master/internal/db"
+	expauth "github.com/determined-ai/determined/master/internal/experiment"
 	"github.com/determined-ai/determined/master/internal/grpcutil"
+	"github.com/determined-ai/determined/master/internal/sproto"
 	"github.com/determined-ai/determined/master/internal/task"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
+	"github.com/determined-ai/determined/proto/pkg/taskv1"
 )
 
 const (
@@ -28,23 +36,175 @@ var (
 
 	taskLogsBatchMissWaitTime   = time.Second
 	taskLogsFieldsBatchWaitTime = 5 * time.Second
-
-	// Common errors.
-	taskNotFound = status.Error(codes.NotFound, "task not found")
 )
+
+func expFromTaskID(
+	m *Master, taskID model.TaskID,
+) (isExperiment bool, exp *model.Experiment, err error) {
+	expID, err := experimentIDFromTrialTaskID(taskID)
+	if errors.Is(err, errIsNotTrialTaskID) {
+		return false, nil, nil
+	} else if err != nil {
+		return false, nil, err
+	}
+
+	exp, err = m.db.ExperimentByID(expID)
+	if err != nil {
+		return false, nil, err
+	}
+	return true, exp, nil
+}
+
+func canAccessNTSCTask(ctx context.Context, curUser model.User, taskID model.TaskID) (bool, error) {
+	spec, err := db.IdentifyTask(ctx, taskID)
+	if errors.Is(err, db.ErrNotFound) {
+		// Non NTSC case like checkpointGC case or the task just does not exist.
+		// TODO(nick) eventually control access to checkpointGC.
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	return command.AuthZProvider.Get().CanGetNSC(
+		ctx, curUser, spec.WorkspaceID,
+	)
+}
+
+func (a *apiServer) canDoActionsOnTask(
+	ctx context.Context, taskID model.TaskID,
+	actions ...func(context.Context, model.User, *model.Experiment) error,
+) error {
+	errTaskNotFound := status.Errorf(codes.NotFound, "task not found: %s", taskID)
+	t, err := a.m.db.TaskByID(taskID)
+	if errors.Is(err, db.ErrNotFound) {
+		return errTaskNotFound
+	} else if err != nil {
+		return err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	switch t.TaskType {
+	case model.TaskTypeTrial:
+		isExp, exp, err := expFromTaskID(a.m, taskID)
+		if !isExp {
+			return fmt.Errorf("error we failed to look up an experiment "+
+				"from taskID %s when we think it is a trial task", taskID)
+		}
+		if err != nil {
+			return err
+		}
+
+		var ok bool
+		if ok, err = expauth.AuthZProvider.Get().CanGetExperiment(ctx, *curUser, exp); err != nil {
+			return err
+		} else if !ok {
+			return errTaskNotFound
+		}
+
+		for _, action := range actions {
+			if err = action(ctx, *curUser, exp); err != nil {
+				return status.Error(codes.PermissionDenied, err.Error())
+			}
+		}
+	default: // NTSC case + checkpointGC.
+		if ok, err := canAccessNTSCTask(ctx, *curUser, taskID); err != nil {
+			return err
+		} else if !ok {
+			return errTaskNotFound
+		}
+	}
+	return nil
+}
+
+func (a *apiServer) canEditAllocation(ctx context.Context, allocationID string) error {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	if !strings.Contains(allocationID, ".") {
+		return status.Errorf(codes.InvalidArgument,
+			"allocationID %s does not  contain at least '.'", allocationID)
+	}
+
+	taskID := model.AllocationID(allocationID).ToTaskID()
+	errAllocationNotFound := status.Errorf(codes.NotFound, "allocation not found: %s", allocationID)
+	isExp, exp, err := expFromTaskID(a.m, taskID)
+	if err != nil {
+		return err
+	}
+	if !isExp {
+		var ok bool
+		if ok, err = canAccessNTSCTask(ctx, *curUser, taskID); err != nil {
+			return err
+		} else if !ok {
+			return errAllocationNotFound
+		}
+		return nil
+	}
+
+	var ok bool
+	if ok, err = expauth.AuthZProvider.Get().CanGetExperiment(ctx, *curUser, exp); err != nil {
+		return err
+	} else if !ok {
+		return errAllocationNotFound
+	}
+	if err = expauth.AuthZProvider.Get().CanEditExperiment(ctx, *curUser, exp); err != nil {
+		return status.Error(codes.PermissionDenied, err.Error())
+	}
+
+	return nil
+}
 
 func (a *apiServer) AllocationReady(
 	ctx context.Context, req *apiv1.AllocationReadyRequest,
 ) (*apiv1.AllocationReadyResponse, error) {
-	handler, err := a.allocationHandlerByID(model.AllocationID(req.AllocationId))
-	if err != nil {
+	if err := a.canEditAllocation(ctx, req.AllocationId); err != nil {
 		return nil, err
 	}
 
-	if err := a.ask(handler.Address(), task.AllocationReady{}, nil); err != nil {
+	resp, err := a.m.rm.GetAllocationHandler(
+		a.m.system,
+		sproto.GetAllocationHandler{ID: model.AllocationID(req.AllocationId)},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.waitForAllocationToBeRestored(ctx, resp); err != nil {
+		return nil, err
+	}
+
+	if err := a.ask(resp.Address(), task.AllocationReady{}, nil); err != nil {
 		return nil, err
 	}
 	return &apiv1.AllocationReadyResponse{}, nil
+}
+
+func (a *apiServer) AllocationWaiting(
+	ctx context.Context, req *apiv1.AllocationWaitingRequest,
+) (*apiv1.AllocationWaitingResponse, error) {
+	if err := a.canEditAllocation(ctx, req.AllocationId); err != nil {
+		return nil, err
+	}
+
+	resp, err := a.m.rm.GetAllocationHandler(
+		a.m.system,
+		sproto.GetAllocationHandler{ID: model.AllocationID(req.AllocationId)},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.waitForAllocationToBeRestored(ctx, resp); err != nil {
+		return nil, err
+	}
+
+	if err := a.ask(resp.Address(), task.AllocationWaiting{}, nil); err != nil {
+		return nil, err
+	}
+	return &apiv1.AllocationWaitingResponse{}, nil
 }
 
 func (a *apiServer) AllocationAllGather(
@@ -53,9 +213,18 @@ func (a *apiServer) AllocationAllGather(
 	if req.AllocationId == "" {
 		return nil, status.Error(codes.InvalidArgument, "allocation ID missing")
 	}
+	if err := a.canEditAllocation(ctx, req.AllocationId); err != nil {
+		return nil, err
+	}
 
-	handler, err := a.allocationHandlerByID(model.AllocationID(req.AllocationId))
+	handler, err := a.m.rm.GetAllocationHandler(
+		a.m.system,
+		sproto.GetAllocationHandler{ID: model.AllocationID(req.AllocationId)},
+	)
 	if err != nil {
+		return nil, err
+	}
+	if err := a.waitForAllocationToBeRestored(ctx, handler); err != nil {
 		return nil, err
 	}
 
@@ -85,6 +254,35 @@ func (a *apiServer) AllocationAllGather(
 	}
 }
 
+func (a *apiServer) PostAllocationProxyAddress(
+	ctx context.Context, req *apiv1.PostAllocationProxyAddressRequest,
+) (*apiv1.PostAllocationProxyAddressResponse, error) {
+	if req.AllocationId == "" {
+		return nil, status.Error(codes.InvalidArgument, "allocation ID missing")
+	}
+	if err := a.canEditAllocation(ctx, req.AllocationId); err != nil {
+		return nil, err
+	}
+
+	handler, err := a.m.rm.GetAllocationHandler(
+		a.m.system,
+		sproto.GetAllocationHandler{ID: model.AllocationID(req.AllocationId)},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.waitForAllocationToBeRestored(ctx, handler); err != nil {
+		return nil, err
+	}
+
+	if err := a.ask(handler.Address(), task.SetAllocationProxyAddress{
+		ProxyAddress: req.ProxyAddress,
+	}, nil); err != nil {
+		return nil, err
+	}
+	return &apiv1.PostAllocationProxyAddressResponse{}, nil
+}
+
 func (a *apiServer) TaskLogs(
 	req *apiv1.TaskLogsRequest, resp apiv1.Determined_TaskLogsServer,
 ) error {
@@ -93,14 +291,6 @@ func (a *apiServer) TaskLogs(
 		grpcutil.ValidateFollow(req.Limit, req.Follow),
 	); err != nil {
 		return err
-	}
-
-	taskID := model.TaskID(req.TaskId)
-	switch exists, err := a.m.db.CheckTaskExists(taskID); {
-	case err != nil:
-		return err
-	case !exists:
-		return taskNotFound
 	}
 
 	ctx, cancel := context.WithCancel(resp.Context())
@@ -120,6 +310,103 @@ func (a *apiServer) TaskLogs(
 	})
 }
 
+func (a *apiServer) GetActiveTasksCount(
+	ctx context.Context, req *apiv1.GetActiveTasksCountRequest,
+) (resp *apiv1.GetActiveTasksCountResponse, err error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = command.AuthZProvider.Get().CanGetActiveTasksCount(ctx, *curUser); err != nil {
+		return nil, status.Error(codes.PermissionDenied, err.Error())
+	}
+
+	finalResp := &apiv1.GetActiveTasksCountResponse{}
+	req1 := &apiv1.GetNotebooksRequest{}
+	resp1 := &apiv1.GetNotebooksResponse{}
+	if err = a.ask(notebooksAddr, req1, &resp1); err != nil {
+		return nil, err
+	}
+	for _, n := range resp1.Notebooks {
+		if n.State == taskv1.State_STATE_RUNNING {
+			finalResp.Notebooks++
+		}
+	}
+
+	req2 := &apiv1.GetTensorboardsRequest{}
+	resp2 := &apiv1.GetTensorboardsResponse{}
+	if err = a.ask(tensorboardsAddr, req2, &resp2); err != nil {
+		return nil, err
+	}
+	for _, tb := range resp2.Tensorboards {
+		if tb.State == taskv1.State_STATE_RUNNING {
+			finalResp.Tensorboards++
+		}
+	}
+
+	req3 := &apiv1.GetCommandsRequest{}
+	resp3 := &apiv1.GetCommandsResponse{}
+	if err = a.ask(commandsAddr, req3, &resp3); err != nil {
+		return nil, err
+	}
+	for _, c := range resp3.Commands {
+		if c.State == taskv1.State_STATE_RUNNING {
+			finalResp.Commands++
+		}
+	}
+
+	req4 := &apiv1.GetShellsRequest{}
+	resp4 := &apiv1.GetShellsResponse{}
+	if err = a.ask(shellsAddr, req4, &resp4); err != nil {
+		return nil, err
+	}
+	for _, s := range resp4.Shells {
+		if s.State == taskv1.State_STATE_RUNNING {
+			finalResp.Shells++
+		}
+	}
+
+	return finalResp, err
+}
+
+func (a *apiServer) GetTasks(
+	ctx context.Context, req *apiv1.GetTasksRequest,
+) (resp *apiv1.GetTasksResponse, err error) {
+	summary, err := a.m.rm.GetAllocationSummaries(a.m.system, sproto.GetAllocationSummaries{})
+	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	pbAllocationIDToSummary := make(map[string]*taskv1.AllocationSummary)
+	for allocationID, allocationSummary := range summary {
+		isExp, exp, err := expFromTaskID(a.m, allocationSummary.TaskID)
+		if err != nil {
+			return nil, err
+		}
+
+		var ok bool
+		if !isExp {
+			ok, err = canAccessNTSCTask(ctx, *curUser, summary[allocationID].TaskID)
+		} else {
+			ok, err = expauth.AuthZProvider.Get().CanGetExperiment(ctx, *curUser, exp)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if ok {
+			pbAllocationIDToSummary[string(allocationID)] = allocationSummary.Proto()
+		}
+	}
+
+	return &apiv1.GetTasksResponse{AllocationIdToSummary: pbAllocationIDToSummary}, nil
+}
+
 func (a *apiServer) taskLogs(
 	ctx context.Context, req *apiv1.TaskLogsRequest, res chan api.BatchResult,
 ) {
@@ -133,7 +420,17 @@ func (a *apiServer) taskLogs(
 	}
 
 	var followState interface{}
+	var timeSinceLastAuth time.Time
 	fetch := func(r api.BatchRequest) (api.Batch, error) {
+		if time.Now().Sub(timeSinceLastAuth) >= recheckAuthPeriod {
+			if err = a.canDoActionsOnTask(ctx, taskID,
+				expauth.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+				return nil, err
+			}
+
+			timeSinceLastAuth = time.Now()
+		}
+
 		switch {
 		case r.Follow, r.Limit > taskLogsBatchSize:
 			r.Limit = taskLogsBatchSize
@@ -181,10 +478,24 @@ func constructTaskLogsFilters(req *apiv1.TaskLogsRequest) ([]api.Filter, error) 
 		}
 	}
 
+	// Allow a value in a list of numbers, or a NULL represented as -1.
+	addNullInclusiveFilter := func(field string, values []int32) {
+		if values == nil || !slices.Contains(values, -1) {
+			addInFilter(field, values, len(values))
+			return
+		}
+		filters = append(filters, api.Filter{
+			Field:     field,
+			Operation: api.FilterOperationInOrNull,
+			Values:    values,
+		})
+	}
+
+	addNullInclusiveFilter("rank_id", req.RankIds)
+
 	addInFilter("allocation_id", req.AllocationIds, len(req.AllocationIds))
 	addInFilter("agent_id", req.AgentIds, len(req.AgentIds))
 	addInFilter("container_id", req.ContainerIds, len(req.ContainerIds))
-	addInFilter("rank_id", req.RankIds, len(req.RankIds))
 	addInFilter("stdtype", req.Stdtypes, len(req.Stdtypes))
 	addInFilter("source", req.Sources, len(req.Sources))
 	addInFilter("level", func() interface{} {
@@ -216,6 +527,14 @@ func constructTaskLogsFilters(req *apiv1.TaskLogsRequest) ([]api.Filter, error) 
 			Values:    req.TimestampAfter.AsTime(),
 		})
 	}
+
+	if req.SearchText != "" {
+		filters = append(filters, api.Filter{
+			Field:     "log",
+			Operation: api.FilterOperationStringContainment,
+			Values:    req.SearchText,
+		})
+	}
 	return filters, nil
 }
 
@@ -223,7 +542,18 @@ func (a *apiServer) TaskLogsFields(
 	req *apiv1.TaskLogsFieldsRequest, resp apiv1.Determined_TaskLogsFieldsServer,
 ) error {
 	taskID := model.TaskID(req.TaskId)
+
+	var timeSinceLastAuth time.Time
 	fetch := func(lr api.BatchRequest) (api.Batch, error) {
+		if time.Now().Sub(timeSinceLastAuth) >= recheckAuthPeriod {
+			if err := a.canDoActionsOnTask(resp.Context(), taskID,
+				expauth.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+				return nil, err
+			}
+
+			timeSinceLastAuth = time.Now()
+		}
+
 		fields, err := a.m.taskLogBackend.TaskLogsFields(taskID)
 		return api.ToBatchOfOne(fields), err
 	}

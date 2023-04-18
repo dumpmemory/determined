@@ -1,22 +1,19 @@
 package db
 
 import (
+	"context"
 	"crypto/ed25519"
-	"crypto/rsa"
-	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt"
 	"github.com/jackc/pgconn"
 	"github.com/jmoiron/sqlx"
 	"github.com/o1egl/paseto"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/guregu/null.v3"
 
 	"github.com/determined-ai/determined/master/pkg/model"
+	"github.com/determined-ai/determined/proto/pkg/userv1"
 )
 
 // SessionDuration is how long a newly created session is valid.
@@ -35,7 +32,8 @@ func (db *PgDB) StartUserSession(user *model.User) (string, error) {
 	}
 
 	v2 := paseto.NewV2()
-	token, err := v2.Sign(db.tokenKeys.PrivateKey, userSession, nil)
+	privateKey := db.tokenKeys.PrivateKey
+	token, err := v2.Sign(privateKey, userSession, nil)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to generate user authentication token")
 	}
@@ -54,139 +52,17 @@ func (db *PgDB) DeleteUserSessionByToken(token string) error {
 	return db.DeleteUserSessionByID(session.ID)
 }
 
-// UserByToken returns a user session given an authentication token.
-func (db *PgDB) UserByToken(token string, ext *model.ExternalSessions) (
-	*model.User, *model.UserSession, error) {
-	if ext.JwtKey != "" {
-		return db.UserByExternalToken(token, ext)
-	}
-
-	v2 := paseto.NewV2()
-
-	var session model.UserSession
-	err := v2.Verify(token, db.tokenKeys.PublicKey, &session, nil)
-	if err != nil {
-		return nil, nil, ErrNotFound
-	}
-
-	query := `SELECT * FROM user_sessions WHERE id=$1`
-	if err := db.query(query, &session, session.ID); errors.Cause(err) == ErrNotFound {
-		return nil, nil, ErrNotFound
-	} else if err != nil {
-		return nil, nil, err
-	}
-
-	if session.Expiry.Before(time.Now()) {
-		return nil, nil, ErrNotFound
-	}
-
-	var user model.User
-	if err := db.query(`
-SELECT users.* FROM users
-JOIN user_sessions ON user_sessions.user_id = users.id
-WHERE user_sessions.id=$1`, &user, session.ID); errors.Cause(err) == ErrNotFound {
-		return nil, nil, ErrNotFound
-	} else if err != nil {
-		return nil, nil, err
-	}
-
-	return &user, &session, nil
-}
-
-// UserByExternalToken returns a user session derived from an external authentication token.
-func (db *PgDB) UserByExternalToken(tokenText string,
-	ext *model.ExternalSessions) (*model.User, *model.UserSession, error) {
-	type externalToken struct {
-		*jwt.StandardClaims
-		Email string
-	}
-
-	token, err := jwt.ParseWithClaims(tokenText, &externalToken{},
-		func(token *jwt.Token) (interface{}, error) {
-			var publicKey rsa.PublicKey
-			err := json.Unmarshal([]byte(ext.JwtKey), &publicKey)
-			if err != nil {
-				log.Errorf("error parsing JWT key: %s", err.Error())
-				return nil, err
-			}
-			return &publicKey, nil
-		},
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-	claims := token.Claims.(*externalToken)
-
-	// Access control logic can be applied here
-
-	tx, err := db.sql.Beginx()
-	defer func() {
-		if tx == nil {
-			return
-		}
-
-		if rErr := tx.Rollback(); rErr != nil {
-			log.Errorf("error during rollback: %v", rErr)
-		}
-	}()
-	if err != nil {
-		return nil, nil, errors.WithStack(err)
-	}
-	user, err := db.UserByUsername(claims.Email)
-	if err != nil {
-		if err != ErrNotFound {
-			return nil, nil, err
-		}
-		user = &model.User{
-			Username:     claims.Email,
-			PasswordHash: null.NewString("", false),
-			Admin:        true,
-			Active:       true,
-		}
-		userID, err := addUser(tx, user)
-		if err != nil {
-			return nil, nil, errors.WithStack(err)
-		}
-		user.ID = userID
-		if err := tx.Commit(); err != nil {
-			return nil, nil, errors.WithStack(err)
-		}
-		tx = nil
-	}
-
-	session := &model.UserSession{
-		ID:     model.SessionID(user.ID),
-		UserID: user.ID,
-		Expiry: time.Unix(claims.ExpiresAt, 0),
-	}
-
-	return user, session, nil
-}
-
 // DeleteUserSessionByID deletes the user session with the given ID.
 func (db *PgDB) DeleteUserSessionByID(sessionID model.SessionID) error {
 	_, err := db.sql.Exec("DELETE FROM user_sessions WHERE id=$1", sessionID)
 	return err
 }
 
-// UserByUsername looks up a user by name in the database.
-func (db *PgDB) UserByUsername(username string) (*model.User, error) {
-	var user model.User
-	query := `SELECT * FROM users WHERE username=$1`
-	if err := db.query(query, &user, strings.ToLower(username)); errors.Cause(err) == ErrNotFound {
-		return nil, ErrNotFound
-	} else if err != nil {
-		return nil, err
-	}
-
-	return &user, nil
-}
-
 func addUser(tx *sqlx.Tx, user *model.User) (model.UserID, error) {
 	stmt, err := tx.PrepareNamed(`
 INSERT INTO users
-(username, admin, active, password_hash)
-VALUES (:username, :admin, :active, :password_hash)
+(username, admin, active, password_hash, display_name, remote)
+VALUES (:username, :admin, :active, :password_hash, :display_name, :remote)
 RETURNING id`)
 	if err != nil {
 		return 0, errors.WithStack(err)
@@ -195,14 +71,41 @@ RETURNING id`)
 
 	if err := stmt.QueryRowx(user).Scan(&user.ID); err != nil {
 		if pgerr, ok := errors.Cause(err).(*pgconn.PgError); ok {
-			if pgerr.Code == uniqueViolation {
+			if pgerr.Code == CodeUniqueViolation {
 				return 0, ErrDuplicateRecord
 			}
 		}
 		return 0, errors.Wrapf(err, "error creating user %v", err)
 	}
 
+	if err := addUserPersonalGroup(tx, user.ID); err != nil {
+		return 0, errors.Wrap(err, "error adding users personal group")
+	}
+
 	return user.ID, nil
+}
+
+// PersonalGroupPostfix is the system postfix appended to the username of all personal groups.
+const PersonalGroupPostfix = "DeterminedPersonalGroup"
+
+func addUserPersonalGroup(tx *sqlx.Tx, userID model.UserID) error {
+	query := `
+INSERT INTO groups(group_name, user_id) 
+SELECT username || $2 AS group_name, id AS user_id FROM users 
+WHERE id = $1`
+	if _, err := tx.Exec(query, userID, PersonalGroupPostfix); err != nil {
+		return errors.WithStack(err)
+	}
+
+	query = `
+INSERT INTO user_group_membership(user_id, group_id)
+SELECT user_id AS user_id, id AS group_id FROM groups 
+WHERE user_id = $1`
+	if _, err := tx.Exec(query, userID); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
 }
 
 func addAgentUserGroup(tx *sqlx.Tx, userID model.UserID, ug *model.AgentUserGroup) error {
@@ -234,10 +137,10 @@ func deleteAgentUserGroup(tx *sqlx.Tx, userID model.UserID) error {
 }
 
 // AddUser creates a new user.
-func (db *PgDB) AddUser(user *model.User, ug *model.AgentUserGroup) error {
+func (db *PgDB) AddUser(user *model.User, ug *model.AgentUserGroup) (model.UserID, error) {
 	tx, err := db.sql.Beginx()
 	if err != nil {
-		return errors.WithStack(err)
+		return 0, errors.WithStack(err)
 	}
 
 	defer func() {
@@ -252,21 +155,21 @@ func (db *PgDB) AddUser(user *model.User, ug *model.AgentUserGroup) error {
 
 	userID, err := addUser(tx, user)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	if ug != nil {
 		if err := addAgentUserGroup(tx, userID, ug); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return errors.WithStack(err)
+		return 0, errors.WithStack(err)
 	}
 
 	tx = nil
-	return nil
+	return userID, nil
 }
 
 // UpdateUser updates an existing user.  `toUpdate` names the fields to update.
@@ -314,9 +217,10 @@ func (db *PgDB) UpdateUser(updated *model.User, toUpdate []string, ug *model.Age
 		if err = deleteAgentUserGroup(tx, updated.ID); err != nil {
 			return err
 		}
-
-		if err = addAgentUserGroup(tx, updated.ID, ug); err != nil {
-			return err
+		if *ug != (model.AgentUserGroup{}) {
+			if err = addAgentUserGroup(tx, updated.ID, ug); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -344,20 +248,14 @@ func (db *PgDB) UserList() (values []model.FullUser, err error) {
 	return values, err
 }
 
-// UserByID returns the full user for a given ID.
-func (db *PgDB) UserByID(userID model.UserID) (*model.FullUser, error) {
-	var fu model.FullUser
-	if err := db.query(`
-SELECT
-	u.id, u.username, u.display_name, u.admin, u.active,
-	h.uid AS agent_uid, h.gid AS agent_gid, h.user_ AS agent_user, h.group_ AS agent_group
-FROM users u
-LEFT OUTER JOIN agent_user_groups h ON (u.id = h.user_id)
-WHERE u.id = $1`, &fu, userID); err != nil {
-		return nil, err
+// UserImage returns the profile picture associated with the user.
+func (db *PgDB) UserImage(username string) (photo []byte, err error) {
+	type photoRow struct {
+		Photo []byte
 	}
-
-	return &fu, nil
+	var userPhoto photoRow
+	err = db.Query("get_user_image", &userPhoto, username)
+	return userPhoto.Photo, err
 }
 
 // AgentUserGroup returns the AgentUserGroup for the user or nil if none exists.
@@ -393,6 +291,7 @@ func (db *PgDB) initAuthKeys() error {
 	default:
 		db.tokenKeys = storedKeys
 	}
+	setTokenKeys(db.tokenKeys)
 	return nil
 }
 
@@ -414,4 +313,33 @@ func (db *PgDB) AuthTokenKeypair() (*model.AuthTokenKeypair, error) {
 	default:
 		return &tokenKeypair, nil
 	}
+}
+
+// UpdateUserSetting updates user setting.
+func UpdateUserSetting(setting *model.UserWebSetting) error {
+	if len(setting.Value) == 0 {
+		_, err := Bun().NewDelete().Model(setting).Where(
+			"user_id = ?", setting.UserID).Where(
+			"storage_path = ?", setting.StoragePath).Where(
+			"key = ?", setting.Key).Exec(context.TODO())
+		return err
+	}
+
+	_, err := Bun().NewInsert().Model(setting).On("CONFLICT (user_id, key, storage_path) DO UPDATE").
+		Set("value = EXCLUDED.value").Exec(context.TODO())
+	return err
+}
+
+// GetUserSetting gets user setting.
+func GetUserSetting(userID model.UserID) ([]*userv1.UserWebSetting, error) {
+	setting := []*userv1.UserWebSetting{}
+	err := Bun().NewSelect().Model(&setting).Where("user_id = ?", userID).Scan(context.TODO())
+	return setting, err
+}
+
+// ResetUserSetting resets user setting.
+func ResetUserSetting(userID model.UserID) error {
+	var setting model.UserWebSetting
+	_, err := Bun().NewDelete().Model(&setting).Where("user_id = ?", userID).Exec(context.TODO())
+	return err
 }

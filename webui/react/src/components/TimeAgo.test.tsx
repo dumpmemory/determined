@@ -1,10 +1,13 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import dayjs from 'dayjs';
-import React from 'react';
 
 import {
-  DURATION_DAY, DURATION_HOUR, DURATION_MINUTE, DURATION_SECOND, DURATION_YEAR,
-} from 'utils/datetime';
+  DURATION_DAY,
+  DURATION_HOUR,
+  DURATION_MINUTE,
+  DURATION_SECOND,
+  DURATION_YEAR,
+} from 'shared/utils/datetime';
 
 import TimeAgo, { TimeAgoCase } from './TimeAgo';
 
@@ -46,7 +49,7 @@ describe('TimeAgo', () => {
     const customClassName = 'customClassName';
     const view = render(<TimeAgo className={customClassName} datetime={datetime} />);
     const element = view.getByText(daysMatch);
-    expect(element.className).toBe(customClassName);
+    expect(element.className).toBe(`base ${customClassName}`);
   });
 
   it('should render "Just Now" when < 1 minute', () => {
@@ -116,21 +119,21 @@ describe('TimeAgo', () => {
   it('should render updates', async () => {
     render(<TimeAgo datetime={shared.now - 59 * DURATION_SECOND} />);
     expect(screen.getByText(/just now/i)).toBeInTheDocument();
-
+    await new Promise((r) => setTimeout(r, 2000));
     await waitFor(() => expect(screen.queryByText(/1m ago/i)).not.toBeNull());
     expect(screen.getByText(/1m ago/i)).toBeInTheDocument();
   });
 
   it('should not render updates', async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
 
     render(<TimeAgo datetime={shared.now - 59 * DURATION_SECOND} noUpdate />);
     expect(screen.getByText(/just now/i)).toBeInTheDocument();
 
-    await jest.advanceTimersByTime(2000);
+    await vi.advanceTimersByTime(2000);
     expect(screen.getByText(/just now/i)).toBeInTheDocument();
 
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   it('should render lower case', () => {

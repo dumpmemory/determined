@@ -43,10 +43,11 @@ class NotFoundException(APIException):
 
 class ForbiddenException(BadRequestException):
     def __init__(self, username: str, message: str = ""):
-        super().__init__(
-            message=f"Forbidden({message}): Please contact your administrator "
-            "in order to access this resource."
-        )
+        err_message = f"Forbidden({message})"
+        if not (message == "invalid credentials" or message == "user not found"):
+            err_message += ": Please contact your administrator in order to access this resource."
+
+        super().__init__(message=err_message)
         self.username = username
 
 
@@ -74,3 +75,14 @@ class CorruptCertificateCacheException(Exception):
             "Attempted to read a corrupted certificate cache.  The store has been deleted; "
             "please try again.\n"
         )
+
+
+class EmptyResultException(BadResponseException):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class DeleteFailedException(APIException):
+    def __init__(self, error_message: str) -> None:
+        self.message = error_message
+        self.status_code = 200

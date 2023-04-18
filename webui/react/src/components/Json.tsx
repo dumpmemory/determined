@@ -1,13 +1,14 @@
 import React from 'react';
 
-import { RawJson } from 'types';
-import { isObject } from 'utils/data';
+import { RawJson } from 'shared/types';
+import { isObject } from 'shared/utils/data';
 
 import css from './Json.module.scss';
 
 type TextTransfomer = (key: string) => string;
 
 interface Props {
+  alternateBackground?: boolean;
   hideDivider?: boolean;
   json: RawJson;
   translateLabel?: TextTransfomer;
@@ -31,22 +32,25 @@ const Row: React.FC<RowProps> = ({ translateLabel, label, value }: RowProps) => 
   return (
     <li className={css.item} key={label}>
       <span className={css.label}>
-        {typeof label === 'string' && translateLabel ? translateLabel(label) : label}
-        :
+        {typeof label === 'string' && translateLabel ? translateLabel(label) : label}:
       </span>
-      <span className={css.value}>
-        {textValue}
-      </span>
+      <span className={css.value}>{textValue}</span>
     </li>
   );
 };
 
-const Json: React.FC<Props> = ({ json, translateLabel, hideDivider }: Props) => {
-  const classes = [ css.base ];
-  if(hideDivider) classes.push(css.hideDivider);
+const Json: React.FC<Props> = ({
+  json,
+  translateLabel,
+  hideDivider,
+  alternateBackground,
+}: Props) => {
+  const classes = [css.base];
+  if (hideDivider) classes.push(css.hideDivider);
+  if (alternateBackground) classes.push(css.alternateBackground);
   return (
     <ul className={classes.join(' ')}>
-      {Object.entries(json).map(([ label, value ]) => (
+      {Object.entries(json).map(([label, value]) => (
         <Row key={label} label={label} translateLabel={translateLabel} value={value} />
       ))}
     </ul>

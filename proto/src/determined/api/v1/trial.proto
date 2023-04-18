@@ -6,13 +6,353 @@ option go_package = "github.com/determined-ai/determined/proto/pkg/apiv1";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
+import "determined/common/v1/common.proto";
 import "determined/experiment/v1/experiment.proto";
 import "determined/experiment/v1/searcher.proto";
 import "determined/log/v1/log.proto";
 import "determined/trial/v1/trial.proto";
+import "determined/api/v1/experiment.proto";
 import "determined/api/v1/pagination.proto";
 import "determined/checkpoint/v1/checkpoint.proto";
 import "protoc-gen-swagger/options/annotations.proto";
+
+// Summarized Metric captures a metric's name and downsampled data points.
+message SummarizedMetric {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "data", "name", "type" ] }
+  };
+  // Name of the selected metric.
+  string name = 1;
+  // A possibly down-sampled series of metric readings through the progress of
+  // the trial.
+  repeated DataPoint data = 2;
+  // Type of metrics (training, validation, or unset).
+  MetricType type = 3;
+}
+
+// WorkloadContainer is a wrapper for Determined workloads to allow repeated
+// oneof types.
+message WorkloadContainer {
+  // workload represent one of Determined workloads: training, validation, or
+  // checkpoint.
+  oneof workload {
+    // Training workload.
+    determined.trial.v1.MetricsWorkload training = 4;
+    // Validation workload.
+    determined.trial.v1.MetricsWorkload validation = 5;
+    // Checkpoint workload.
+    determined.trial.v1.CheckpointWorkload checkpoint = 6;
+  }
+}
+
+// A filter structure to allow for range filters on arbitrary keys
+message ColumnFilter {
+  // The name of the field on which the filters is applied.
+  string name = 1;
+  // The filter to apply to the given column
+  determined.common.v1.DoubleFieldFilter filter = 2;
+}
+
+// Tag for trials. Implemented in such a way to allow easy
+// evolvability into/coexistence with key/values tags
+message TrialTag {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "key" ] }
+  };
+  // The actual tag.
+  string key = 1;
+}
+
+// Struct to specify a sorting for trials. Used for both determining sort order
+// for returned trials, and for filtering trials by their rank according to
+// sorter
+message TrialSorter {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "namespace", "field" ] }
+  };
+  // Namespace for the sort field. corresponds to the different ways
+  // to access in the db
+  enum Namespace {
+    // Namespace for columns in the trials table
+    NAMESPACE_UNSPECIFIED = 0;
+    // Namespace corrspondings to trials->hparams
+    NAMESPACE_HPARAMS = 1;
+    // Namespace corrspondings to steps->avg_metrics
+    NAMESPACE_TRAINING_METRICS = 2;
+    // Namespace corrspondings to validations->validation_metrics
+    NAMESPACE_VALIDATION_METRICS = 3;
+  }
+  // The namespace for the sort field.
+  Namespace namespace = 1;
+  // The name of the sort field.
+  string field = 2;
+  // The ordering for the sort.
+  OrderBy order_by = 3;
+}
+
+// Filters to be applied to trials. Can be used to query, patch, and create
+// dynamic collections of trials.
+message TrialFilters {
+  // Filter trials by their corresponding experiment ids.
+  repeated int32 experiment_ids = 1;
+  // Filter trials by their corresponding project ids.
+  repeated int32 project_ids = 2;
+  // Filter trials by their corresponding workspace ids.
+  repeated int32 workspace_ids = 3;
+  // Filter trials to those containing ALL validation_metrics
+  // within the indicated ranges.
+  repeated ColumnFilter validation_metrics = 4;
+  // Filter trials to those containing ALL training_metrics
+  // within the indicated ranges.
+  repeated ColumnFilter training_metrics = 5;
+  // Filter trials to those containing ALL hyperparameters
+  // within the indicated ranges. Nested hparams are specified
+  // with dots.
+  repeated ColumnFilter hparams = 6;
+  // Filter trials according to the creators user id.
+  repeated int32 user_ids = 8;
+  // Filter trials according to the name of the searcher used.
+  string searcher = 7;
+  // Filter trials to those containing ANY of the provided tags.
+  repeated TrialTag tags = 9;
+  // Specifies a ranking for trials within their experiment.
+  message RankWithinExp {
+    // Specifies the sorter for determining the rank
+    TrialSorter sorter = 1;
+    // Specifies the top $RANK experiements to filter to
+    int32 rank = 2;
+  }
+  // Filter trials according to their rank within the experiment.
+  RankWithinExp rank_within_exp = 10;
+  // Filter trials to those starting within the given range.
+  determined.common.v1.TimestampFieldFilter start_time = 11;
+  // Filter trials to those ending within the given range.
+  determined.common.v1.TimestampFieldFilter end_time = 12;
+  // Filter trials to those with any of the given states.
+  repeated determined.trial.v1.State states = 13;
+  // Filter trials to those with the given searcher metric.
+  string searcher_metric = 14;
+  // Filter trials to those with a searcher metric within a given range
+  determined.common.v1.DoubleFieldFilter searcher_metric_value = 15;
+  // Filter trials to those with the provided ids
+  repeated int32 trial_ids = 16;
+}
+
+// Request to QueryTrials includes pagination parameters and TrialFilters.
+message QueryTrialsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "filters" ] }
+  };
+  // The filters to be appled to the trial.
+  TrialFilters filters = 1;
+  // Sort trials by the given field.
+  TrialSorter sorter = 2;
+  // Offset for pagination.
+  int32 offset = 3;
+  // Limit the number of trials. A value of 0 denotes no limit.
+  int32 limit = 4;
+}
+
+// Augmented Trial struct to service trial comparison functionality.
+message AugmentedTrial {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: {
+      required: [
+        "trial_id",
+        "state",
+        "hparams",
+        "training_metrics",
+        "validation_metrics",
+        "tags",
+        "start_time",
+        "end_time",
+        "searcher_type",
+        "experiment_id",
+        "experiment_name",
+        "experiment_description",
+        "experiment_labels",
+        "user_id",
+        "project_id",
+        "workspace_id",
+        "total_batches"
+      ]
+    }
+  };
+  // The id of the trial.
+  int32 trial_id = 1;
+  // The state of the trial.
+  determined.trial.v1.State state = 2;
+  // The hyperparameters for the trial
+  google.protobuf.Struct hparams = 3;
+  // The training metrics for the trial.
+  google.protobuf.Struct training_metrics = 4;
+  // The validation metrics for the trial.
+  google.protobuf.Struct validation_metrics = 5;
+  // The tags for the trial.
+  google.protobuf.Struct tags = 6;
+  // The start time for the trial.
+  google.protobuf.Timestamp start_time = 7;
+  // The end time for the trial.
+  google.protobuf.Timestamp end_time = 8;
+  // The searcher type for the trial.
+  string searcher_type = 9;
+  // The trials rank within the experiment, according to
+  // the sorter that is provided.
+  int32 rank_within_exp = 10;
+  // The experiment id for the trial.
+  int32 experiment_id = 11;
+  // The experiment name for the trial.
+  string experiment_name = 12;
+  // The experiment description for the trial.
+  string experiment_description = 13;
+  // The labels for the experiment corresponding to the trial.
+  repeated string experiment_labels = 14;
+  // The id of the user who created the experiment corresponding
+  // to the trial.
+  int32 user_id = 15;
+  // The project id for the trial.
+  int32 project_id = 16;
+  // The workspace id for the trial.
+  int32 workspace_id = 17;
+  // The total number of batches in the trial.
+  int32 total_batches = 18;
+  // The name of the trials searcher metric.
+  string searcher_metric = 19;
+  // The value for the trials searcher metric.
+  double searcher_metric_value = 20;
+  // The loss for the trials searcher metric.
+  double searcher_metric_loss = 21;
+}
+
+// Response for QueryTrials.
+message QueryTrialsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "trials" ] }
+  };
+  // The trials matching the query, with extra data.
+  repeated AugmentedTrial trials = 1;
+}
+
+// Specifies whether a tag should be added or removed.
+message TrialPatch {
+  // Specifies that a tag will be added.
+  repeated TrialTag add_tag = 1;
+  // Specifies that a tag will be removed.
+  repeated TrialTag remove_tag = 2;
+}
+
+// Request to patch trials. Can either specify a set of filters or
+// set of trial ids as the patch target.
+message UpdateTrialTagsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "target", "patch" ] }
+  };
+  // struct for the ids parameter.
+  message Ids {
+    // List of Trial ids
+    repeated int32 ids = 1;
+  }
+  // the possible patch targets.
+  oneof target {
+    // patch that targets trials matching filters.
+    TrialFilters filters = 2;
+    // Patch that targets a list of trials.
+    Ids trial = 3;
+  }
+  // The patch to be applied to the trials
+  TrialPatch patch = 4;
+}
+
+// Response message to PatchTrials.
+message UpdateTrialTagsResponse {
+  // The number of trials that were patched.
+  int32 rows_affected = 1;
+}
+
+// Struct that represents a dynamic collection of trials,
+// along with some accompanying metadata.
+message TrialsCollection {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: {
+      required: [ "name", "project_id", "filters", "sorter", "id", "user_id" ]
+    }
+  };
+  // The id for the collection.
+  int32 id = 1;
+  // The id of the user who created the collection.
+  int32 user_id = 2;
+  // The id of the project that the collection belongs to .
+  int32 project_id = 3;
+  // The name of the collection.
+  string name = 4;
+  // The filters that define the trials within the collection.
+  TrialFilters filters = 5;
+  // A sorter that determines the order for trials in the collection.
+  TrialSorter sorter = 6;
+}
+
+// Request message for GetTrialsCollection.
+message GetTrialsCollectionsRequest {
+  // The id of the project for which to retrieve all collections
+  int32 project_id = 1;
+}
+
+// Response message for GetTrialsCollection.
+message GetTrialsCollectionsResponse {
+  // The collections belonging to that project.
+  repeated TrialsCollection collections = 1;
+}
+
+// Request body for CeateTrials request which includes TrialFilters.
+message CreateTrialsCollectionRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "name", "project_id", "filters", "sorter" ] }
+  };
+  // The name for the collection.
+  string name = 1;
+  // The project id for the collection.
+  int32 project_id = 2;
+  // The filters for the collection.
+  TrialFilters filters = 3;
+  // The sorter for the collection.
+  TrialSorter sorter = 4;
+}
+
+//  Response message to CreateTrialCollection.
+message CreateTrialsCollectionResponse {
+  // The collection of trials.
+  TrialsCollection collection = 1;
+}
+
+// Request message to PatchTrialsCollection.
+message PatchTrialsCollectionRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "id" ] }
+  };
+  // The ID of the collection to be patched.
+  int32 id = 1;
+  // The new name for the collection.
+  string name = 2;
+  // The new filters for the collection.
+  TrialFilters filters = 3;
+  // The new sorter for the collection.
+  TrialSorter sorter = 4;
+}
+
+// Response message to PatchTrialsCollection
+message PatchTrialsCollectionResponse {
+  // The patched collection.
+  TrialsCollection collection = 1;
+}
+
+// Request message to PatchTrialsCollection
+message DeleteTrialsCollectionRequest {
+  // The id for the TrialsCollection.
+  int32 id = 1;
+}
+
+// Empty response for DeleteTrialsCollection.
+message DeleteTrialsCollectionResponse {}
 
 // Stream trial logs.
 message TrialLogsRequest {
@@ -43,21 +383,39 @@ message TrialLogsRequest {
   google.protobuf.Timestamp timestamp_after = 13;
   // Order logs in either ascending or descending order by timestamp.
   OrderBy order_by = 14;
+  // Search the logs by whether the text contains a substring.
+  string search_text = 15;
 }
 
 // Response to TrialLogsRequest.
 message TrialLogsResponse {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "id", "level", "message", "timestamp" ] }
+    json_schema: {
+      required: [ "id", "level", "message", "timestamp", "trial_id" ]
+    }
   };
   // The ID of the trial log.
   string id = 1;
   // The timestamp of the log.
   google.protobuf.Timestamp timestamp = 2;
-  // The log message.
-  string message = 3;
+  // The flat version of the log that UIs have shown historically.
+  string message = 3 [deprecated = true];
   // The level of the log.
   determined.log.v1.LogLevel level = 4;
+  // The ID of the trial associated with this log entry.
+  int32 trial_id = 5;
+  // The ID of the agent that logged this.
+  optional string agent_id = 6;
+  // The ID of the container or, in the case of k8s, the pod name.
+  optional string container_id = 7;
+  // The rank ID.
+  optional int32 rank_id = 8;
+  // The text of the log entry.
+  optional string log = 9;
+  // The source of the log entry.
+  optional string source = 10;
+  // The output stream (e.g. stdout, stderr).
+  optional string stdtype = 11;
 }
 
 // Stream distinct trial log fields.
@@ -97,15 +455,11 @@ message GetTrialCheckpointsRequest {
     // Returns checkpoints sorted by UUID.
     SORT_BY_UUID = 1;
     // Returns checkpoints sorted by batch number.
-    SORT_BY_BATCH_NUMBER = 6;
-    // Returns checkpoints sorted by start time.
-    SORT_BY_START_TIME = 7;
+    SORT_BY_BATCH_NUMBER = 2;
     // Returns checkpoints sorted by end time.
-    SORT_BY_END_TIME = 8;
-    // Returns checkpoints sorted by validation state.
-    SORT_BY_VALIDATION_STATE = 15;
+    SORT_BY_END_TIME = 3;
     // Returns checkpoints sorted by state.
-    SORT_BY_STATE = 16;
+    SORT_BY_STATE = 4;
   }
   // The trial id.
   int32 id = 1;
@@ -118,15 +472,15 @@ message GetTrialCheckpointsRequest {
   int32 offset = 4;
   // Limit the number of checkpoints. A value of 0 denotes no limit.
   int32 limit = 5;
-
-  // Limit the checkpoints to those that match the validation states.
-  repeated determined.checkpoint.v1.State validation_states = 6;
   // Limit the checkpoints to those that match the states.
   repeated determined.checkpoint.v1.State states = 7;
 }
 
 // Response to GetTrialCheckpointsRequest.
 message GetTrialCheckpointsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "checkpoints", "pagination" ] }
+  };
   // The list of returned checkpoints.
   repeated determined.checkpoint.v1.Checkpoint checkpoints = 1;
   // Pagination information of the full dataset.
@@ -169,6 +523,10 @@ message GetExperimentTrialsRequest {
     SORT_BY_BATCHES_PROCESSED = 9;
     // Return the trials sorted by the total duration.
     SORT_BY_DURATION = 10;
+    // Return the trials sorted by the number of restarts.
+    SORT_BY_RESTARTS = 11;
+    // Return the trials sorted by checkpoint size.
+    SORT_BY_CHECKPOINT_SIZE = 12;
   }
   // Sort trials by the given field.
   SortBy sort_by = 1;
@@ -203,26 +561,58 @@ message GetTrialRequest {
 // Response to GetTrialRequest.
 message GetTrialResponse {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "trial", "workloads" ] }
+    json_schema: { required: [ "trial" ] }
   };
-  // WorkloadContainer is a wrapper for Determined workloads to allow repeated
-  // oneof types.
-  message WorkloadContainer {
-    // workload represent one of Determined workloads: training, validation, or
-    // checkpoint.
-    oneof workload {
-      // Training workload.
-      determined.trial.v1.MetricsWorkload training = 4;
-      // Validation workload.
-      determined.trial.v1.MetricsWorkload validation = 5;
-      // Checkpoint workload.
-      determined.trial.v1.CheckpointWorkload checkpoint = 6;
-    }
-  }
   // The requested trial.
   determined.trial.v1.Trial trial = 1;
-  // Trial workloads.
-  repeated WorkloadContainer workloads = 2;
+}
+
+// Get the list of workloads for a trial.
+message GetTrialWorkloadsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "trial_id" ] }
+  };
+
+  // Filter workloads with training, validation, and checkpoint information.
+  enum FilterOption {
+    // Any workload.
+    FILTER_OPTION_UNSPECIFIED = 0;
+    // Only workloads with an associated checkpoint.
+    FILTER_OPTION_CHECKPOINT = 1;
+    // Only validation workloads.
+    FILTER_OPTION_VALIDATION = 2;
+    // Only validation workloads or ones with an associated checkpoint.
+    FILTER_OPTION_CHECKPOINT_OR_VALIDATION = 3;
+  }
+
+  // Order workloads in either ascending or descending order.
+  OrderBy order_by = 1;
+  // Skip the number of workloads before returning results. Negative values
+  // denote number of workloads to skip from the end before returning results.
+  int32 offset = 2;
+  // Limit the number of workloads. A value of 0 denotes no limit.
+  int32 limit = 3;
+  // Limit workloads to those that are owned by the specified trial.
+  int32 trial_id = 4;
+  // Sort workloads by batches, a training metric, or a validation metric.
+  string sort_key = 5;
+  // Filter workloads with validation and/or checkpoint information.
+  FilterOption filter = 6;
+  // Include per-batch metrics.
+  bool include_batch_metrics = 7;
+  // When sorting workloads by sort_key, specify training or validation form of
+  // a metric.
+  MetricType metric_type = 8;
+}
+// Response to GetTrialWorkloadsRequest.
+message GetTrialWorkloadsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "workloads", "pagination" ] }
+  };
+  // The list of returned workloads.
+  repeated WorkloadContainer workloads = 1;
+  // Pagination information of the full dataset.
+  Pagination pagination = 2;
 }
 
 // Stream trial profiler metrics.
@@ -274,6 +664,93 @@ message PostTrialProfilerMetricsBatchRequest {
 // Response to PostTrialProfilerMetricsBatchRequest
 message PostTrialProfilerMetricsBatchResponse {}
 
+// Scale options available in metrics charts.
+enum Scale {
+  // Unknown scale.
+  SCALE_UNSPECIFIED = 0;
+  // Downsample points with closeness plotted on a linear y-axis.
+  SCALE_LINEAR = 1;
+  // Downsample points with closeness plotted on a logarithmic y-axis.
+  SCALE_LOG = 2;
+}
+
+// Get downsampled metrics from a trial.
+message SummarizeTrialRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "max_datapoints", "trial_id" ] }
+  };
+  // The requested trial's id.
+  int32 trial_id = 1;
+  // The maximum number of data points to return after downsampling.
+  int32 max_datapoints = 2;
+  // The names of selected metrics.
+  repeated string metric_names = 3;
+  // Sample from metrics after this batch number.
+  int32 start_batches = 4;
+  // Sample from metrics before this batch number.
+  int32 end_batches = 5;
+  // Type of metrics.
+  MetricType metric_type = 6;
+  // Scale of metric visualization (linear or log scale).
+  Scale scale = 7;
+}
+// Response to SummarizeTrialRequest.
+message SummarizeTrialResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "metrics", "trial" ] }
+  };
+  // The requested trial.
+  determined.trial.v1.Trial trial = 1;
+  // The downsampled datapoints.
+  repeated SummarizedMetric metrics = 2;
+}
+
+// Container for a requested trial and its metrics.
+message ComparableTrial {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "metrics", "trial" ] }
+  };
+
+  // The requested trial.
+  determined.trial.v1.Trial trial = 1;
+  // The downsampled datapoints.
+  repeated SummarizedMetric metrics = 2;
+}
+
+// Get time-series downsampled metrics from multiple trials.
+message CompareTrialsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "max_datapoints", "trial_ids" ] }
+  };
+  // The requested trial ids.
+  repeated int32 trial_ids = 1;
+  // The maximum number of data points to return after downsampling.
+  int32 max_datapoints = 2;
+  // The names of selected metrics.
+  repeated string metric_names = 3;
+  // Sample from metrics after this batch number.
+  int32 start_batches = 4;
+  // Sample from metrics before this batch number.
+  int32 end_batches = 5;
+  // Type of metrics.
+  MetricType metric_type = 6;
+  // Scale of metric visualization (linear or log scale).
+  Scale scale = 7;
+  // metric ids for the query
+  repeated string metric_ids = 9;
+  // The metric and range filter for a time series
+  determined.common.v1.PolymorphicFilter time_series_filter = 10;
+}
+
+// Response to CompareTrialsRequest.
+message CompareTrialsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "trials" ] }
+  };
+  // A list of objects containing trial and metrics information.
+  repeated ComparableTrial trials = 1;
+}
+
 // Long poll for updates to the preemption status for an allocation.
 message AllocationPreemptionSignalRequest {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
@@ -297,6 +774,18 @@ message AckAllocationPreemptionSignalRequest {
   // The allocation that is acknowledging the request.
   string allocation_id = 1;
 }
+// Allocation has been notified of a pending preemption
+message AllocationPendingPreemptionSignalRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "allocation_id" ] }
+  };
+  // The id of the allocation.
+  string allocation_id = 1;
+}
+
+// Response to AllocationPendingPreemptionSignalRequest
+message AllocationPendingPreemptionSignalResponse {}
+
 // Response to AckAllocationPreemptionSignalRequest.
 message AckAllocationPreemptionSignalResponse {}
 
@@ -332,6 +821,16 @@ message AllocationRendezvousInfoResponse {
   determined.trial.v1.RendezvousInfo rendezvous_info = 1;
 }
 
+// Set the proxy address for some allocation.
+message PostAllocationProxyAddressRequest {
+  // The id of the allocation.
+  string allocation_id = 1;
+  // The address of the host where the service is, w.r.t. the master.
+  string proxy_address = 2;
+}
+// Response to PostAllocationProxyAddressRequest
+message PostAllocationProxyAddressResponse {}
+
 // Arguments to an all gather.
 message AllocationAllGatherRequest {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
@@ -355,6 +854,33 @@ message AllocationAllGatherResponse {
   repeated google.protobuf.Struct data = 1;
 }
 
+// Arguments to a notify container running.
+message NotifyContainerRunningRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "allocation_id", "global_recv_count", "data" ] }
+  };
+  // The ID of the allocation.
+  string allocation_id = 1;
+  // The UUID of the participant in a notify container running message.
+  string request_uuid = 2;
+  // The number of process to wait for.
+  int32 num_peers = 3;
+  // The container's rank.
+  int32 rank = 4;
+  // The name of the node who sent the request
+  string node_name = 5;
+  // The data from this process.
+  google.protobuf.Struct data = 6;
+}
+// Response to NotifyContainerRunningResponse
+message NotifyContainerRunningResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "data" ] }
+  };
+  // The data for all the processes.
+  repeated google.protobuf.Struct data = 1;
+}
+
 // Retrieves the current searcher operation.
 message GetCurrentTrialSearcherOperationRequest {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
@@ -366,7 +892,7 @@ message GetCurrentTrialSearcherOperationRequest {
 // Response to GetCurrentTrialSearcherOperationRequest
 message GetCurrentTrialSearcherOperationResponse {
   // The current searcher operation.
-  determined.experiment.v1.SearcherOperation op = 1;
+  determined.experiment.v1.TrialOperation op = 1;
   // The status of the searcher operation.
   bool completed = 2;
 }
@@ -436,17 +962,6 @@ message ReportTrialValidationMetricsRequest {
 // Response to ReportTrialValidationMetricsRequest
 message ReportTrialValidationMetricsResponse {}
 
-// Persist the given checkpoint metadata for the trial.
-message ReportTrialCheckpointMetadataRequest {
-  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "checkpoint_metadata" ] }
-  };
-  // The training metrics to persist.
-  determined.trial.v1.CheckpointMetadata checkpoint_metadata = 1;
-}
-// Response to ReportTrialCheckpointMetadataRequest
-message ReportTrialCheckpointMetadataResponse {}
-
 // Partially update the trial metadata.
 message PostTrialRunnerMetadataRequest {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
@@ -459,3 +974,37 @@ message PostTrialRunnerMetadataRequest {
 }
 // Response to PatchTrialMetadataRequest
 message PostTrialRunnerMetadataResponse {}
+
+// Stream training metrics.
+message GetTrainingMetricsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "trial_ids" ] }
+  };
+  // Trial IDs to get metrics for.
+  repeated int32 trial_ids = 1;
+}
+// Response to GetTrainingMetricsRequest.
+message GetTrainingMetricsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "metrics" ] }
+  };
+  // Metric response.
+  repeated determined.trial.v1.MetricsReport metrics = 1;
+}
+
+// Stream validation metrics.
+message GetValidationMetricsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "trial_ids" ] }
+  };
+  // Trial IDs to get metrics for.
+  repeated int32 trial_ids = 1;
+}
+// Response to GetTrainingMetricsRequest.
+message GetValidationMetricsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "metrics" ] }
+  };
+  // Metric response.
+  repeated determined.trial.v1.MetricsReport metrics = 1;
+}

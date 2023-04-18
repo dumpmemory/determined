@@ -14,12 +14,18 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/determined-ai/determined/master/internal/api"
+	"github.com/determined-ai/determined/master/internal/api/apiutils"
+	"github.com/determined-ai/determined/master/internal/command"
+	"github.com/determined-ai/determined/master/internal/db"
+	"github.com/determined-ai/determined/master/internal/grpcutil"
 	"github.com/determined-ai/determined/master/pkg/actor"
 	"github.com/determined-ai/determined/master/pkg/archive"
 	"github.com/determined-ai/determined/master/pkg/check"
+	pkgCommand "github.com/determined-ai/determined/master/pkg/command"
 	"github.com/determined-ai/determined/master/pkg/etc"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/master/pkg/protoutils"
+	"github.com/determined-ai/determined/master/pkg/ptrs"
 	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 	"github.com/determined-ai/determined/master/pkg/ssh"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
@@ -37,41 +43,153 @@ const (
 var shellsAddr = actor.Addr("shells")
 
 func (a *apiServer) GetShells(
-	_ context.Context, req *apiv1.GetShellsRequest,
+	ctx context.Context, req *apiv1.GetShellsRequest,
 ) (resp *apiv1.GetShellsResponse, err error) {
+	defer func() {
+		if status.Code(err) == codes.Unknown {
+			err = apiutils.MapAndFilterErrors(err, nil, nil)
+		}
+	}()
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	workspaceNotFoundErr := status.Errorf(codes.NotFound, "workspace %d not found", req.WorkspaceId)
+
+	if req.WorkspaceId != 0 {
+		// check if the workspace exists.
+		_, err = a.GetWorkspaceByID(ctx, req.WorkspaceId, *curUser, false)
+		if errors.Is(err, db.ErrNotFound) {
+			return nil, workspaceNotFoundErr
+		} else if err != nil {
+			return nil, err
+		}
+	}
+
 	if err = a.ask(shellsAddr, req, &resp); err != nil {
 		return nil, err
 	}
+	limitedScopes, err := command.AuthZProvider.Get().AccessibleScopes(
+		ctx, *curUser, model.AccessScopeID(req.WorkspaceId),
+	)
+	if err != nil {
+		return nil, apiutils.MapAndFilterErrors(err, nil, nil)
+	}
+
+	if req.WorkspaceId != 0 && len(limitedScopes) == 0 {
+		return nil, workspaceNotFoundErr
+	}
+
+	a.filter(&resp.Shells, func(i int) bool {
+		return limitedScopes[model.AccessScopeID(resp.Shells[i].WorkspaceId)]
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
 	a.sort(resp.Shells, req.OrderBy, req.SortBy, apiv1.GetShellsRequest_SORT_BY_ID)
 	return resp, a.paginate(&resp.Pagination, &resp.Shells, req.Offset, req.Limit)
 }
 
 func (a *apiServer) GetShell(
-	_ context.Context, req *apiv1.GetShellRequest) (resp *apiv1.GetShellResponse, err error) {
-	return resp, a.ask(shellsAddr.Child(req.ShellId), req, &resp)
+	ctx context.Context, req *apiv1.GetShellRequest,
+) (resp *apiv1.GetShellResponse, err error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	addr := shellsAddr.Child(req.ShellId)
+	if err = a.ask(addr, req, &resp); err != nil {
+		return nil, err
+	}
+
+	if ok, err := command.AuthZProvider.Get().CanGetNSC(
+		ctx, *curUser, model.AccessScopeID(resp.Shell.WorkspaceId)); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errActorNotFound(addr)
+	}
+	return resp, nil
 }
 
 func (a *apiServer) KillShell(
-	_ context.Context, req *apiv1.KillShellRequest) (resp *apiv1.KillShellResponse, err error) {
+	ctx context.Context, req *apiv1.KillShellRequest,
+) (resp *apiv1.KillShellResponse, err error) {
+	defer func() {
+		if status.Code(err) == codes.Unknown {
+			err = apiutils.MapAndFilterErrors(err, nil, nil)
+		}
+	}()
+
+	getResponse, err := a.GetShell(ctx, &apiv1.GetShellRequest{ShellId: req.ShellId})
+	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	err = command.AuthZProvider.Get().CanTerminateNSC(
+		ctx, *curUser, model.AccessScopeID(getResponse.Shell.WorkspaceId))
+	if err != nil {
+		return nil, err
+	}
+
 	return resp, a.ask(shellsAddr.Child(req.ShellId), req, &resp)
 }
 
 func (a *apiServer) SetShellPriority(
-	_ context.Context, req *apiv1.SetShellPriorityRequest,
+	ctx context.Context, req *apiv1.SetShellPriorityRequest,
 ) (resp *apiv1.SetShellPriorityResponse, err error) {
+	defer func() {
+		if status.Code(err) == codes.Unknown {
+			err = apiutils.MapAndFilterErrors(err, nil, nil)
+		}
+	}()
+
+	getResponse, err := a.GetShell(ctx, &apiv1.GetShellRequest{ShellId: req.ShellId})
+	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	err = command.AuthZProvider.Get().CanSetNSCsPriority(
+		ctx, *curUser, model.AccessScopeID(getResponse.Shell.WorkspaceId), int(req.Priority))
+	if err != nil {
+		return nil, err
+	}
+
 	return resp, a.ask(shellsAddr.Child(req.ShellId), req, &resp)
 }
 
 func (a *apiServer) LaunchShell(
 	ctx context.Context, req *apiv1.LaunchShellRequest,
 ) (*apiv1.LaunchShellResponse, error) {
-	spec, err := a.getCommandLaunchParams(ctx, &protoCommandParams{
+	spec, launchWarnings, err := a.getCommandLaunchParams(ctx, &protoCommandParams{
 		TemplateName: req.TemplateName,
 		Config:       req.Config,
 		Files:        req.Files,
 	})
 	if err != nil {
 		return nil, api.APIErrToGRPC(errors.Wrapf(err, "failed to prepare launch params"))
+	}
+
+	spec.Metadata.WorkspaceID = model.DefaultWorkspaceID
+	if req.WorkspaceId != 0 {
+		spec.Metadata.WorkspaceID = model.AccessScopeID(req.WorkspaceId)
+	}
+	if err = a.isNTSCPermittedToLaunch(ctx, spec); err != nil {
+		return nil, err
 	}
 
 	// Postprocess the spec.
@@ -85,8 +203,13 @@ func (a *apiServer) LaunchShell(
 	// Selecting a random port mitigates the risk of multiple processes binding
 	// the same port on an agent in host mode.
 	port := getRandomPort(minSshdPort, maxSshdPort)
-	spec.Port = &port
-	spec.Config.Environment.Ports = map[string]int{"shell": port}
+	// Shell authentication happens through SSH keys, instead.
+	spec.Base.ExtraProxyPorts = append(spec.Base.ExtraProxyPorts, expconf.ProxyPort{
+		RawProxyPort:        port,
+		RawProxyTCP:         ptrs.Ptr(true),
+		RawUnauthenticated:  ptrs.Ptr(true),
+		RawDefaultServiceID: ptrs.Ptr(true),
+	})
 
 	spec.Config.Entrypoint = []string{
 		shellEntrypointScript, "-f", shellSSHDConfigFile, "-p", strconv.Itoa(port), "-D", "-e",
@@ -100,43 +223,39 @@ func (a *apiServer) LaunchShell(
 		spec.Base.AgentUserGroup.OwnedArchiveItem(
 			shellEntrypointScript,
 			etc.MustStaticFile(etc.ShellEntrypointResource),
-			0700,
+			0o700,
 			tar.TypeReg,
 		),
 		spec.Base.AgentUserGroup.OwnedArchiveItem(
 			taskReadyCheckLogs,
 			etc.MustStaticFile(etc.TaskCheckReadyLogsResource),
-			0700,
+			0o700,
 			tar.TypeReg,
 		),
 	}
 
 	spec.Base.ExtraEnvVars = map[string]string{"DET_TASK_TYPE": string(model.TaskTypeShell)}
 
-	var keys ssh.PrivateAndPublicKeys
+	var passphrase *string
 	if len(req.Data) > 0 {
 		var data map[string]interface{}
 		if err = json.Unmarshal(req.Data, &data); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to parse data %s: %s", req.Data, err)
 		}
-		var passphrase *string
 		if pwd, ok := data["passphrase"]; ok {
 			if typed, typedOK := pwd.(string); typedOK {
 				passphrase = &typed
 			}
 		}
-		keys, err = ssh.GenerateKey(spec.Base.SSHRsaSize, passphrase)
-		if err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
-		}
 	}
-	spec.Metadata = map[string]interface{}{
-		"privateKey": string(keys.PrivateKey),
-		"publicKey":  string(keys.PublicKey),
-	}
-	spec.Keys = &keys
 
-	spec.ProxyTCP = true
+	keys, err := ssh.GenerateKey(spec.Base.SSHRsaSize, passphrase)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	spec.Metadata.PrivateKey = ptrs.Ptr(string(keys.PrivateKey))
+	spec.Metadata.PublicKey = ptrs.Ptr(string(keys.PublicKey))
+	spec.Keys = &keys
 
 	// Launch a Shell actor.
 	var shellID model.TaskID
@@ -150,7 +269,8 @@ func (a *apiServer) LaunchShell(
 	}
 
 	return &apiv1.LaunchShellResponse{
-		Shell:  shell,
-		Config: protoutils.ToStruct(spec.Config),
+		Shell:    shell,
+		Config:   protoutils.ToStruct(spec.Config),
+		Warnings: pkgCommand.LaunchWarningToProto(launchWarnings),
 	}, nil
 }

@@ -53,7 +53,8 @@ def overwrite_deepspeed_config(
 
 
 class DeepSpeedTrialContext(det.TrialContext, pytorch._PyTorchReducerContext):
-    """Contains runtime information for any Determined workflow that uses the ``DeepSpeedTrial`` API.
+    """Contains runtime information for any Determined workflow that uses the ``DeepSpeedTrial``
+    API.
 
     With this class, users can do the following things:
 
@@ -69,7 +70,7 @@ class DeepSpeedTrialContext(det.TrialContext, pytorch._PyTorchReducerContext):
     3. Set a custom model parallel configuration that should instantiate a
        :class:`determined.pytorch.deepspeed.ModelParallelUnit` dataclass.  We automatically set the
        mpu for data parallel and standard pipeline parallel training.  This should only be needed
-       if there is additional model parallelism outside of DeepSpeed's supported methods.
+       if there is additional model parallelism outside DeepSpeed's supported methods.
     4. Disable data reproducibility checks to allow custom data loaders.
     5. Disable automatic gradient aggregation for non-pipeline-parallel training.
     """
@@ -83,7 +84,7 @@ class DeepSpeedTrialContext(det.TrialContext, pytorch._PyTorchReducerContext):
         # Track which types we have issued warnings for in to_device().
         self._to_device_warned_types = set()  # type: Set[Type]
 
-        # DeepSpeed supports mixed precision through NVidia Apex AMP.  ZeRO optimizer requires
+        # DeepSpeed supports mixed precision through Nvidia Apex AMP.  ZeRO optimizer requires
         # Apex AMP and cannot be used with more complex AMP modes.
         apex_available = importlib.util.find_spec("apex") is not None
         if not apex_available:
@@ -112,6 +113,8 @@ class DeepSpeedTrialContext(det.TrialContext, pytorch._PyTorchReducerContext):
         self._manual_grad_accumulation = False
 
         self._check_experiment_config_optimizations()
+
+        self._tbd_writer = None  # type: Optional[Any]
 
     def _check_experiment_config_optimizations(self) -> None:
         """
@@ -336,3 +339,42 @@ class DeepSpeedTrialContext(det.TrialContext, pytorch._PyTorchReducerContext):
         if self._current_batch_idx is None:
             raise det.errors.InternalException("Training hasn't started.")
         return self._current_batch_idx
+
+    def get_tensorboard_writer(self) -> Any:
+        """
+        This function returns an instance of ``torch.utils.tensorboard.SummaryWriter``
+
+        Trials users who wish to log to TensorBoard can use this writer object.
+        We provide and manage a writer in order to save and upload TensorBoard
+        files automatically on behalf of the user.
+
+        Usage example:
+
+        .. code-block:: python
+
+           class MyModel(PyTorchTrial):
+               def __init__(self, context):
+                   ...
+                   self.writer = context.get_tensorboard_writer()
+
+               def train_batch(self, batch, epoch_idx, batch_idx):
+                   self.writer.add_scalar('my_metric', np.random.random(), batch_idx)
+                   self.writer.add_image('my_image', torch.ones((3,32,32)), batch_idx)
+        """
+
+        if self._tbd_writer is None:
+            # As of torch v1.9.0, torch.utils.tensorboard has a bug that is exposed by setuptools
+            # 59.6.0.  The bug is that it attempts to import distutils then access distutils.version
+            # without actually importing distutils.version.  We can workaround this by prepopulating
+            # the distutils.version submodule in the distutils module.
+            import distutils.version  # noqa: F401
+
+            from torch.utils.tensorboard import SummaryWriter
+
+            self._tbd_writer = SummaryWriter(self.get_tensorboard_path())  # type: ignore
+
+        return self._tbd_writer
+
+    def _maybe_reset_tbd_writer(self) -> None:
+        if self._tbd_writer is not None:
+            self._tbd_writer.close()

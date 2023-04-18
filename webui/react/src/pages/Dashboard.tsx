@@ -1,245 +1,293 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 
-import Grid, { GridMode } from 'components/Grid';
-import Message, { MessageType } from 'components/Message';
-import OverviewStats from 'components/OverviewStats';
+import ExperimentIcons from 'components/ExperimentIcons';
+import JupyterLabButton from 'components/JupyterLabButton';
+import Breadcrumb from 'components/kit/Breadcrumb';
+import Card from 'components/kit/Card';
+import Empty from 'components/kit/Empty';
+import Link from 'components/Link';
 import Page from 'components/Page';
+import ProjectCard from 'components/ProjectCard';
 import Section from 'components/Section';
-import TaskCard from 'components/TaskCard';
-import TaskFilter from 'components/TaskFilter';
-import { activeCommandStates, activeRunStates } from 'constants/states';
-import { useStore } from 'contexts/Store';
-import { useFetchUsers } from 'hooks/useFetch';
-import usePolling from 'hooks/usePolling';
-import useStorage from 'hooks/useStorage';
+import ResponsiveTable from 'components/Table/ResponsiveTable';
 import {
-  getCommands, getExperiments, getJupyterLabs, getShells, getTensorBoards,
+  experimentNameRenderer,
+  relativeTimeRenderer,
+  taskNameRenderer,
+  taskTypeRenderer,
+} from 'components/Table/Table';
+import usePermissions from 'hooks/usePermissions';
+import { paths } from 'routes/utils';
+import {
+  getCommands,
+  getExperiments,
+  getJupyterLabs,
+  getProjectsByUserActivity,
+  getShells,
+  getTensorBoards,
 } from 'services/api';
-import { Determinedexperimentv1State } from 'services/api-ts-sdk';
-import { encodeExperimentState } from 'services/decoder';
-import { validateDetApiEnumList } from 'services/utils';
-import { ShirtSize } from 'themes';
-import {
-  ALL_VALUE, CommandTask, CommandType, ExperimentItem, RecentTask,
-  ResourceType, RunState, TaskFilters, TaskType,
-} from 'types';
-import { isEqual, validateEnumList } from 'utils/data';
-import handleError, { ErrorType } from 'utils/error';
-import { filterTasks, taskFromCommandTask, taskFromExperiment } from 'utils/task';
+import Icon from 'shared/components/Icon/Icon';
+import Spinner from 'shared/components/Spinner';
+import usePolling from 'shared/hooks/usePolling';
+import { ErrorType } from 'shared/utils/error';
+import { dateTimeStringSorter } from 'shared/utils/sort';
+import userStore from 'stores/users';
+import { CommandTask, DetailedUser, ExperimentItem, Project } from 'types';
+import handleError from 'utils/error';
+import { Loadable } from 'utils/loadable';
+import { useObservable } from 'utils/observable';
 
-const defaultFilters: TaskFilters = {
-  limit: 25,
-  states: [ ALL_VALUE ],
-  types: undefined,
-  users: undefined,
-};
+import css from './Dashboard.module.scss';
 
-const STORAGE_PATH = 'dashboard';
-const STORAGE_FILTERS_KEY = 'filters';
-
-const countActiveCommand = (commands: CommandTask[]): number => {
-  return commands.filter(command => activeCommandStates.includes(command.state)).length;
-};
+const SUBMISSIONS_FETCH_LIMIT = 25;
+const PROJECTS_FETCH_LIMIT = 5;
+const DISPLAY_LIMIT = 25;
 
 const Dashboard: React.FC = () => {
-  const { cluster: overview, users, auth: { user } } = useStore();
-  const storage = useStorage(STORAGE_PATH);
-  const initFilters = storage.getWithDefault(STORAGE_FILTERS_KEY, { ...defaultFilters });
-  const [ filters, setFilters ] = useState<TaskFilters>(() => {
-    return { ...initFilters, types: validateEnumList(TaskType, initFilters.types) };
-  });
-  const [ canceler ] = useState(new AbortController());
-  const [ experiments, setExperiments ] = useState<ExperimentItem[]>();
-  const [ tasks, setTasks ] = useState<CommandTask[]>();
-  const [ activeTaskTally, setActiveTaskTally ] = useState({
-    [CommandType.Command]: 0,
-    [CommandType.JupyterLab]: 0,
-    [CommandType.Shell]: 0,
-    [CommandType.TensorBoard]: 0,
-  });
-  const [ activeExperimentCount, setActiveExperimentCount ] = useState<number>();
+  const [experiments, setExperiments] = useState<ExperimentItem[]>([]);
+  const [tasks, setTasks] = useState<CommandTask[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [submissions, setSubmissions] = useState<Submission[]>([]);
+  const [canceler] = useState(new AbortController());
+  const [submissionsLoading, setSubmissionsLoading] = useState<boolean>(true);
+  const [projectsLoading, setProjectsLoading] = useState<boolean>(true);
+  const currentUser = Loadable.getOrElse(undefined, useObservable(userStore.currentUser));
+  const { canCreateNSC } = usePermissions();
+  type Submission = ExperimentItem & CommandTask;
 
-  const fetchUsers = useFetchUsers(canceler);
-
-  const fetchExperiments = useCallback(async (): Promise<void> => {
-    try {
-      const states = (filters.states || []).map(state => encodeExperimentState(state as RunState));
-      const response = await getExperiments(
-        {
-          archived: false,
-          limit: 50,
+  const fetchTasks = useCallback(
+    async (user: DetailedUser) => {
+      const results = await Promise.allSettled([
+        getCommands({
+          limit: SUBMISSIONS_FETCH_LIMIT,
           orderBy: 'ORDER_BY_DESC',
+          signal: canceler.signal,
           sortBy: 'SORT_BY_START_TIME',
-          states: validateDetApiEnumList(Determinedexperimentv1State, states),
-          users: filters.users,
-        },
-        { signal: canceler.signal },
-      );
-      setExperiments(prev => {
-        if (isEqual(prev, response.experiments)) return prev;
-        return response.experiments;
-      });
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to fetch experiments.',
-        silent: true,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ canceler, filters, setExperiments ]);
-
-  const fetchActiveExperiments = useCallback(async () => {
-    try {
-      const response = await getExperiments(
-        { limit: -2, states: activeRunStates },
-        { signal: canceler.signal },
-      );
-      setActiveExperimentCount(response.pagination.total);
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to fetch active experiments.',
-        silent: true,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ canceler, setActiveExperimentCount ]);
-
-  const fetchTasks = useCallback(async () => {
-    try {
-      const [ commands, jupyterLabs, shells, tensorboards ] = await Promise.all([
-        getCommands({ signal: canceler.signal }),
-        getJupyterLabs({ signal: canceler.signal }),
-        getShells({ signal: canceler.signal }),
-        getTensorBoards({ signal: canceler.signal }),
+          users: [user.id.toString()],
+        }),
+        getJupyterLabs({
+          limit: SUBMISSIONS_FETCH_LIMIT,
+          orderBy: 'ORDER_BY_DESC',
+          signal: canceler.signal,
+          sortBy: 'SORT_BY_START_TIME',
+          users: [user.id.toString()],
+        }),
+        getShells({
+          limit: SUBMISSIONS_FETCH_LIMIT,
+          orderBy: 'ORDER_BY_DESC',
+          signal: canceler.signal,
+          sortBy: 'SORT_BY_START_TIME',
+          users: [user.id.toString()],
+        }),
+        getTensorBoards({
+          limit: SUBMISSIONS_FETCH_LIMIT,
+          orderBy: 'ORDER_BY_DESC',
+          signal: canceler.signal,
+          sortBy: 'SORT_BY_START_TIME',
+          users: [user.id.toString()],
+        }),
       ]);
-      setActiveTaskTally(prev => {
-        const newTally = {
-          [CommandType.Command]: countActiveCommand(commands),
-          [CommandType.JupyterLab]: countActiveCommand(jupyterLabs),
-          [CommandType.Shell]: countActiveCommand(shells),
-          [CommandType.TensorBoard]: countActiveCommand(tensorboards),
-        };
-        if (!isEqual(prev, newTally)) return newTally;
-        return prev;
-      });
-      setTasks(prev => {
-        const newTasks = [ ...commands, ...jupyterLabs, ...shells, ...tensorboards ];
-        if (isEqual(prev, newTasks)) return prev;
-        return newTasks;
-      });
+      const newTasks = results.reduce((acc, current) => {
+        if (current.status === 'fulfilled') return acc.concat(current.value);
+        return acc;
+      }, [] as CommandTask[]);
+      setTasks(newTasks);
+    },
+    [canceler],
+  );
+
+  const fetchExperiments = useCallback(
+    async (user: DetailedUser) => {
+      try {
+        const response = await getExperiments(
+          {
+            limit: SUBMISSIONS_FETCH_LIMIT,
+            orderBy: 'ORDER_BY_DESC',
+            sortBy: 'SORT_BY_START_TIME',
+            users: [user.id.toString()],
+          },
+          {
+            signal: canceler.signal,
+          },
+        );
+        setExperiments(response.experiments);
+      } catch (e) {
+        handleError(e, {
+          publicSubject: 'Error fetching experiments for dashboard',
+          silent: false,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [canceler],
+  );
+
+  const fetchProjects = useCallback(async () => {
+    try {
+      const projects = await getProjectsByUserActivity(
+        { limit: PROJECTS_FETCH_LIMIT },
+        {
+          signal: canceler.signal,
+        },
+      );
+      setProjects(projects);
+      setProjectsLoading(false);
     } catch (e) {
       handleError(e, {
-        publicSubject: 'Unable to fetch tasks.',
-        silent: true,
+        publicSubject: 'Error fetching projects for dashboard',
+        silent: false,
         type: ErrorType.Api,
       });
     }
-  }, [ canceler ]);
+  }, [canceler]);
 
-  const fetchAll = useCallback(async () => {
-    await Promise.allSettled([
-      fetchUsers(),
-      fetchExperiments(),
-      fetchActiveExperiments(),
-      fetchTasks(),
-    ]);
-  }, [ fetchUsers, fetchExperiments, fetchActiveExperiments, fetchTasks ]);
+  const fetchSubmissions = useCallback(async () => {
+    if (!currentUser) return;
+    await Promise.allSettled([fetchExperiments(currentUser), fetchTasks(currentUser)]);
+    setSubmissionsLoading(false);
+  }, [currentUser, fetchExperiments, fetchTasks]);
 
-  usePolling(fetchAll);
+  const fetchAll = useCallback(() => {
+    fetchProjects();
+    fetchSubmissions();
+  }, [fetchSubmissions, fetchProjects]);
+
+  const { stopPolling } = usePolling(fetchAll, { rerunOnNewFn: true });
 
   useEffect(() => {
-    return () => canceler.abort();
-  }, [ canceler ]);
-
-  /* Recent Tasks */
-
-  const filteredTasks = useMemo(() => {
-    const sorted = [
-      ...(experiments || []).map(taskFromExperiment),
-      ...(tasks || []).map(taskFromCommandTask),
-    ].sort(
-      (a, b) => Date.parse(a.lastEvent.date) < Date.parse(b.lastEvent.date) ? 1 : -1,
+    setSubmissions(
+      (experiments as Submission[])
+        .concat(tasks as Submission[])
+        .sort((a, b) => dateTimeStringSorter(b.startTime, a.startTime))
+        .slice(0, DISPLAY_LIMIT),
     );
-    const filtered = filterTasks<TaskType, RecentTask>(sorted, filters, users || []);
-    return filtered.slice(0, filters.limit);
-  }, [ experiments, filters, tasks, users ]);
+  }, [experiments, tasks]);
 
-  const handleFilterChange = useCallback((filters: TaskFilters): void => {
-    storage.set(STORAGE_FILTERS_KEY, filters);
-    setFilters(filters);
-  }, [ setFilters, storage ]);
+  useEffect(() => {
+    return () => {
+      canceler.abort();
+      stopPolling();
+    };
+  }, [canceler, stopPolling]);
+
+  if (projectsLoading && submissionsLoading) {
+    return (
+      <Page options={<JupyterLabButton enabled={canCreateNSC} />} title="Home">
+        <Spinner center />
+      </Page>
+    );
+  }
 
   return (
-    <Page docTitle="Overview" id="dashboard">
-      <Section title="Overview">
-        <Grid gap={ShirtSize.medium} minItemWidth={120} mode={GridMode.AutoFill}>
-          <OverviewStats title="Cluster Allocation">
-            {overview[ResourceType.ALL].allocation}<small>%</small>
-          </OverviewStats>
-          {overview[ResourceType.CUDA].total ? (
-            <OverviewStats title="Available GPUs">
-              {overview[ResourceType.CUDA].available}
-              <small>/{overview[ResourceType.CUDA].total}</small>
-            </OverviewStats>
-          ) : null}
-          {overview[ResourceType.ROCM].total ? (
-            <OverviewStats title="Available ROCm GPUs">
-              {overview[ResourceType.ROCM].available}
-              <small>/{overview[ResourceType.ROCM].total}</small>
-            </OverviewStats>
-          ) : null}
-          {overview[ResourceType.CPU].total ? (
-            <OverviewStats title="Available CPUs">
-              {overview[ResourceType.CPU].available}
-              <small>/{overview[ResourceType.CPU].total}</small>
-            </OverviewStats>
-          ) : null}
-          {activeExperimentCount ? (
-            <OverviewStats title="Active Experiments">
-              {activeExperimentCount}
-            </OverviewStats>
-          ) : null}
-          {activeTaskTally[CommandType.JupyterLab] ? (
-            <OverviewStats title="Active JupyterLabs">
-              {activeTaskTally[CommandType.JupyterLab]}
-            </OverviewStats>
-          ) : null}
-          {activeTaskTally[CommandType.TensorBoard] ? (
-            <OverviewStats title="Active Tensorboards">
-              {activeTaskTally[CommandType.TensorBoard]}
-            </OverviewStats>
-          ) : null}
-          {activeTaskTally[CommandType.Shell] ? (
-            <OverviewStats title="Active Shells">
-              {activeTaskTally[CommandType.Shell]}
-            </OverviewStats>
-          ) : null}
-          {activeTaskTally[CommandType.Command] ? (
-            <OverviewStats title="Active Commands">
-              {activeTaskTally[CommandType.Command]}
-            </OverviewStats>
-          ) : null}
-        </Grid>
-      </Section>
-      <Section
-        divider
-        loading={!experiments || !tasks}
-        options={<TaskFilter filters={filters} onChange={handleFilterChange} />}
-        title="Recent Tasks">
-        {filteredTasks.length !== 0 ? (
-          <Grid gap={ShirtSize.medium} mode={GridMode.AutoFill}>
-            {filteredTasks.map((props: RecentTask) => (
-              <TaskCard
-                curUser={user}
-                key={props.id}
-                {...props}
+    <Page options={<JupyterLabButton enabled={canCreateNSC} />} title="Home">
+      {projectsLoading ? (
+        <Section>
+          <Spinner center />
+        </Section>
+      ) : projects.length > 0 ? (
+        // hide Projects header when empty:
+        <Section title="Recently Viewed Projects">
+          <Card.Group size="small" wrap={false}>
+            {projects.map((project) => (
+              <ProjectCard
+                fetchProjects={fetchProjects}
+                key={project.id}
+                project={project}
+                showWorkspace
               />
             ))}
-          </Grid>
+          </Card.Group>
+        </Section>
+      ) : null}
+      {/* show Submissions header even when empty: */}
+      <Section title="Your Recent Submissions">
+        {submissionsLoading ? (
+          <Spinner center />
+        ) : submissions.length > 0 ? (
+          <ResponsiveTable<Submission>
+            className={css.table}
+            columns={[
+              {
+                dataIndex: 'state',
+                render: (state) => {
+                  return <ExperimentIcons state={state} />;
+                },
+                width: 1,
+              },
+              {
+                dataIndex: 'projectId',
+                render: (projectId, row, index) => {
+                  if (projectId) {
+                    return <Icon name="experiment" title="Experiment" />;
+                  } else {
+                    return taskTypeRenderer(row.type, row, index);
+                  }
+                },
+                width: 1,
+              },
+              {
+                dataIndex: 'name',
+                render: (name, row, index) => {
+                  if (row.projectId) {
+                    // only for Experiments, not Tasks:
+                    return experimentNameRenderer(name, row);
+                  } else {
+                    return taskNameRenderer(row.id, row, index);
+                  }
+                },
+              },
+              {
+                dataIndex: 'projectId',
+                render: (projectId, row) => {
+                  if (row.workspaceId && row.projectId !== 1) {
+                    return (
+                      <Breadcrumb>
+                        <Breadcrumb.Item>
+                          <Link path={paths.workspaceDetails(row.workspaceId)}>
+                            {row.workspaceName}
+                          </Link>
+                        </Breadcrumb.Item>
+                        <Breadcrumb.Item>
+                          <Link path={paths.projectDetails(projectId)}>{row.projectName}</Link>
+                        </Breadcrumb.Item>
+                      </Breadcrumb>
+                    );
+                  }
+                  if (row.projectName) {
+                    return (
+                      <Breadcrumb>
+                        <Breadcrumb.Item>
+                          <Link path={paths.projectDetails(projectId)}>{row.projectName}</Link>
+                        </Breadcrumb.Item>
+                      </Breadcrumb>
+                    );
+                  }
+                },
+              },
+              {
+                dataIndex: 'startTime',
+                render: relativeTimeRenderer,
+              },
+            ]}
+            dataSource={submissions}
+            loading={submissionsLoading}
+            pagination={false}
+            rowKey="id"
+            showHeader={false}
+            size="middle"
+          />
         ) : (
-          <Message
-            title="No recent tasks matching the current filters"
-            type={MessageType.Empty}
+          <Empty
+            description={
+              <>
+                Your recent experiments and tasks will show up here.{' '}
+                <Link external path={paths.docs('/quickstart-mdldev.html')}>
+                  Get started
+                </Link>
+              </>
+            }
+            icon="experiment"
+            title="No submissions"
           />
         )}
       </Section>

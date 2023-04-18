@@ -3,46 +3,46 @@ Description:  This template deploys a VPC, with a public and private subnet. It 
 Mappings:
   RegionMap:
     ap-northeast-1:
-      Master: ami-0d40f290731382e9c
-      Agent: ami-09b858b9faff207a9
-      Bastion: ami-0d40f290731382e9c
+      Master: ami-00910ef9457f0df47
+      Agent: ami-0bb9d169eea880f0c
+      Bastion: ami-00910ef9457f0df47
     # TODO(DET-4258) Uncomment these when we fully support all P3 regions.
     # ap-northeast-2:
-    #   Master: ami-07cc75e9e8f9300eb
-    #   Agent: ami-015ab3e5a38ea8658
-    #   Bastion: ami-07cc75e9e8f9300eb
+    #   Master: ami-035e3e44dc41db6a2
+    #   Agent: ami-04b2a73ef7923efe6
+    #   Bastion: ami-035e3e44dc41db6a2
     # ap-southeast-1:
-    #   Master: ami-06004dc0577827979
-    #   Agent: ami-0a93cc0d839604673
-    #   Bastion: ami-06004dc0577827979
+    #   Master: ami-0fd1ee6c8b656f020
+    #   Agent: ami-024d675978237fa80
+    #   Bastion: ami-0fd1ee6c8b656f020
     # ap-southeast-2:
-    #   Master: ami-0e1310e493e66914a
-    #   Agent: ami-0c70420cc468cff2b
-    #   Bastion: ami-0e1310e493e66914a
+    #   Master: ami-0b62ecd3babd1c548
+    #   Agent: ami-0238276397b254a83
+    #   Bastion: ami-0b62ecd3babd1c548
     eu-central-1:
-      Master: ami-0243761267e52b9ce
-      Agent: ami-00c3bdcf86fef0569
-      Bastion: ami-0243761267e52b9ce
+      Master: ami-0abbe417ed83c0b29
+      Agent: ami-09506c0a6df6626bc
+      Bastion: ami-0abbe417ed83c0b29
     eu-west-1:
-      Master: ami-015afd151917a362d
-      Agent: ami-004336f1e6d7af72c
-      Bastion: ami-015afd151917a362d
+      Master: ami-0e3f7dd2dc743e48a
+      Agent: ami-0e2b716415874cb07
+      Bastion: ami-0e3f7dd2dc743e48a
     # eu-west-2:
-    #   Master: ami-0b2537c6147faa3e2
-    #   Agent: ami-0792151eff6317968
-    #   Bastion: ami-0b2537c6147faa3e2
+    #   Master: ami-0d78429fb6af30994
+    #   Agent: ami-0c8a8a8c7a2721ee7
+    #   Bastion: ami-0d78429fb6af30994
     us-east-1:
-      Master: ami-000722651477bd39b
-      Agent: ami-05b2885aabd00770b
-      Bastion: ami-000722651477bd39b
+      Master: ami-0172070f66a8ebe63
+      Agent: ami-0b18bcecbd428ae4c
+      Bastion: ami-0172070f66a8ebe63
     us-east-2:
-      Master: ami-0f597975071f4c4ec
-      Agent: ami-0e66fcef272135c97
-      Bastion: ami-0f597975071f4c4ec
+      Master: ami-0bafa3699418551cd
+      Agent: ami-00e86d39577d39acf
+      Bastion: ami-0bafa3699418551cd
     us-west-2:
-      Master: ami-0d37fe5ba03a9ac43
-      Agent: ami-059453aebcb2d4a14
-      Bastion: ami-0d37fe5ba03a9ac43
+      Master: ami-0ceeab680f529cc36
+      Agent: ami-0c841a5d48a137ae2
+      Bastion: ami-0ceeab680f529cc36
 
 Parameters:
   VpcCIDR:
@@ -76,13 +76,13 @@ Parameters:
 
   AuxAgentInstanceType:
     Type: String
-    Description: Instance Type of Agent in the CPU resource pool
+    Description: Instance Type of agents in the auxiliary resource pool
     Default: t2.xlarge
 
   ComputeAgentInstanceType:
     Type: String
-    Description: Instance Type of Agent in the GPU resource pool
-    Default: p2.8xlarge
+    Description: Instance Type of agents in the compute resource pool
+    Default: g4dn.metal
 
   BastionInstanceType:
     Type: String
@@ -99,10 +99,30 @@ Parameters:
     Description: Docker image repository to use for determined-master and determined-agent images
     Default: determinedai
 
+  MasterImageName:
+    Type: String
+    Description: Name of the Docker image to use for the Determined master
+    Default: determined-master
+
+  AgentImageName:
+    Type: String
+    Description: Name of the Docker image to use for the Determined agent
+    Default: determined-agent
+
+  DockerUser:
+    Type: String
+    Description: Docker user to pull images that need authentication
+    Default: ""
+
+  DockerPass:
+    Type: String
+    Description: Docker password to pull images that need authentication
+    Default: ""
+
   Version:
     Type: String
     Description: Determined version or commit for master image
-    Default: 0.17.15-dev0
+    Default: 0.21.2-dev0
 
   DBPassword:
     Type: String
@@ -111,7 +131,7 @@ Parameters:
 
   MaxAuxContainersPerAgent:
     Type: Number
-    Description: Maximum number of CPU containers to keep running on agents in the CPU resource pool
+    Description: Maximum number of CPU containers to launch on agents in the default auxiliary resource pool.
     Default: 100
 
   MaxIdleAgentPeriod:
@@ -121,7 +141,7 @@ Parameters:
 
   MaxAgentStartingPeriod:
     Type: String
-    Description: How long for agent starting before retrying
+    Description: How long to wait for agents to start up before retrying
     Default: 20m
 
   MinDynamicAgents:
@@ -191,6 +211,11 @@ Parameters:
     Description: Prefix for output CloudWatch log group (the full log group will be "/<prefix>/<stack>")
     Default: determined
 
+  NotebookTimeout:
+    Type: Number
+    Description: Specifies the duration in seconds before idle notebook instances are automatically terminated.
+    Default: 0
+
   MasterConfigTemplate:
     Type: String
     Description: Master config template
@@ -228,12 +253,14 @@ Parameters:
       resource_pools:
         - pool_name: aux-pool
           max_aux_containers_per_agent: {{ .resource_pools.pools.aux_pool.max_aux_containers_per_agent }}
+          agent_reattach_enabled: {{ .resource_pools.pools.aux_pool.agent_reattach_enabled }}
           provider:
             instance_type: {{ .resource_pools.pools.aux_pool.instance_type }}
             {{- toYaml .resource_pools.aws | nindent 6}}
 
         - pool_name: compute-pool
           max_aux_containers_per_agent: 0
+          agent_reattach_enabled: {{ .resource_pools.pools.compute_pool.agent_reattach_enabled }}
           provider:
             instance_type: {{ .resource_pools.pools.compute_pool.instance_type }}
             cpu_slots_allowed: true
@@ -257,6 +284,10 @@ Parameters:
           cpu: {{ .cpu_env_image }}
           gpu: {{ .gpu_env_image }}
         {{- end }}
+      {{ end }}
+
+      {{ if ne .notebook_timeout 0.0 }}
+      notebook_timeout: {{ .notebook_timeout }}
       {{ end }}
   ### END INJECT CODE
 
@@ -713,6 +744,13 @@ Resources:
               - Effect: Allow
                 Action: iam:PassRole
                 Resource: !GetAtt AgentRole.Arn
+        - PolicyName: master-s3-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "s3:*"
+                Resource: "*"
       Tags:
         - Key: user
           Value: !Ref AWS::StackName
@@ -722,6 +760,14 @@ Resources:
     Properties:
       Roles:
         - !Ref MasterRole
+
+  IMDSV2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
 
   MasterInstance:
     Type: AWS::EC2::Instance
@@ -734,6 +780,9 @@ Resources:
         - Master
       KeyName: !Ref Keypair
       IamInstanceProfile: !Ref MasterInstanceProfile
+      LaunchTemplate:
+        LaunchTemplateId: !Ref IMDSV2LaunchTemplate
+        Version: !GetAtt IMDSV2LaunchTemplate.LatestVersionNumber
       SecurityGroupIds:
         - !Ref MasterSecurityGroup
       BlockDeviceMappings:
@@ -805,7 +854,7 @@ Resources:
                 master_cert_name: ${MasterCertName}
                 iam_instance_profile_arn: ${AgentInstanceProfile.Arn}
                 image_id: ${AgentAmi}
-                agent_docker_image: ${ImageRepoPrefix}/determined-agent:${Version}
+                agent_docker_image: ${ImageRepoPrefix}/${AgentImageName}:${Version}
                 instance_name: determined-agent-${AWS::StackName}
                 log_group: /${LogGroupPrefix}/${AWS::StackName}
                 log_stream: determined-agent
@@ -825,10 +874,16 @@ Resources:
                 ssh_key_name: ${Keypair}
                 tag_key: det-${AWS::StackName}
                 tag_value: det-agent-${AWS::StackName}
+                agent_config_file_contents: ${AgentConfigFileContents}
+                startup_script: |
+                  if [ ! -z "${DockerUser}" ] && [ ! -z ${DockerPass} ]; then
+                    echo "${DockerPass}" | docker login --username "${DockerUser}" --password-stdin
+                  fi
 
             scheme: $scheme
             cpu_env_image: ${CpuEnvImage}
             gpu_env_image: ${GpuEnvImage}
+            notebook_timeout: ${NotebookTimeout}
             EOF
 
             apt-get remove docker docker-engine docker.io containerd runc
@@ -850,6 +905,10 @@ Resources:
             curl -fsSL https://www.amazontrust.com/repository/AmazonRootCA1.pem > \
               /usr/local/determined/etc/db_ssl_root_cert.pem
 
+            if [ ! -z "${DockerUser}" ] && [ ! -z ${DockerPass} ]; then
+              echo "${DockerPass}" | docker login --username "${DockerUser}" --password-stdin
+            fi
+
             docker network create determined
 
             docker stop $(docker ps -a -q)
@@ -861,7 +920,7 @@ Resources:
                 --rm \
                 -v /usr/local/determined/etc/:/etc/determined/ \
                 --entrypoint /bin/bash \
-                ${ImageRepoPrefix}/determined-master:${Version} \
+                ${ImageRepoPrefix}/${MasterImageName}:${Version} \
                 -c "/usr/bin/determined-gotmpl -i /etc/determined/master.yaml.context /etc/determined/master.yaml.tmpl > /etc/determined/master.yaml"
             test $? -eq 0 || ( echo "Failed to generate master.yaml" && exit 1 )
 
@@ -874,7 +933,7 @@ Resources:
                 --log-opt awslogs-stream=determined-master \
                 -p "$port":"$port" \
                 -v /usr/local/determined/etc/:/etc/determined/ \
-                ${ImageRepoPrefix}/determined-master:${Version}
+                ${ImageRepoPrefix}/${MasterImageName}:${Version}
             --//
 
           - AgentAmi: !FindInMap [RegionMap, !Ref "AWS::Region", Agent]

@@ -6,13 +6,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/uptrace/bun"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
 	"github.com/determined-ai/determined/proto/pkg/logv1"
-
-	"github.com/google/uuid"
-
 	"github.com/determined-ai/determined/proto/pkg/taskv1"
 )
 
@@ -62,13 +61,18 @@ const (
 
 // Task is the model for a task in the database.
 type Task struct {
-	TaskID    TaskID     `db:"task_id"`
+	bun.BaseModel `bun:"table:tasks"`
+
+	TaskID    TaskID     `db:"task_id" bun:"task_id,pk"`
 	JobID     *JobID     `db:"job_id"`
 	TaskType  TaskType   `db:"task_type"`
 	StartTime time.Time  `db:"start_time"`
 	EndTime   *time.Time `db:"end_time"`
 	// LogVersion indicates how the logs were stored.
 	LogVersion TaskLogVersion `db:"log_version"`
+
+	// Relations.
+	Job *Job `bun:"rel:belongs-to,join:job_id=job_id"`
 }
 
 // AllocationID is the ID of an allocation of a task. It is usually of the form
@@ -76,30 +80,32 @@ type Task struct {
 // allocations run.
 type AllocationID string
 
-// NewAllocationID returns a new unique task id.
-func NewAllocationID(name string) AllocationID {
-	return AllocationID(name)
-}
-
 func (a AllocationID) String() string {
 	return string(a)
 }
 
+// ToTaskID converts an AllocationID to its taskID.
+func (a AllocationID) ToTaskID() TaskID {
+	return TaskID(a[:strings.LastIndex(string(a), ".")])
+}
+
 // Allocation is the model for an allocation in the database.
 type Allocation struct {
-	AllocationID AllocationID     `db:"allocation_id"`
-	TaskID       TaskID           `db:"task_id"`
-	Slots        int              `db:"slots"`
-	AgentLabel   string           `db:"agent_label"`
-	ResourcePool string           `db:"resource_pool"`
-	StartTime    *time.Time       `db:"start_time"`
-	EndTime      *time.Time       `db:"end_time"`
-	State        *AllocationState `db:"state"`
-	IsReady      *bool            `db:"is_ready"`
+	bun.BaseModel `bun:"table:allocations"`
+
+	AllocationID AllocationID     `db:"allocation_id" bun:"allocation_id,pk"`
+	TaskID       TaskID           `db:"task_id" bun:"task_id,notnull"`
+	Slots        int              `db:"slots" bun:"slots,notnull"`
+	ResourcePool string           `db:"resource_pool" bun:"resource_pool,notnull"`
+	StartTime    *time.Time       `db:"start_time" bun:"start_time"`
+	EndTime      *time.Time       `db:"end_time" bun:"end_time"`
+	State        *AllocationState `db:"state" bun:"state"`
+	IsReady      *bool            `db:"is_ready" bun:"is_ready"`
+	Ports        map[string]int   `db:"ports" bun:"ports,notnull"`
 }
 
 // AllocationState represents the current state of the task. Value indicates a partial ordering.
-type AllocationState int
+type AllocationState string
 
 // TaskStats is the model for task stats in the database.
 type TaskStats struct {
@@ -109,24 +115,34 @@ type TaskStats struct {
 	EndTime      *time.Time
 }
 
+// ResourceAggregates is the model for resource_aggregates in the database.
+type ResourceAggregates struct {
+	Date            *time.Time
+	AggregationType string
+	AggregationKey  string
+	Seconds         float32
+}
+
 const (
 	// AllocationStatePending state denotes that the command is awaiting allocation.
-	AllocationStatePending AllocationState = 0
+	AllocationStatePending AllocationState = "PENDING"
+	// AllocationStateWaiting state denotes that the command is waiting on data.
+	AllocationStateWaiting AllocationState = "WAITING"
 	// AllocationStateAssigned state denotes that the command has been assigned to an agent but has
 	// not started yet.
-	AllocationStateAssigned AllocationState = 1
+	AllocationStateAssigned AllocationState = "ASSIGNED"
 	// AllocationStatePulling state denotes that the command's base image is being pulled from the
 	// Docker registry.
-	AllocationStatePulling AllocationState = 2
+	AllocationStatePulling AllocationState = "PULLING"
 	// AllocationStateStarting state denotes that the image has been pulled and the task is being
 	// started, but the task is not ready yet.
-	AllocationStateStarting AllocationState = 3
+	AllocationStateStarting AllocationState = "STARTING"
 	// AllocationStateRunning state denotes that the service in the command is running.
-	AllocationStateRunning AllocationState = 4
-	// AllocationStateTerminating state denotes that the command is terminating.
-	AllocationStateTerminating AllocationState = 5
+	AllocationStateRunning AllocationState = "RUNNING"
 	// AllocationStateTerminated state denotes that the command has exited or has been aborted.
-	AllocationStateTerminated AllocationState = 6
+	AllocationStateTerminated AllocationState = "TERMINATED"
+	// AllocationStateTerminating state denotes that the command is terminating.
+	AllocationStateTerminating AllocationState = "TERMINATING"
 )
 
 // MostProgressedAllocationState returns the further progressed state. E.G. a call
@@ -136,44 +152,34 @@ func MostProgressedAllocationState(states ...AllocationState) AllocationState {
 		return AllocationStatePending
 	}
 
-	max := states[0]
-	for _, state := range states {
-		if state > max {
-			max = state
+	// Can't use taskv1.State_value[state] since in proto
+	// "STATE_TERMINATING" > "STATE_TERMINATED"
+	// while our model used to have
+	// "STATE_TERMINATED" > "STATE_TERMINATING".
+	statesToOrder := map[AllocationState]int{
+		AllocationStatePending:     0,
+		AllocationStateAssigned:    1,
+		AllocationStatePulling:     2,
+		AllocationStateStarting:    3,
+		AllocationStateRunning:     4,
+		AllocationStateWaiting:     5,
+		AllocationStateTerminating: 6,
+		AllocationStateTerminated:  7,
+	}
+	maxOrder, state := statesToOrder[states[0]], states[0]
+	for _, s := range states {
+		if order := statesToOrder[s]; order > maxOrder {
+			maxOrder, state = order, s
 		}
 	}
-	return max
-}
-
-// String returns the string representation of the task state.
-func (s AllocationState) String() string {
-	switch s {
-	case AllocationStatePending:
-		return "PENDING"
-	case AllocationStateAssigned:
-		return "ASSIGNED"
-	case AllocationStatePulling:
-		return "PULLING"
-	case AllocationStateStarting:
-		return "STARTING"
-	case AllocationStateRunning:
-		return "RUNNING"
-	case AllocationStateTerminating:
-		return "TERMINATING"
-	case AllocationStateTerminated:
-		return "TERMINATED"
-	default:
-		return "UNSPECIFIED"
-	}
+	return state
 }
 
 // Proto returns the proto representation of the task state.
 func (s AllocationState) Proto() taskv1.State {
 	switch s {
-	case AllocationStatePending:
-		return taskv1.State_STATE_PENDING
-	case AllocationStateAssigned:
-		return taskv1.State_STATE_ASSIGNED
+	case AllocationStateWaiting:
+		return taskv1.State_STATE_WAITING
 	case AllocationStatePulling:
 		return taskv1.State_STATE_PULLING
 	case AllocationStateStarting:
@@ -199,8 +205,8 @@ const (
 	LogLevelDebug = "DEBUG"
 	// LogLevelInfo is the info task log level.
 	LogLevelInfo = "INFO"
-	// LogLevelWarn is the warn task log level.
-	LogLevelWarn = "WARN"
+	// LogLevelWarning is the warn task log level.
+	LogLevelWarning = "WARNING"
 	// LogLevelError is the error task log level.
 	LogLevelError = "ERROR"
 	// LogLevelCritical is the critical task log level.
@@ -221,7 +227,7 @@ func TaskLogLevelFromProto(l logv1.LogLevel) string {
 	case logv1.LogLevel_LOG_LEVEL_INFO:
 		return LogLevelInfo
 	case logv1.LogLevel_LOG_LEVEL_WARNING:
-		return LogLevelWarn
+		return LogLevelWarning
 	case logv1.LogLevel_LOG_LEVEL_ERROR:
 		return LogLevelError
 	case logv1.LogLevel_LOG_LEVEL_CRITICAL:
@@ -240,7 +246,7 @@ func TaskLogLevelToProto(l string) logv1.LogLevel {
 		return logv1.LogLevel_LOG_LEVEL_DEBUG
 	case LogLevelInfo:
 		return logv1.LogLevel_LOG_LEVEL_INFO
-	case LogLevelWarn:
+	case LogLevelWarning:
 		return logv1.LogLevel_LOG_LEVEL_WARNING
 	case LogLevelError:
 		return logv1.LogLevel_LOG_LEVEL_ERROR
@@ -301,6 +307,9 @@ func (t *TaskLog) Message() string {
 			containerID = containerID[:containerIDMaxLength]
 		}
 		parts = append(parts, containerID)
+	} else {
+		// Just so the logs visually line up.
+		parts = append(parts, strings.Repeat(" ", containerIDMaxLength))
 	}
 
 	// e.g., " [rank=1]"
@@ -344,12 +353,26 @@ func (t TaskLog) Proto() (*apiv1.TaskLogsResponse, error) {
 		level = TaskLogLevelToProto(*t.Level)
 	}
 
-	return &apiv1.TaskLogsResponse{
-		Id:        id,
-		Timestamp: ts,
-		Level:     level,
-		Message:   t.Message(),
-	}, nil
+	resp := &apiv1.TaskLogsResponse{
+		Id:           id,
+		TaskId:       t.TaskID,
+		Timestamp:    ts,
+		Level:        level,
+		Message:      t.Message(),
+		Log:          t.Log,
+		AllocationId: t.AllocationID,
+		AgentId:      t.AgentID,
+		ContainerId:  t.ContainerID,
+		Source:       t.Source,
+		Stdtype:      t.StdType,
+	}
+
+	if t.RankID != nil {
+		id := int32(*t.RankID)
+		resp.RankId = &id
+	}
+
+	return resp, nil
 }
 
 // TaskLogBatch represents a batch of model.TaskLog.
@@ -369,3 +392,9 @@ func (t TaskLogBatch) ForEach(f func(interface{}) error) error {
 	}
 	return nil
 }
+
+// AccessScopeID is an identifier for an access scope.
+type AccessScopeID int
+
+// AccessScopeSet is a set of access scopes.
+type AccessScopeSet = map[AccessScopeID]bool

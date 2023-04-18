@@ -1,15 +1,10 @@
 import json
-import time
 from argparse import Namespace
-from typing import Any, List
+from typing import Any, List, Optional
 
-from requests import Response
-
-from determined.cli.session import setup_session
-from determined.cli.util import format_args
+from determined import cli
 from determined.common import api, yaml
 from determined.common.api import authentication, bindings
-from determined.common.check import check_gt
 from determined.common.declarative_argparse import Arg, Cmd, Group
 
 
@@ -23,46 +18,27 @@ def config(args: Namespace) -> None:
 
 
 def get_master(args: Namespace) -> None:
-    resp = bindings.get_GetMaster(setup_session(args))
+    resp = bindings.get_GetMaster(cli.setup_session(args))
     if args.json:
         print(json.dumps(resp.to_json(), indent=4))
     else:
         print(yaml.safe_dump(resp.to_json(), default_flow_style=False))
 
 
+def format_log_entry(log: bindings.v1LogEntry) -> str:
+    """Format v1LogEntry for printing."""
+    log_level = str(log.level.value)[len("LOG_LEVEL_") :] if log.level else ""
+    return f"{log.timestamp} [{log_level}]: {log.message}"
+
+
 @authentication.required
 def logs(args: Namespace) -> None:
-    def process_response(response: Response, latest_log_id: int) -> int:
-        for log in response.json():
-            check_gt(log["id"], latest_log_id)
-            latest_log_id = log["id"]
-            print("{} [{}]: {}".format(log["time"], log["level"], log["message"]))
-        return latest_log_id
-
-    params = {}
+    offset: Optional[int] = None
     if args.tail:
-        params["tail"] = args.tail
-
-    response = api.get(args.master, "logs", params=params)
-    latest_log_id = process_response(response, -1)
-
-    # "Follow" mode is implemented as a loop in the CLI. We assume that
-    # newer log messages have a numerically larger ID than older log
-    # messages, so we keep track of the max ID seen so far.
-    if args.follow:
-        while True:
-            try:
-                # Poll for new logs every 100 ms.
-                time.sleep(0.1)
-
-                # The `tail` parameter only makes sense the first time we
-                # fetch logs.
-                response = api.get(
-                    args.master, "logs", params={"greater_than_id": str(latest_log_id)}
-                )
-                latest_log_id = process_response(response, latest_log_id)
-            except KeyboardInterrupt:
-                break
+        offset = -args.tail
+    responses = bindings.get_MasterLogs(cli.setup_session(args), follow=args.follow, offset=offset)
+    for response in responses:
+        print(format_log_entry(response.logEntry))
 
 
 # fmt: off
@@ -70,10 +46,10 @@ def logs(args: Namespace) -> None:
 args_description = [
     Cmd("master", None, "manage master", [
         Cmd("config", config, "fetch master config", [
-            Group(format_args["json"], format_args["yaml"])
+            Group(cli.output_format_args["json"], cli.output_format_args["yaml"])
         ]),
         Cmd("info", get_master, "fetch master info", [
-            Group(format_args["json"], format_args["yaml"])
+            Group(cli.output_format_args["json"], cli.output_format_args["yaml"])
         ]),
         Cmd("logs", logs, "fetch master logs", [
             Arg("-f", "--follow", action="store_true",

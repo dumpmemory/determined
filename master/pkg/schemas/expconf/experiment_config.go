@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	petname "github.com/dustinkirkland/golang-petname"
@@ -13,20 +14,19 @@ import (
 	"github.com/determined-ai/determined/master/pkg/schemas"
 )
 
-//go:generate ../gen.sh
 // ExperimentConfigV0 is a versioned experiment config.
+//
+//go:generate ../gen.sh
 type ExperimentConfigV0 struct {
 	RawBindMounts               BindMountsConfigV0          `json:"bind_mounts"`
 	RawCheckpointPolicy         *string                     `json:"checkpoint_policy"`
 	RawCheckpointStorage        *CheckpointStorageConfigV0  `json:"checkpoint_storage"`
-	RawDataLayer                *DataLayerConfigV0          `json:"data_layer"`
 	RawData                     map[string]interface{}      `json:"data"`
 	RawDebug                    *bool                       `json:"debug"`
 	RawDescription              *string                     `json:"description"`
 	RawEntrypoint               *EntrypointV0               `json:"entrypoint"`
 	RawEnvironment              *EnvironmentConfigV0        `json:"environment"`
 	RawHyperparameters          HyperparametersV0           `json:"hyperparameters"`
-	RawInternal                 *InternalConfigV0           `json:"internal,omitempty"`
 	RawLabels                   LabelsV0                    `json:"labels"`
 	RawMaxRestarts              *int                        `json:"max_restarts"`
 	RawMinCheckpointPeriod      *LengthV0                   `json:"min_checkpoint_period"`
@@ -35,6 +35,7 @@ type ExperimentConfigV0 struct {
 	RawOptimizations            *OptimizationsConfigV0      `json:"optimizations"`
 	RawPerformInitialValidation *bool                       `json:"perform_initial_validation"`
 	RawProfiling                *ProfilingConfigV0          `json:"profiling"`
+	RawProject                  *string                     `json:"project"`
 	RawRecordsPerEpoch          *int                        `json:"records_per_epoch"`
 	RawReproducibility          *ReproducibilityConfigV0    `json:"reproducibility"`
 	RawResources                *ResourcesConfigV0          `json:"resources"`
@@ -42,6 +43,9 @@ type ExperimentConfigV0 struct {
 	RawSearcher                 *SearcherConfigV0           `json:"searcher"`
 	RawSecurity                 *SecurityConfigV0           `json:"security,omitempty"`
 	RawTensorboardStorage       *TensorboardStorageConfigV0 `json:"tensorboard_storage,omitempty"`
+	RawWorkspace                *string                     `json:"workspace"`
+	RawSlurmConfig              *SlurmConfigV0              `json:"slurm,omitempty"`
+	RawPbsConfig                *PbsConfigV0                `json:"pbs,omitempty"`
 }
 
 // Unit implements the model.InUnits interface.
@@ -78,17 +82,18 @@ func (e *ExperimentConfigV0) Scan(src interface{}) error {
 	// This *should* be a copy without any changes, unless perhaps we just shimmed the bytes that
 	// were in the database, but to ensure we never allow any un-defaulted experiments anywhere
 	// inside the system, we call WithDefaults here.
-	*e = schemas.WithDefaults(config).(ExperimentConfigV0)
+	*e = schemas.WithDefaults(config)
 	return nil
 }
 
 // AsLegacy converts a current ExperimentConfig to a (limited capacity) LegacyConfig.
 func (e ExperimentConfig) AsLegacy() LegacyConfig {
 	return LegacyConfig{
-		checkpointStorage: schemas.Copy(e.CheckpointStorage()).(CheckpointStorageConfig),
-		bindMounts:        schemas.Copy(e.BindMounts()).(BindMountsConfig),
-		envvars:           schemas.Copy(e.Environment().EnvironmentVariables()).(EnvironmentVariablesMap),
-		podSpec:           schemas.Copy(e.Environment().PodSpec()).(*PodSpec),
+		CheckpointStorage: schemas.Copy(e.CheckpointStorage()),
+		BindMounts:        schemas.Copy(e.BindMounts()),
+		Environment:       schemas.Copy(e.Environment()),
+		Hyperparameters:   schemas.Copy(e.Hyperparameters()),
+		Searcher:          e.Searcher().AsLegacy(),
 	}
 }
 
@@ -99,8 +104,8 @@ type Name struct {
 	RawString *string
 }
 
-// WithDefaults implements the Defaultable interface.
-func (d Name) WithDefaults() interface{} {
+// WithDefaults implements the Defaultable psuedointerface.
+func (d Name) WithDefaults() Name {
 	var s string
 	if d.RawString != nil {
 		s = *d.RawString
@@ -180,8 +185,26 @@ func (l *LabelsV0) UnmarshalJSON(data []byte) error {
 	return err
 }
 
+// SlurmConfigV0 configures experiment resource usage.
+//
 //go:generate ../gen.sh
+type SlurmConfigV0 struct {
+	RawSlotsPerNode *int     `json:"slots_per_node,omitempty"`
+	RawGpuType      *string  `json:"gpu_type,omitempty"`
+	RawSbatchArgs   []string `json:"sbatch_args,omitempty"`
+}
+
+// PbsConfigV0 configures experiment resource usage.
+//
+//go:generate ../gen.sh
+type PbsConfigV0 struct {
+	RawSlotsPerNode *int     `json:"slots_per_node,omitempty"`
+	RawSbatchArgs   []string `json:"pbsbatch_args,omitempty"`
+}
+
 // ResourcesConfigV0 configures experiment resource usage.
+//
+//go:generate ../gen.sh
 type ResourcesConfigV0 struct {
 	// Slots is used by commands while trials use SlotsPerTrial.
 	RawSlots *int `json:"slots,omitempty"`
@@ -191,15 +214,15 @@ type ResourcesConfigV0 struct {
 	RawWeight         *float64 `json:"weight"`
 	RawNativeParallel *bool    `json:"native_parallel,omitempty"`
 	RawShmSize        *int     `json:"shm_size"`
-	RawAgentLabel     *string  `json:"agent_label"`
 	RawResourcePool   *string  `json:"resource_pool"`
 	RawPriority       *int     `json:"priority"`
 
 	RawDevices DevicesConfigV0 `json:"devices"`
 }
 
-//go:generate ../gen.sh
 // OptimizationsConfigV0 is a legacy config value.
+//
+//go:generate ../gen.sh
 type OptimizationsConfigV0 struct {
 	RawAggregationFrequency       *int    `json:"aggregation_frequency"`
 	RawAverageAggregatedGradients *bool   `json:"average_aggregated_gradients"`
@@ -212,8 +235,9 @@ type OptimizationsConfigV0 struct {
 	RawAutoTuneTensorFusion       *bool   `json:"auto_tune_tensor_fusion"`
 }
 
-//go:generate ../gen.sh
 // BindMountsConfigV0 is the configuration for bind mounts.
+//
+//go:generate ../gen.sh
 type BindMountsConfigV0 []BindMountV0
 
 // Merge is just merge-by-appending, with a specific form of deduplication.
@@ -224,8 +248,7 @@ type BindMountsConfigV0 []BindMountV0
 // is that if either the user-provided config or the template config is broken, it would be
 // confusing that Merge() would silently fix them.  However it would also be confusing if two valid
 // configs got merged together and resulted in a clearly invalid config.
-func (b BindMountsConfigV0) Merge(other interface{}) interface{} {
-	tOther := other.(BindMountsConfigV0)
+func (b BindMountsConfigV0) Merge(other BindMountsConfigV0) BindMountsConfigV0 {
 	out := BindMountsConfigV0{}
 	out = append(out, b...)
 
@@ -234,7 +257,7 @@ func (b BindMountsConfigV0) Merge(other interface{}) interface{} {
 	for _, mount := range b {
 		paths[mount.ContainerPath()] = true
 	}
-	for _, mount := range tOther {
+	for _, mount := range other {
 		if _, ok := paths[mount.ContainerPath()]; !ok {
 			out = append(out, mount)
 		}
@@ -257,8 +280,9 @@ func (e *EntrypointV0) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &e.RawEntrypoint)
 }
 
-//go:generate ../gen.sh
 // BindMountV0 configures trial runner filesystem bind mounts.
+//
+//go:generate ../gen.sh
 type BindMountV0 struct {
 	RawHostPath      string  `json:"host_path"`
 	RawContainerPath string  `json:"container_path"`
@@ -266,14 +290,14 @@ type BindMountV0 struct {
 	RawPropagation   *string `json:"propagation"`
 }
 
-//go:generate ../gen.sh
 // DevicesConfigV0 is the configuration for devices.
+//
+//go:generate ../gen.sh
 type DevicesConfigV0 []DeviceV0
 
 // Merge is just merge-by-appending, with a specific form of deduplication.
 // See the comment on BindMountsConfigV0.Merge() for details.
-func (d DevicesConfigV0) Merge(other interface{}) interface{} {
-	tOther := other.(DevicesConfigV0)
+func (d DevicesConfigV0) Merge(other DevicesConfigV0) DevicesConfigV0 {
 	out := DevicesConfigV0{}
 	out = append(out, d...)
 
@@ -282,7 +306,7 @@ func (d DevicesConfigV0) Merge(other interface{}) interface{} {
 	for _, mount := range d {
 		paths[mount.ContainerPath()] = true
 	}
-	for _, mount := range tOther {
+	for _, mount := range other {
 		if _, ok := paths[mount.ContainerPath()]; !ok {
 			out = append(out, mount)
 		}
@@ -290,22 +314,44 @@ func (d DevicesConfigV0) Merge(other interface{}) interface{} {
 	return out
 }
 
-//go:generate ../gen.sh
 // DeviceV0 configures trial runner filesystem bind mounts.
+//
+//go:generate ../gen.sh
 type DeviceV0 struct {
 	RawHostPath      string  `json:"host_path"`
 	RawContainerPath string  `json:"container_path"`
 	RawMode          *string `json:"mode"`
 }
 
-//go:generate ../gen.sh
+// UnmarshalJSON implements the json.Unmarshaler interface.
+func (d *DeviceV0) UnmarshalJSON(data []byte) error {
+	var plain string
+	if err := json.Unmarshal(data, &plain); err == nil {
+		fields := strings.Split(plain, ":")
+		if len(fields) < 2 || len(fields) > 3 {
+			return errors.Errorf("invalid device string: %q", plain)
+		}
+		d.RawHostPath = fields[0]
+		d.RawContainerPath = fields[1]
+		if len(fields) > 2 {
+			d.RawMode = &fields[2]
+		}
+		return nil
+	}
+
+	type DefaultParser *DeviceV0
+	return json.Unmarshal(data, DefaultParser(d))
+}
+
 // ReproducibilityConfigV0 configures parameters related to reproducibility.
+//
+//go:generate ../gen.sh
 type ReproducibilityConfigV0 struct {
 	RawExperimentSeed *uint32 `json:"experiment_seed"`
 }
 
-// WithDefaults implements the Defaultable interface.
-func (r ReproducibilityConfigV0) WithDefaults() interface{} {
+// WithDefaults implements the Defaultable psuedointerface.
+func (r ReproducibilityConfigV0) WithDefaults() ReproducibilityConfigV0 {
 	var seed uint32
 	if r.RawExperimentSeed != nil {
 		seed = *r.RawExperimentSeed
@@ -315,26 +361,16 @@ func (r ReproducibilityConfigV0) WithDefaults() interface{} {
 	return ReproducibilityConfigV0{&seed}
 }
 
-//go:generate ../gen.sh
 // SecurityConfigV0 is a legacy config.
+//
+//go:generate ../gen.sh
 type SecurityConfigV0 struct {
 	RawKerberos KerberosConfigV0 `json:"kerberos"`
 }
 
-//go:generate ../gen.sh
 // KerberosConfigV0 is a legacy config.
+//
+//go:generate ../gen.sh
 type KerberosConfigV0 struct {
 	RawConfigFile string `json:"config_file"`
-}
-
-//go:generate ../gen.sh
-// InternalConfigV0 is a legacy config.
-type InternalConfigV0 struct {
-	RawNative NativeConfigV0 `json:"native"`
-}
-
-//go:generate ../gen.sh
-// NativeConfigV0 is a legacy config.
-type NativeConfigV0 struct {
-	RawCommand []string `json:"command"`
 }

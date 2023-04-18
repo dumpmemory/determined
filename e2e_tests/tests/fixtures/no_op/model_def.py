@@ -5,13 +5,14 @@ import os
 import pathlib
 import pickle
 import random
+import sys
 import time
 from typing import Any, Dict, Optional
 
 import numpy as np
 
 import determined as det
-from determined import layers, util, workload
+from determined import layers, tensorboard, util, workload
 from determined.common import check
 
 
@@ -45,6 +46,7 @@ class NoOpTrialController(det.TrialController):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.metric_writer = self.create_metric_writer()
 
         check_startup_hook_ran = self.env.hparams.get("check_startup_hook_ran", False)
         if check_startup_hook_ran:
@@ -56,6 +58,7 @@ class NoOpTrialController(det.TrialController):
         self.chaos_probability_train = self.env.hparams.get("chaos_probability_train")
         self.chaos_probability_validate = self.env.hparams.get("chaos_probability_validate")
         self.chaos_probability_checkpoint = self.env.hparams.get("chaos_probability_checkpoint")
+        self.nan_probability_validate = self.env.hparams.get("nan_probability_validate", 0)
         self.fail_on_first_validation = self.env.hparams.get("fail_on_first_validation", "")
         self.fail_on_chechpoint_save = self.env.hparams.get("fail_on_chechpoint_save", "")
         self.validation_set_size = self.env.hparams.get("validation_set_size", 32 * 32)
@@ -80,13 +83,15 @@ class NoOpTrialController(det.TrialController):
 
         self.request_stop = self.env.hparams.get("request_stop", False)
 
+        self.non_chief_exit_immediately = self.env.hparams.get("non_chief_exit_immediately", False)
+
         self.wlsq = None
         if self.workloads is None:
             self.workloads, self.wlsq = layers.make_compatibility_workloads(
                 self.context._core, self.env, self.context.get_global_batch_size()
             )
 
-        self.latest_batch = self.env.latest_batch
+        self.steps_completed = self.env.steps_completed
 
         if self.env.latest_checkpoint is not None:
             with self.context._core.checkpoint.restore_path(
@@ -104,14 +109,23 @@ class NoOpTrialController(det.TrialController):
     def pre_execute_hook(env: det.EnvContext, distributed_backend: det._DistributedBackend) -> None:
         np.random.seed(env.trial_seed)
 
+    def create_metric_writer(self) -> tensorboard.BatchMetricWriter:
+        return tensorboard.get_metric_writer()
+
     def run(self) -> None:
+        if self.non_chief_exit_immediately:
+            if self.context.distributed.get_rank() != 0:
+                sys.exit()
+            else:
+                time.sleep(1800)
+
         for w, response_func in self.workloads:
             if w.kind == workload.Workload.Kind.RUN_STEP:
                 response = self.train_for_step(w.step_id, w.num_batches)
             elif w.kind == workload.Workload.Kind.COMPUTE_VALIDATION_METRICS:
                 response = self.compute_validation_metrics(w.step_id)
             elif w.kind == workload.Workload.Kind.CHECKPOINT_MODEL:
-                metadata = {"latest_batch": self.latest_batch}
+                metadata = {"steps_completed": self.steps_completed}
                 if self.is_chief:
                     with self.context._core.checkpoint.store_path(metadata) as (
                         path,
@@ -125,6 +139,7 @@ class NoOpTrialController(det.TrialController):
                 raise AssertionError("Unexpected workload: {}".format(w.kind))
 
             response_func(response)
+            self.upload_tb_files()
 
     def steps_trained(self) -> int:
         return sum(self.trained_steps.values())
@@ -156,7 +171,12 @@ class NoOpTrialController(det.TrialController):
             ),
             "stop_requested": self.context.get_stop_requested(),
         }
-        self.latest_batch += num_batches
+        self.steps_completed += num_batches
+        self.metric_writer.on_train_step_end(
+            self.steps_completed,
+            metrics=response["metrics"]["avg_metrics"],
+            batch_metrics=response["metrics"]["batch_metrics"],
+        )
         return response
 
     def compute_validation_metrics(self, step_id: int) -> Dict[str, Any]:
@@ -165,7 +185,10 @@ class NoOpTrialController(det.TrialController):
         self.chaos_failure(self.chaos_probability_validate)
         time.sleep(self.validation_secs)
         metrics = {
-            name: self.current_metric() for name in ["validation_error", *self.validation_metrics()]
+            name: (
+                np.nan if random.random() < self.nan_probability_validate else self.current_metric()
+            )
+            for name in ["validation_error", *self.validation_metrics()]
         }
         response = {
             "metrics": {"validation_metrics": metrics, "num_inputs": self.validation_set_size},

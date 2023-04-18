@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import warnings
 
 import pytest
 
@@ -9,11 +10,25 @@ from tests import experiment as exp
 
 
 @pytest.mark.distributed
-def test_mnist_pytorch_distributed() -> None:
+@pytest.mark.parametrize("image_type", ["PT", "TF2"])
+def test_mnist_pytorch_distributed(image_type: str) -> None:
     config = conf.load_config(conf.tutorials_path("mnist_pytorch/distributed.yaml"))
     config = conf.set_max_length(config, {"batches": 200})
 
+    if image_type == "PT":
+        config = conf.set_pt_image(config)
+    elif image_type == "TF2":
+        config = conf.set_tf2_image(config)
+    else:
+        warnings.warn("Using default images", stacklevel=2)
+
     exp.run_basic_test_with_temp_config(config, conf.tutorials_path("mnist_pytorch"), 1)
+
+
+@pytest.mark.distributed
+def test_mnist_pytorch_set_stop_requested_distributed() -> None:
+    config = conf.load_config(conf.fixtures_path("mnist_pytorch/distributed-stop-requested.yaml"))
+    exp.run_basic_test_with_temp_config(config, conf.fixtures_path("mnist_pytorch"), 1)
 
 
 @pytest.mark.distributed
@@ -33,22 +48,19 @@ def test_imagenet_pytorch_distributed() -> None:
 
 
 @pytest.mark.distributed
-def test_cifar10_pytorch_distributed() -> None:
+@pytest.mark.parametrize("image_type", ["PT", "TF2"])
+def test_cifar10_pytorch_distributed(image_type: str) -> None:
     config = conf.load_config(conf.cv_examples_path("cifar10_pytorch/distributed.yaml"))
     config = conf.set_max_length(config, {"batches": 200})
 
+    if image_type == "PT":
+        config = conf.set_pt_image(config)
+    elif image_type == "TF2":
+        config = conf.set_tf2_image(config)
+    else:
+        warnings.warn("Using default images", stacklevel=2)
+
     exp.run_basic_test_with_temp_config(config, conf.cv_examples_path("cifar10_pytorch"), 1)
-
-
-@pytest.mark.distributed
-@pytest.mark.gpu_required
-def test_mmdetection_pytorch_distributed() -> None:
-    config = conf.load_config(
-        conf.cv_examples_path("mmdetection_pytorch/distributed_fake_data.yaml")
-    )
-    config = conf.set_max_length(config, {"batches": 200})
-
-    exp.run_basic_test_with_temp_config(config, conf.cv_examples_path("mmdetection_pytorch"), 1)
 
 
 @pytest.mark.distributed
@@ -123,6 +135,14 @@ def test_gan_mnist_pytorch_distributed() -> None:
 
 
 @pytest.mark.distributed
+def test_pix2pix_facades_distributed() -> None:
+    config = conf.load_config(conf.gan_examples_path("pix2pix_tf_keras/distributed.yaml"))
+    config = conf.set_max_length(config, {"batches": 200})
+
+    exp.run_basic_test_with_temp_config(config, conf.gan_examples_path("pix2pix_tf_keras"), 1)
+
+
+@pytest.mark.distributed
 @pytest.mark.gpu_required
 def test_detr_coco_pytorch_distributed() -> None:
     config = conf.load_config(conf.cv_examples_path("detr_coco_pytorch/const_fake.yaml"))
@@ -146,11 +166,19 @@ def test_deformabledetr_coco_pytorch_distributed() -> None:
 
 
 @pytest.mark.distributed
-def test_word_language_transformer_distributed() -> None:
+@pytest.mark.parametrize("image_type", ["PT", "TF2"])
+def test_word_language_transformer_distributed(image_type: str) -> None:
     config = conf.load_config(conf.nlp_examples_path("word_language_model/distributed.yaml"))
     config = conf.set_max_length(config, {"batches": 200})
     config = config.copy()
     config["hyperparameters"]["model_cls"] = "Transformer"
+
+    if image_type == "PT":
+        config = conf.set_pt_image(config)
+    elif image_type == "TF2":
+        config = conf.set_tf2_image(config)
+    else:
+        warnings.warn("Using default images", stacklevel=2)
 
     exp.run_basic_test_with_temp_config(config, conf.nlp_examples_path("word_language_model"), 1)
 
@@ -173,6 +201,16 @@ def test_byol_pytorch_distributed() -> None:
     config = conf.set_max_length(config, {"epochs": 1})
 
     exp.run_basic_test_with_temp_config(config, conf.cv_examples_path("byol_pytorch"), 1)
+
+
+@pytest.mark.distributed
+@pytest.mark.gpu_required
+def test_hf_trainer_api_integration() -> None:
+    config = conf.load_config(conf.integrations_examples_path("hf_trainer_api/distributed.yaml"))
+
+    exp.run_basic_test_with_temp_config(
+        config, conf.integrations_examples_path("hf_trainer_api"), 1
+    )
 
 
 @pytest.mark.deepspeed
@@ -208,20 +246,14 @@ def test_deepspeed_pipeline_parallel() -> None:
 
 @pytest.mark.deepspeed
 @pytest.mark.gpu_required
-def test_gpt_neox_zero_medium() -> None:
-    config = conf.load_config(conf.deepspeed_examples_path("gpt_neox/zero3_medium.yaml"))
+def test_gpt_neox_zero1() -> None:
+    config = conf.load_config(conf.deepspeed_examples_path("gpt_neox/zero1.yaml"))
     config = conf.set_max_length(config, {"batches": 100})
     config = conf.set_min_validation_period(config, {"batches": 100})
-
-    exp.run_basic_test_with_temp_config(config, conf.deepspeed_examples_path("gpt_neox"), 1)
-
-
-@pytest.mark.deepspeed
-@pytest.mark.gpu_required
-def test_gpt_neox_zero_3D_parallel() -> None:
-    config = conf.load_config(conf.deepspeed_examples_path("gpt_neox/zero1_3d_parallel.yaml"))
-    config = conf.set_max_length(config, {"batches": 100})
-    config = conf.set_min_validation_period(config, {"batches": 100})
+    # Changing to satisfy cluter size and gpu mem limitations.
+    config = conf.set_slots_per_trial(config, 8)
+    config["hyperparameters"]["conf_file"] = ["350M.yml", "determined_cluster.yml"]
+    config["hyperparameters"]["overwrite_values"]["train_batch_size"] = 32
 
     exp.run_basic_test_with_temp_config(config, conf.deepspeed_examples_path("gpt_neox"), 1)
 
@@ -233,3 +265,93 @@ def test_deepspeed_dcgan() -> None:
     config = conf.set_max_length(config, {"batches": 200})
 
     exp.run_basic_test_with_temp_config(config, conf.deepspeed_examples_path("deepspeed_dcgan"), 1)
+
+
+@pytest.mark.deepspeed
+@pytest.mark.gpu_required
+def test_deepspeed_cpu_offloading() -> None:
+    config = conf.load_config(
+        conf.deepspeed_examples_path("cifar10_cpu_offloading/zero_3_cpu_offload.yaml")
+    )
+    config = conf.set_max_length(config, {"batches": 100})
+
+    exp.run_basic_test_with_temp_config(
+        config, conf.deepspeed_examples_path("cifar10_cpu_offloading"), 1
+    )
+
+
+@pytest.mark.distributed
+def test_remote_search_runner() -> None:
+    config = conf.custom_search_method_examples_path(
+        "asha_search_method/remote_search_runner/searcher.yaml"
+    )
+
+    exp.run_basic_test(config, conf.custom_search_method_examples_path("asha_search_method"), 1)
+
+
+@pytest.mark.distributed
+@pytest.mark.gpu_required
+def test_textual_inversion_stable_diffusion_finetune() -> None:
+    """Requires downloading weights from Hugging Face via an authorization token. The experiment
+    expects the token to be stored in the HF_AUTH_TOKEN environment variable.
+
+    Hugging Face tokens are stored in CircleCI's "hugging-face" context as HF_READ_ONLY_TOKEN and
+    HF_READ_WRITE_TOKEN environment variables which are accessible during CI runs.
+
+    The Hugging Face account details can be found at
+    github.com/determined-ai/secrets/blob/master/ci/hugging_face.txt
+    """
+    config = conf.load_config(
+        conf.diffusion_examples_path(
+            "textual_inversion_stable_diffusion/finetune_const_advanced.yaml"
+        )
+    )
+    config = conf.set_max_length(config, 10)
+    try:
+        config = conf.set_environment_variables(
+            config, [f'HF_AUTH_TOKEN={os.environ["HF_READ_ONLY_TOKEN"]}']
+        )
+        exp.run_basic_test_with_temp_config(
+            config, conf.diffusion_examples_path("textual_inversion_stable_diffusion"), 1
+        )
+    except KeyError as k:
+        if str(k) == "'HF_READ_ONLY_TOKEN'":
+            pytest.skip("HF_READ_ONLY_TOKEN CircleCI environment variable missing, skipping test")
+        else:
+            raise k
+
+
+@pytest.mark.distributed
+@pytest.mark.gpu_required
+def test_textual_inversion_stable_diffusion_generate() -> None:
+    """Requires downloading weights from Hugging Face via an authorization token. The experiment
+    expects the token to be stored in the HF_AUTH_TOKEN environment variable.
+
+    Hugging Face tokens are stored in CircleCI's "hugging-face" context as HF_READ_ONLY_TOKEN and
+    HF_READ_WRITE_TOKEN environment variables which are accessible during CI runs.
+
+    The Hugging Face account details can be found at
+    github.com/determined-ai/secrets/blob/master/ci/hugging_face.txt
+    """
+    config = conf.load_config(
+        conf.diffusion_examples_path("textual_inversion_stable_diffusion/generate_grid.yaml")
+    )
+    # Shorten the Experiment and reduce to two Trials.
+    config = conf.set_max_length(config, 2)
+    prompt_vals = config["hyperparameters"]["call_kwargs"]["prompt"]["vals"]
+    config["hyperparameters"]["call_kwargs"]["guidance_scale"] = 7.5
+    while len(prompt_vals) > 1:
+        prompt_vals.pop()
+
+    try:
+        config = conf.set_environment_variables(
+            config, [f'HF_AUTH_TOKEN={os.environ["HF_READ_ONLY_TOKEN"]}']
+        )
+        exp.run_basic_test_with_temp_config(
+            config, conf.diffusion_examples_path("textual_inversion_stable_diffusion"), 2
+        )
+    except KeyError as k:
+        if str(k) == "'HF_READ_ONLY_TOKEN'":
+            pytest.skip("HF_READ_ONLY_TOKEN CircleCI environment variable missing, skipping test")
+        else:
+            raise k

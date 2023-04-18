@@ -2,8 +2,10 @@
 import { useRef } from 'react';
 
 import { getTelemetry } from 'services/api';
-import { Auth, DeterminedInfo } from 'types';
-import handleError, { ErrorLevel, ErrorType } from 'utils/error';
+import { ErrorLevel, ErrorType } from 'shared/utils/error';
+import { DeterminedInfo } from 'stores/determinedInfo';
+import { Auth, DetailedUser } from 'types';
+import handleError from 'utils/error';
 
 /*
  * Telemetry is written as a modular class instance instead of
@@ -19,14 +21,14 @@ class Telemetry {
     this.isIdentified = false;
   }
 
-  async update(auth: Auth, info: DeterminedInfo) {
+  async update(auth: Auth, user: DetailedUser, info: DeterminedInfo) {
     if (!info.isTelemetryEnabled) return;
 
     // Attempt to load analytics first.
     await this.load(info);
 
     // Update identify if necessary.
-    this.identify(auth, info);
+    this.identify(auth, user, info);
   }
 
   reset() {
@@ -40,7 +42,7 @@ class Telemetry {
 
   /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
   track(event: string, ...args: any[]) {
-    if (analytics?.track) analytics.track(event, ...args);
+    if (window.analytics?.track) analytics.track(event, ...args);
   }
 
   async load(info: DeterminedInfo): Promise<void> {
@@ -54,12 +56,12 @@ class Telemetry {
       const telemetry = await getTelemetry({});
       const isProperKey = telemetry.segmentKey && /^[a-z0-9]{32}$/i.test(telemetry.segmentKey);
       if (isProperKey) {
-        analytics.load(telemetry.segmentKey || '');
-        analytics.page();
+        if (analytics?.load) analytics.load(telemetry.segmentKey || '');
+        if (analytics?.page) analytics.page();
         this.isLoaded = true;
       }
     } catch (e) {
-      handleError({
+      handleError(e, {
         level: ErrorLevel.Error,
         publicMessage: 'Failed to load telemetry.',
         silent: true,
@@ -68,7 +70,7 @@ class Telemetry {
     }
   }
 
-  identify(auth: Auth, info: DeterminedInfo) {
+  identify(auth: Auth, user: DetailedUser, info: DeterminedInfo) {
     if (!this.isLoaded || !analytics?.identify) return;
 
     /*
@@ -76,22 +78,22 @@ class Telemetry {
      * lower case letters and numbers 0-9.
      */
     try {
-      if (!this.isIdentified && auth.isAuthenticated && auth.user) {
-        analytics.identify(auth.user.id.toString(), {
+      if (!this.isIdentified && auth.isAuthenticated) {
+        analytics.identify(user.id.toString(), {
           clusterId: info.clusterId,
           clusterName: info.clusterName,
           edition: 'OSS',
           masterId: info.masterId,
-          username: auth.user.username,
+          username: user.username,
           version: info.version,
         });
         this.isIdentified = true;
-      } else if (this.isIdentified && !auth.isAuthenticated) {
+      } else if (this.isIdentified || !auth.isAuthenticated) {
         this.reset();
         this.isIdentified = false;
       }
     } catch (e) {
-      handleError({
+      handleError(e, {
         level: ErrorLevel.Error,
         publicMessage: 'Failed to set telemetry identity.',
         silent: true,
@@ -107,7 +109,7 @@ export const telemetryInstance = new Telemetry();
 interface TelemetryHook {
   track: (...args: any[]) => void;
   trackPage: (...args: any[]) => void;
-  updateTelemetry: (auth: Auth, info: DeterminedInfo) => void;
+  updateTelemetry: (auth: Auth, user: DetailedUser, info: DeterminedInfo) => void;
 }
 
 const useTelemetry = (): TelemetryHook => {

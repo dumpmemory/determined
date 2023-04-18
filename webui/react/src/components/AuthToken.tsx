@@ -1,9 +1,11 @@
 import { CopyOutlined } from '@ant-design/icons';
-import { Button, notification, Result } from 'antd';
+import { Result } from 'antd';
 import React, { useCallback } from 'react';
 
+import Button from 'components/kit/Button';
 import { globalStorage } from 'globalStorage';
-import { copyToClipboard } from 'utils/dom';
+import { copyToClipboard } from 'shared/utils/dom';
+import { notification } from 'utils/dialogApi';
 
 import css from './AuthToken.module.scss';
 
@@ -18,22 +20,18 @@ const AuthToken: React.FC = () => {
         message: 'Auth Token Copied',
       });
     } catch (e) {
-      notification.warn({
-        description: e.message,
+      notification.warning({
+        description: (e as Error)?.message,
         message: 'Unable to Copy to Clipboard',
       });
     }
-  }, [ token ]);
+  }, [token]);
 
   return (
     <Result
       className={css.base}
       extra={[
-        <Button
-          icon={<CopyOutlined />}
-          key="copy"
-          type="primary"
-          onClick={handleCopyToClipboard}>
+        <Button icon={<CopyOutlined />} key="copy" type="primary" onClick={handleCopyToClipboard}>
           Copy token to clipboard
         </Button>,
       ]}

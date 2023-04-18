@@ -83,11 +83,11 @@ func (s *tournamentSearch) trialCreated(
 }
 
 func (s *tournamentSearch) validationCompleted(
-	ctx context, requestID model.RequestID, metric float64,
+	ctx context, requestID model.RequestID, metric interface{}, op ValidateAfter,
 ) ([]Operation, error) {
 	subSearchID := s.TrialTable[requestID]
 	subSearch := s.subSearches[subSearchID]
-	ops, err := subSearch.validationCompleted(ctx, requestID, metric)
+	ops, err := subSearch.validationCompleted(ctx, requestID, metric, op)
 	return s.markCreates(subSearchID, ops), err
 }
 
@@ -113,7 +113,8 @@ func (s *tournamentSearch) trialExitedEarly(
 // progress returns experiment progress as a float between 0.0 and 1.0.
 func (s *tournamentSearch) progress(
 	trialProgress map[model.RequestID]PartialUnits,
-	trialsClosed map[model.RequestID]bool) float64 {
+	trialsClosed map[model.RequestID]bool,
+) float64 {
 	sum := 0.0
 	for subSearchID, subSearch := range s.subSearches {
 		subSearchTrialProgress := map[model.RequestID]PartialUnits{}

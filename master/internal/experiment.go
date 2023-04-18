@@ -1,12 +1,14 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/shopspring/decimal"
-
-	"github.com/determined-ai/determined/master/internal/resourcemanagers"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -16,14 +18,17 @@ import (
 
 	"github.com/determined-ai/determined/master/internal/api"
 	"github.com/determined-ai/determined/master/internal/config"
-	"github.com/determined-ai/determined/master/internal/job"
+	"github.com/determined-ai/determined/master/internal/rm"
+	"github.com/determined-ai/determined/master/internal/rm/rmerrors"
 	"github.com/determined-ai/determined/master/internal/task"
+	"github.com/determined-ai/determined/master/internal/user"
 
 	"github.com/determined-ai/determined/master/internal/db"
-	"github.com/determined-ai/determined/master/internal/hpimportance"
 	"github.com/determined-ai/determined/master/internal/sproto"
 	"github.com/determined-ai/determined/master/internal/telemetry"
+	"github.com/determined-ai/determined/master/internal/webhooks"
 	"github.com/determined-ai/determined/master/pkg/actor"
+	"github.com/determined-ai/determined/master/pkg/command"
 	"github.com/determined-ai/determined/master/pkg/logger"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/master/pkg/ptrs"
@@ -32,6 +37,7 @@ import (
 	"github.com/determined-ai/determined/master/pkg/searcher"
 	"github.com/determined-ai/determined/master/pkg/tasks"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
+	"github.com/determined-ai/determined/proto/pkg/experimentv1"
 	"github.com/determined-ai/determined/proto/pkg/jobv1"
 )
 
@@ -44,7 +50,7 @@ type (
 	trialCompleteOperation struct {
 		requestID model.RequestID
 		op        searcher.ValidateAfter
-		metric    float64
+		metric    interface{}
 	}
 	trialReportEarlyExit struct {
 		requestID model.RequestID
@@ -70,6 +76,12 @@ type (
 		requestID model.RequestID
 		reason    model.ExitedReason
 	}
+
+	// UnwatchEvents is initiated from the get searcher events API. It deletes the watcher with the
+	// given ID.
+	UnwatchEvents struct {
+		id uuid.UUID
+	}
 )
 
 type (
@@ -89,11 +101,12 @@ type (
 		experimentState
 
 		*model.Experiment
-		rm                  *actor.Ref
+		activeConfig        expconf.ExperimentConfig
 		taskLogger          *task.Logger
-		hpImportance        *actor.Ref
 		db                  *db.PgDB
+		rm                  rm.ResourceManager
 		searcher            *searcher.Searcher
+		queue               *searcher.SearcherEventQueue
 		warmStartCheckpoint *model.Checkpoint
 
 		taskSpec *tasks.TaskSpec
@@ -108,56 +121,69 @@ type (
 // Create a new experiment object from the given model experiment object, along with its searcher
 // and log. If the input object has no ID set, also create a new experiment in the database and set
 // the returned object's ID appropriately.
-func newExperiment(master *Master, expModel *model.Experiment, taskSpec *tasks.TaskSpec) (
-	*experiment, error,
-) {
-	conf := &expModel.Config
-
-	resources := conf.Resources()
-	poolName, err := sproto.GetResourcePool(
-		master.system, resources.ResourcePool(), resources.SlotsPerTrial(), false)
+func newExperiment(
+	m *Master,
+	expModel *model.Experiment,
+	activeConfig expconf.ExperimentConfig,
+	taskSpec *tasks.TaskSpec,
+) (*experiment, []command.LaunchWarning, error) {
+	resources := activeConfig.Resources()
+	poolName, err := m.rm.ResolveResourcePool(
+		m.system, resources.ResourcePool(), resources.SlotsPerTrial(),
+	)
 	if err != nil {
-		return nil, errors.Wrap(err, "cannot create an experiment")
+		return nil, nil, fmt.Errorf("cannot create an experiment: %w", err)
+	}
+	if err = m.rm.ValidateResources(m.system, poolName, resources.SlotsPerTrial(), false); err != nil {
+		return nil, nil, fmt.Errorf("validating resources: %v", err)
+	}
+	launchWarnings, err := m.rm.ValidateResourcePoolAvailability(
+		m.system,
+		poolName,
+		resources.SlotsPerTrial(),
+	)
+	if err != nil {
+		return nil, launchWarnings, fmt.Errorf("getting resource availability: %w", err)
+	}
+	if m.config.LaunchError && len(launchWarnings) > 0 {
+		return nil, nil, errors.New("slots requested exceeds cluster capacity")
 	}
 
 	resources.SetResourcePool(poolName)
-	conf.SetResources(resources)
+	activeConfig.SetResources(resources)
 
-	method := searcher.NewSearchMethod(conf.Searcher())
+	method := searcher.NewSearchMethod(activeConfig.Searcher())
 	search := searcher.NewSearcher(
-		conf.Reproducibility().ExperimentSeed(), method, conf.Hyperparameters(),
+		activeConfig.Reproducibility().ExperimentSeed(), method, activeConfig.Hyperparameters(),
 	)
 
 	// Retrieve the warm start checkpoint, if provided.
 	checkpoint, err := checkpointFromTrialIDOrUUID(
-		master.db, conf.Searcher().SourceTrialID(), conf.Searcher().SourceCheckpointUUID())
+		m.db, activeConfig.Searcher().SourceTrialID(), activeConfig.Searcher().SourceCheckpointUUID())
 	if err != nil {
-		return nil, err
+		return nil, launchWarnings, err
 	}
 
 	if expModel.ID == 0 {
-		if err = master.db.AddExperiment(expModel); err != nil {
-			return nil, err
+		if err = m.db.AddExperiment(expModel, activeConfig); err != nil {
+			return nil, launchWarnings, err
 		}
-		telemetry.ReportExperimentCreated(master.system, expModel)
+		telemetry.ReportExperimentCreated(m.system, expModel.ID, activeConfig)
 	}
 
-	agentUserGroup, err := master.db.AgentUserGroup(*expModel.OwnerID)
+	agentUserGroup, err := user.GetAgentUserGroup(*expModel.OwnerID, expModel)
 	if err != nil {
-		return nil, err
+		return nil, launchWarnings, err
 	}
 
-	if agentUserGroup == nil {
-		agentUserGroup = &master.config.Security.DefaultTask
-	}
 	taskSpec.AgentUserGroup = agentUserGroup
 
 	return &experiment{
 		Experiment:          expModel,
-		rm:                  master.rm,
-		taskLogger:          master.taskLogger,
-		hpImportance:        master.hpImportance,
-		db:                  master.db,
+		activeConfig:        activeConfig,
+		taskLogger:          m.taskLogger,
+		db:                  m.db,
+		rm:                  m.rm,
 		searcher:            search,
 		warmStartCheckpoint: checkpoint,
 
@@ -173,7 +199,7 @@ func newExperiment(master *Master, expModel *model.Experiment, taskSpec *tasks.T
 			"job-id":        expModel.JobID,
 			"experiment-id": expModel.ID,
 		},
-	}, nil
+	}, launchWarnings, nil
 }
 
 func (e *experiment) Receive(ctx *actor.Context) error {
@@ -181,18 +207,26 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 	// Searcher-related messages.
 	case actor.PreStart:
 		ctx.AddLabels(e.logCtx)
-		ctx.Tell(e.rm, sproto.SetGroupMaxSlots{
-			MaxSlots: e.Config.Resources().MaxSlots(),
+		e.rm.SetGroupMaxSlots(ctx, sproto.SetGroupMaxSlots{
+			MaxSlots: e.activeConfig.Resources().MaxSlots(),
 			Handler:  ctx.Self(),
 		})
-		if err := e.setWeight(ctx, e.Config.Resources().Weight()); err != nil {
+		if err := e.setWeight(ctx, e.activeConfig.Resources().Weight()); err != nil {
+			e.updateState(ctx, model.StateWithReason{
+				State:               model.StoppingErrorState,
+				InformationalReason: err.Error(),
+			})
 			return err
 		}
-		if err := e.setPriority(ctx, e.Config.Resources().Priority(), true); err != nil {
+		if err := e.setPriority(ctx, e.activeConfig.Resources().Priority(), true); err != nil {
+			e.updateState(ctx, model.StateWithReason{
+				State:               model.StoppingErrorState,
+				InformationalReason: err.Error(),
+			})
 			return err
 		}
 
-		ctx.Self().System().TellAt(job.JobsActorAddr, job.RegisterJob{
+		ctx.Self().System().TellAt(sproto.JobsActorAddr, sproto.RegisterJob{
 			JobID:    e.JobID,
 			JobActor: ctx.Self(),
 		})
@@ -200,14 +234,18 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 		if e.restored {
 			j, err := e.db.JobByID(e.JobID)
 			if err != nil {
+				e.updateState(ctx, model.StateWithReason{
+					State:               model.StoppingErrorState,
+					InformationalReason: err.Error(),
+				})
 				return err
 			}
 
-			if !j.QPos.Equals(decimal.Zero) {
-				ctx.Tell(e.rm, job.RecoverJobPosition{
+			if j.QPos.GreaterThan(decimal.Zero) {
+				e.rm.RecoverJobPosition(ctx, sproto.RecoverJobPosition{
 					JobID:        e.JobID,
 					JobPosition:  j.QPos,
-					ResourcePool: e.Config.Resources().ResourcePool(),
+					ResourcePool: e.activeConfig.Resources().ResourcePool(),
 				})
 			}
 
@@ -217,10 +255,14 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 
 		ops, err := e.searcher.InitialOperations()
 		if err != nil {
-			return errors.Wrap(err, "failed to generate initial operations")
+			err = errors.Wrap(err, "failed to generate initial operations")
+			e.updateState(ctx, model.StateWithReason{
+				State:               model.StoppingErrorState,
+				InformationalReason: err.Error(),
+			})
+			return err
 		}
 		e.processOperations(ctx, ops, nil)
-		ctx.Tell(e.hpImportance, hpimportance.ExperimentCreated{ID: e.ID})
 
 	case trialCreated:
 		ops, err := e.searcher.TrialCreated(msg.requestID)
@@ -263,7 +305,6 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 		if err := e.db.SaveExperimentProgress(e.ID, &progress); err != nil {
 			ctx.Log().WithError(err).Error("failed to save experiment progress")
 		}
-		ctx.Tell(e.hpImportance, hpimportance.ExperimentProgress{ID: e.ID, Progress: progress})
 	case trialGetSearcherState:
 		state, ok := e.TrialSearcherState[msg.requestID]
 		if !ok {
@@ -280,35 +321,51 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 		e.trialClosed(ctx, msg.requestID)
 
 	// Patch experiment messages.
-	case model.State:
+	case model.StateWithReason:
 		e.updateState(ctx, msg)
+	case model.State:
+		e.updateState(ctx, model.StateWithReason{State: msg})
 	case config.ExperimentConfigPatch:
-		e.Config.SetName(expconf.Name{RawString: msg.Name})
+		e.activeConfig.SetName(expconf.Name{RawString: msg.Name})
 	case sproto.SetGroupMaxSlots:
-		resources := e.Config.Resources()
+		resources := e.activeConfig.Resources()
 		resources.SetMaxSlots(msg.MaxSlots)
-		e.Config.SetResources(resources)
+		e.activeConfig.SetResources(resources)
 		msg.Handler = ctx.Self()
-		msg.Handler = ctx.Self()
-		ctx.Tell(e.rm, msg)
+		e.rm.SetGroupMaxSlots(ctx, msg)
 	case sproto.NotifyRMPriorityChange:
-		ctx.Respond(e.setPriority(ctx, &msg.Priority, false))
-	case job.SetGroupWeight:
-		if err := e.setWeight(ctx, msg.Weight); err != nil {
-			ctx.Respond(err)
-			ctx.Log().WithError(err)
+		err := e.setPriority(ctx, &msg.Priority, false)
+		if err != nil {
+			ctx.Log().WithError(err).Info("setting experiment job priority")
 		}
-	case job.SetGroupPriority:
-		ctx.Respond(e.setPriority(ctx, &msg.Priority, true))
-	case job.GetJob:
+		if ctx.ExpectingResponse() {
+			ctx.Respond(err)
+		}
+	case sproto.SetGroupWeight:
+		err := e.setWeight(ctx, msg.Weight)
+		if err != nil {
+			ctx.Log().WithError(err).Info("setting experiment job weight")
+		}
+		if ctx.ExpectingResponse() {
+			ctx.Respond(err)
+		}
+	case sproto.SetGroupPriority:
+		err := e.setPriority(ctx, &msg.Priority, true)
+		if err != nil {
+			ctx.Log().WithError(err).Info("setting experiment job priority")
+		}
+		if ctx.ExpectingResponse() {
+			ctx.Respond(err)
+		}
+	case sproto.GetJob:
 		ctx.Respond(e.toV1Job())
 
-	case job.SetResourcePool:
+	case sproto.SetResourcePool:
 		if err := e.setRP(ctx, msg); err != nil {
 			ctx.Respond(err)
 		}
 
-	case job.RegisterJobPosition:
+	case sproto.RegisterJobPosition:
 		err := e.db.UpdateJobPosition(msg.JobID, msg.JobPosition)
 		if err != nil {
 			ctx.Log().WithError(err).Errorf("persisting position for job %s failed", msg.JobID)
@@ -322,7 +379,7 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 			}
 		}
 
-		ctx.Self().System().TellAt(job.JobsActorAddr, job.UnregisterJob{
+		ctx.Self().System().TellAt(sproto.JobsActorAddr, sproto.UnregisterJob{
 			JobID: e.JobID,
 		})
 
@@ -333,6 +390,11 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 			return errors.New("experiment is already in a terminal state")
 		}
 		telemetry.ReportExperimentStateChanged(ctx.Self().System(), e.db, *e.Experiment)
+		if err := webhooks.ReportExperimentStateChanged(
+			context.TODO(), *e.Experiment, e.activeConfig,
+		); err != nil {
+			log.WithError(err).Error("failed to send experiment state change webhook")
+		}
 
 		if err := e.db.SaveExperimentState(e.Experiment); err != nil {
 			return err
@@ -342,36 +404,25 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 
 		checkpoints, err := e.db.ExperimentCheckpointsToGCRaw(
 			e.Experiment.ID,
-			e.Config.CheckpointStorage().SaveExperimentBest(),
-			e.Config.CheckpointStorage().SaveTrialBest(),
-			e.Config.CheckpointStorage().SaveTrialLatest(),
-			true,
+			e.activeConfig.CheckpointStorage().SaveExperimentBest(),
+			e.activeConfig.CheckpointStorage().SaveTrialBest(),
+			e.activeConfig.CheckpointStorage().SaveTrialLatest(),
 		)
 		if err != nil {
 			ctx.Log().WithError(err).Error("")
 		}
 
 		taskSpec := *e.taskSpec
-		ctx.Self().System().ActorOf(addr, &checkpointGCTask{
-			taskID:            model.TaskID(fmt.Sprintf("%d.%s", e.ID, uuid.New())),
-			jobID:             e.JobID,
-			jobSubmissionTime: e.StartTime,
-			GCCkptSpec: tasks.GCCkptSpec{
-				Base:         taskSpec,
-				ExperimentID: e.Experiment.ID,
-				LegacyConfig: e.Config.AsLegacy(),
-				ToDelete:     checkpoints,
-			},
 
-			rm: e.rm,
-			db: e.db,
-
-			taskLogger: e.taskLogger,
-			logCtx:     e.logCtx,
-		})
-
-		if e.State == model.CompletedState {
-			ctx.Tell(e.hpImportance, hpimportance.ExperimentCompleted{ID: e.ID})
+		// May be no checkpoints to gc, if so skip
+		if len(checkpoints) > 0 {
+			taskID := model.TaskID(fmt.Sprintf("%d.%s", e.ID, uuid.New()))
+			ckptGCTask := newCheckpointGCTask(
+				e.rm, e.db, e.taskLogger, taskID, e.JobID, e.StartTime, taskSpec, e.Experiment.ID,
+				e.activeConfig.AsLegacy(), checkpoints, false, taskSpec.AgentUserGroup, taskSpec.Owner,
+				e.logCtx,
+			)
+			ctx.Self().System().ActorOf(addr, ckptGCTask)
 		}
 
 		if err := e.db.DeleteSnapshotsForExperiment(e.Experiment.ID); err != nil {
@@ -386,8 +437,81 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 
 		ctx.Log().Info("experiment shut down successfully")
 
+	case *apiv1.PostSearcherOperationsRequest:
+		queue, err := e.searcher.GetCustomSearcherEventQueue()
+		if err != nil {
+			ctx.Respond(status.Error(codes.Internal, err.Error()))
+			return nil
+		}
+		var ops []searcher.Operation
+		for _, searcherOp := range msg.SearcherOperations {
+			switch concreteOperation := searcherOp.GetUnion().(type) {
+			case *experimentv1.SearcherOperation_CreateTrial:
+				op, err := searcher.CreateFromProto(concreteOperation, model.TrialWorkloadSequencerType)
+				if err != nil {
+					ctx.Log().Error(err)
+				} else {
+					ops = append(ops, *op)
+				}
+			case *experimentv1.SearcherOperation_ShutDown:
+				ops = append(ops, searcher.NewShutdown())
+			case *experimentv1.SearcherOperation_TrialOperation:
+				switch sub := concreteOperation.TrialOperation.GetUnion().(type) {
+				case *experimentv1.TrialOperation_ValidateAfter:
+					op, err := searcher.ValidateAfterFromProto(sub)
+					if err != nil {
+						ctx.Log().Error(err)
+					} else {
+						ops = append(ops, *op)
+					}
+				}
+			case *experimentv1.SearcherOperation_CloseTrial:
+				op, err := searcher.CloseFromProto(concreteOperation)
+				if err != nil {
+					ctx.Log().Error(err)
+				} else {
+					ops = append(ops, *op)
+				}
+			case *experimentv1.SearcherOperation_SetSearcherProgress:
+				ops = append(ops, searcher.SetSearcherProgressFromProto(concreteOperation))
+			default:
+				ctx.Log().Errorf("unimplemented op %+v", concreteOperation)
+			}
+		}
+		ctx.Log().Infof("processing searcher operations %+v", ops)
+
+		// Remove newly processed events from queue.
+		if err := queue.RemoveUpTo(int(msg.TriggeredByEvent.Id)); err != nil {
+			ctx.Respond(status.Error(codes.Internal, "failed to remove events from queue"))
+		} else {
+			e.searcher.Record(ops)
+			e.processOperations(ctx, ops, nil)
+			ctx.Respond(&apiv1.PostSearcherOperationsResponse{})
+		}
+
+	case *apiv1.GetSearcherEventsRequest:
+		if queue, err := e.searcher.GetCustomSearcherEventQueue(); err != nil {
+			ctx.Respond(status.Error(codes.Internal, err.Error()))
+		} else {
+			if w, err := queue.Watch(); err != nil {
+				ctx.Respond(err)
+			} else {
+				ctx.Respond(w)
+			}
+		}
+
+	case UnwatchEvents:
+		if queue, err := e.searcher.GetCustomSearcherEventQueue(); err != nil {
+			ctx.Respond(status.Error(codes.Internal, err.Error()))
+		} else {
+			queue.Unwatch(msg.id)
+		}
+
 	case *apiv1.ActivateExperimentRequest:
-		switch ok := e.updateState(ctx, model.ActiveState); ok {
+		switch ok := e.updateState(ctx, model.StateWithReason{
+			State:               model.ActiveState,
+			InformationalReason: "user requested activation",
+		}); ok {
 		case true:
 			ctx.Respond(&apiv1.ActivateExperimentResponse{})
 		default:
@@ -396,7 +520,10 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 		}
 
 	case *apiv1.PauseExperimentRequest:
-		switch ok := e.updateState(ctx, model.PausedState); ok {
+		switch ok := e.updateState(ctx, model.StateWithReason{
+			State:               model.PausedState,
+			InformationalReason: "user requested pause",
+		}); ok {
 		case true:
 			ctx.Respond(&apiv1.PauseExperimentResponse{})
 		default:
@@ -409,26 +536,34 @@ func (e *experiment) Receive(ctx *actor.Context) error {
 		case model.StoppingStates[e.State] || model.TerminalStates[e.State]:
 			ctx.Respond(&apiv1.CancelExperimentResponse{})
 		default:
-			if ok := e.updateState(ctx, model.StoppingCanceledState); !ok {
+			switch ok := e.updateState(ctx, model.StateWithReason{
+				State:               model.StoppingCanceledState,
+				InformationalReason: "user requested cancellation",
+			}); ok {
+			case true:
+				ctx.Respond(&apiv1.CancelExperimentResponse{})
+			default:
 				ctx.Respond(status.Errorf(codes.FailedPrecondition,
 					"experiment in incompatible state %s", e.State,
 				))
-			} else {
-				ctx.Respond(&apiv1.CancelExperimentResponse{})
 			}
 		}
 
 	case *apiv1.KillExperimentRequest:
 		switch {
-		case model.StoppingStates[e.State] || model.TerminalStates[e.State]:
+		case e.State == model.StoppingKilledState || model.TerminalStates[e.State]:
 			ctx.Respond(&apiv1.KillExperimentResponse{})
 		default:
-			if ok := e.updateState(ctx, model.StoppingKilledState); !ok {
+			switch ok := e.updateState(ctx, model.StateWithReason{
+				State:               model.StoppingKilledState,
+				InformationalReason: "user requested kill",
+			}); ok {
+			case true:
+				ctx.Respond(&apiv1.KillExperimentResponse{})
+			default:
 				ctx.Respond(status.Errorf(codes.FailedPrecondition,
 					"experiment in incompatible state %s", e.State,
 				))
-			} else {
-				ctx.Respond(&apiv1.KillExperimentResponse{})
 			}
 		}
 
@@ -453,7 +588,10 @@ func (e *experiment) restoreTrials(ctx *actor.Context) {
 	for _, state := range e.TrialSearcherState {
 		checkpoint, err := e.checkpointForCreate(state.Create)
 		if err != nil {
-			e.updateState(ctx, model.StoppingErrorState)
+			e.updateState(ctx, model.StateWithReason{
+				State:               model.StoppingErrorState,
+				InformationalReason: fmt.Sprintf("failed getting checkpoint to restore with error %v", err),
+			})
 			ctx.Log().Error(err)
 			return
 		}
@@ -462,13 +600,17 @@ func (e *experiment) restoreTrials(ctx *actor.Context) {
 }
 
 func (e *experiment) processOperations(
-	ctx *actor.Context, ops []searcher.Operation, err error) {
+	ctx *actor.Context, ops []searcher.Operation, err error,
+) {
 	if _, ok := model.StoppingStates[e.State]; ok {
 		return
 	}
 	if err != nil {
 		ctx.Log().Error(err)
-		e.updateState(ctx, model.StoppingErrorState)
+		e.updateState(ctx, model.StateWithReason{
+			State:               model.StoppingErrorState,
+			InformationalReason: fmt.Sprintf("encountered error %v", err),
+		})
 		return
 	}
 
@@ -481,16 +623,20 @@ func (e *experiment) processOperations(
 		case searcher.Create:
 			checkpoint, err := e.checkpointForCreate(op)
 			if err != nil {
-				e.updateState(ctx, model.StoppingErrorState)
+				e.updateState(ctx, model.StateWithReason{
+					State: model.StoppingErrorState,
+					InformationalReason: fmt.Sprintf(
+						"hp search unable to get checkpoint for new trial with error %v", err),
+				})
 				ctx.Log().Error(err)
 				return
 			}
-			config := schemas.Copy(e.Config).(expconf.ExperimentConfig)
+			config := schemas.Copy(e.activeConfig)
 			state := trialSearcherState{Create: op, Complete: true}
 			e.TrialSearcherState[op.RequestID] = state
 			ctx.ActorOf(op.RequestID, newTrial(
 				e.logCtx, trialTaskID(e.ID, op.RequestID), e.JobID, e.StartTime, e.ID, e.State,
-				state, e.rm, e.taskLogger, e.db, config, checkpoint, e.taskSpec,
+				state, e.taskLogger, e.rm, e.db, config, checkpoint, e.taskSpec, false,
 			))
 		case searcher.ValidateAfter:
 			state := e.TrialSearcherState[op.RequestID]
@@ -498,16 +644,33 @@ func (e *experiment) processOperations(
 			state.Complete = false
 			e.TrialSearcherState[op.RequestID] = state
 			updatedTrials[op.RequestID] = true
+		case searcher.SetSearcherProgress:
+			if err := e.searcher.SetCustomSearcherProgress(op.Progress); err != nil {
+				ctx.Respond(status.Error(codes.Internal, err.Error()))
+			}
+
 		case searcher.Close:
 			state := e.TrialSearcherState[op.RequestID]
 			state.Closed = true
 			e.TrialSearcherState[op.RequestID] = state
 			updatedTrials[op.RequestID] = true
 		case searcher.Shutdown:
-			if op.Failure {
-				e.updateState(ctx, model.StoppingErrorState)
-			} else {
-				e.updateState(ctx, model.StoppingCompletedState)
+			switch {
+			case op.Failure:
+				e.updateState(ctx, model.StateWithReason{
+					State:               model.StoppingErrorState,
+					InformationalReason: "hp search failed",
+				})
+			case op.Cancel:
+				e.updateState(ctx, model.StateWithReason{
+					State:               model.StoppingCanceledState,
+					InformationalReason: "hp search canceled",
+				})
+			default:
+				e.updateState(ctx, model.StateWithReason{
+					State:               model.StoppingCompletedState,
+					InformationalReason: "hp search completed",
+				})
 			}
 		default:
 			panic(fmt.Sprintf("unexpected operation: %v", op))
@@ -515,12 +678,35 @@ func (e *experiment) processOperations(
 	}
 
 	for requestID := range updatedTrials {
+		ref := ctx.Child(requestID)
+		if ref == nil {
+			ctx.Log().Errorf("invalid request ID: %v", requestID)
+			continue
+		}
 		ctx.Tell(ctx.Child(requestID), e.TrialSearcherState[requestID])
 	}
 }
 
 func trialTaskID(eID int, rID model.RequestID) model.TaskID {
 	return model.TaskID(fmt.Sprintf("%d.%s", eID, rID))
+}
+
+var errIsNotTrialTaskID = fmt.Errorf("taskID is not a trial task ID")
+
+// Hack to associate allocations to experiments for RBAC.
+// Currently unable to go through the database since trials are not necessarily persisted when
+// we return allocation information.
+func experimentIDFromTrialTaskID(taskID model.TaskID) (int, error) {
+	expID, _, found := strings.Cut(string(taskID), ".")
+	if !found {
+		return 0, errors.Wrapf(errIsNotTrialTaskID, "error on task ID %s", taskID)
+	}
+
+	id, err := strconv.Atoi(expID)
+	if err != nil {
+		return 0, errors.Wrapf(err, "error parsing experiment ID for task ID %s", taskID)
+	}
+	return id, nil
 }
 
 func (e *experiment) checkpointForCreate(op searcher.Create) (*model.Checkpoint, error) {
@@ -541,16 +727,21 @@ func (e *experiment) checkpointForCreate(op searcher.Create) (*model.Checkpoint,
 	return checkpoint, nil
 }
 
-func (e *experiment) updateState(ctx *actor.Context, state model.State) bool {
-	if wasPatched, err := e.Transition(state); err != nil {
+func (e *experiment) updateState(ctx *actor.Context, state model.StateWithReason) bool {
+	if wasPatched, err := e.Transition(state.State); err != nil {
 		ctx.Log().Errorf("error transitioning experiment state: %s", err)
 		return false
 	} else if !wasPatched {
 		return true
 	}
 	telemetry.ReportExperimentStateChanged(ctx.Self().System(), e.db, *e.Experiment)
+	if err := webhooks.ReportExperimentStateChanged(
+		context.TODO(), *e.Experiment, e.activeConfig,
+	); err != nil {
+		log.WithError(err).Error("failed to send experiment state change webhook")
+	}
 
-	ctx.Log().Infof("experiment state changed to %s", state)
+	ctx.Log().Infof("experiment state changed to %s", state.State)
 	ctx.TellAll(state, ctx.Children()...)
 	if err := e.db.SaveExperimentState(e.Experiment); err != nil {
 		ctx.Log().Errorf("error saving experiment state: %s", err)
@@ -621,38 +812,40 @@ func (e *experiment) setPriority(ctx *actor.Context, priority *int, forward bool
 	if priority == nil {
 		return nil
 	}
-	oldPriority := resourcemanagers.DefaultSchedulingPriority
+	oldPriority := config.DefaultSchedulingPriority
 	var oldPriorityPtr *int
-	resources := e.Config.Resources()
+	resources := e.activeConfig.Resources()
 	if resources.Priority() != nil {
 		oldPriority = *resources.Priority()
 		oldPriorityPtr = &oldPriority
 	}
 	resources.SetPriority(priority)
-	e.Config.SetResources(resources)
+	e.activeConfig.SetResources(resources)
 
 	defer func() {
 		if err != nil {
 			resources.SetPriority(oldPriorityPtr)
-			e.Config.SetResources(resources)
-			err = e.db.SaveExperimentConfig(e.Experiment)
+			e.activeConfig.SetResources(resources)
+			err = e.db.SaveExperimentConfig(e.ID, e.activeConfig)
 			if err != nil {
 				return
 			}
 		}
 	}()
 
-	if err := e.db.SaveExperimentConfig(e.Experiment); err != nil {
+	if err := e.db.SaveExperimentConfig(e.ID, e.activeConfig); err != nil {
 		return errors.Wrapf(err, "setting experiment %d priority", e.ID)
 	}
 
 	if forward {
-		resp := ctx.Ask(sproto.GetRM(ctx.Self().System()), job.SetGroupPriority{
+		switch err := e.rm.SetGroupPriority(ctx, sproto.SetGroupPriority{
 			Priority: *priority,
 			Handler:  ctx.Self(),
-		})
-		err := resp.Error()
-		if err != nil {
+		}).(type) {
+		case nil:
+		case rmerrors.ErrUnsupported:
+			ctx.Log().WithError(err).Debug("ignoring unsupported call to set group priority")
+		default:
 			return errors.Wrapf(err, "setting experiment %d priority", e.ID)
 		}
 	}
@@ -661,50 +854,56 @@ func (e *experiment) setPriority(ctx *actor.Context, priority *int, forward bool
 }
 
 func (e *experiment) setWeight(ctx *actor.Context, weight float64) error {
-	resources := e.Config.Resources()
+	resources := e.activeConfig.Resources()
 	oldWeight := resources.Weight()
 	resources.SetWeight(weight)
-	e.Config.SetResources(resources)
-	if err := e.db.SaveExperimentConfig(e.Experiment); err != nil {
+	e.activeConfig.SetResources(resources)
+	if err := e.db.SaveExperimentConfig(e.ID, e.activeConfig); err != nil {
 		resources.SetWeight(oldWeight)
-		e.Config.SetResources(resources)
-		return errors.Wrapf(err, "setting experiment %d weight", e.ID)
+		e.activeConfig.SetResources(resources)
+		return fmt.Errorf("setting experiment %d weight: %w", e.ID, err)
 	}
-	resp := ctx.Ask(sproto.GetRM(ctx.Self().System()), job.SetGroupWeight{
+
+	switch err := e.rm.SetGroupWeight(ctx, sproto.SetGroupWeight{
 		Weight:  weight,
 		Handler: ctx.Self(),
-	})
-	err := resp.Error()
-	if err != nil {
+	}).(type) {
+	case nil:
+	case rmerrors.ErrUnsupported:
+		ctx.Log().WithError(err).Debug("ignoring unsupported call to set group weight")
+	default:
 		resources.SetWeight(oldWeight)
-		e.Config.SetResources(resources)
-		err = errors.Wrapf(err, "setting experiment %d weight", e.ID)
+		e.activeConfig.SetResources(resources)
+		return fmt.Errorf("setting experiment %d weight: %w", e.ID, err)
 	}
-	return err
+	return nil
 }
 
-func (e *experiment) setRP(ctx *actor.Context, msg job.SetResourcePool) error {
-	if sproto.UseK8sRM(ctx.Self().System()) {
-		return fmt.Errorf("kubernetes does not support setting resource pools")
-	}
-
-	if _, err := sproto.GetResourcePool(ctx.Self().System(), msg.ResourcePool, 0, false); err != nil {
-		return fmt.Errorf("invalid resource pool name %s", msg.ResourcePool)
-	}
-
-	resources := e.Config.Resources()
+func (e *experiment) setRP(ctx *actor.Context, msg sproto.SetResourcePool) error {
+	resources := e.activeConfig.Resources()
 	oldRP := resources.ResourcePool()
-	resources.SetResourcePool(msg.ResourcePool)
-	e.Config.SetResources(resources)
-
-	if err := e.db.SaveExperimentConfig(e.Experiment); err != nil {
-		resources.SetResourcePool(oldRP)
-		e.Config.SetResources(resources)
-		return errors.Wrapf(err, "setting experiment %d RP to %s", e.ID, msg.ResourcePool)
+	rp, err := e.rm.ResolveResourcePool(
+		ctx, msg.ResourcePool, e.activeConfig.Resources().SlotsPerTrial(),
+	)
+	switch {
+	case err != nil:
+		return fmt.Errorf("invalid resource pool name %s", msg.ResourcePool)
+	case oldRP == rp:
+		return fmt.Errorf("resource pool is unchanged (%s == %s)", oldRP, rp)
 	}
+
+	resources.SetResourcePool(rp)
+	e.activeConfig.SetResources(resources)
+
+	if err := e.db.SaveExperimentConfig(e.ID, e.activeConfig); err != nil {
+		resources.SetResourcePool(oldRP)
+		e.activeConfig.SetResources(resources)
+		return errors.Wrapf(err, "setting experiment %d RP to %s", e.ID, rp)
+	}
+
 	// TODO revert the change like the other setters
 	// also change to ask all?
-	ctx.TellAll(sproto.ChangeRP{ResourcePool: msg.ResourcePool}, ctx.Children()...)
+	ctx.TellAll(sproto.ChangeRP{ResourcePool: rp}, ctx.Children()...)
 
 	return nil
 }
@@ -718,18 +917,14 @@ func (e *experiment) toV1Job() *jobv1.Job {
 		Username:       e.Username,
 		UserId:         int32(*e.OwnerID),
 		Progress:       float32(e.searcher.Progress()),
-		Name:           e.Config.Name().String(),
+		Name:           e.activeConfig.Name().String(),
 	}
 
 	j.IsPreemptible = config.ReadRMPreemptionStatus(j.ResourcePool)
-	j.Priority = int32(config.ReadPriority(j.ResourcePool, &e.Config))
-	j.Weight = config.ReadWeight(j.ResourcePool, &e.Config)
+	j.Priority = int32(config.ReadPriority(j.ResourcePool, &e.activeConfig))
+	j.Weight = config.ReadWeight(j.ResourcePool, &e.activeConfig)
 
-	if config.IsUsingKubernetesRM() {
-		j.ResourcePool = resourcemanagers.KubernetesDummyResourcePool
-	} else {
-		j.ResourcePool = e.Config.Resources().ResourcePool()
-	}
+	j.ResourcePool = e.activeConfig.Resources().ResourcePool()
 
 	return &j
 }

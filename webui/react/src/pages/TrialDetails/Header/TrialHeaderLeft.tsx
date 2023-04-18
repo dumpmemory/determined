@@ -1,9 +1,9 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
 
-import Icon from 'components/Icon';
+import ExperimentIcons from 'components/ExperimentIcons';
 import { paths } from 'routes/utils';
-import { getStateColorCssVar } from 'themes';
+import Icon from 'shared/components/Icon/Icon';
 import { ExperimentBase, TrialDetails } from 'types';
 
 import css from './TrialHeaderLeft.module.scss';
@@ -21,10 +21,8 @@ const TrialHeaderLeft: React.FC<Props> = ({ experiment, trial }: Props) => {
       </Link>
       <Icon name="arrow-right" size="tiny" />
       <div className={css.trial}>
-        <div className={css.state} style={{ backgroundColor: getStateColorCssVar(trial.state) }}>
-          {trial.state}
-        </div>
-        Trial {trial.id}
+        <ExperimentIcons state={trial.state} />
+        <div>Trial {trial.id}</div>
       </div>
     </div>
   );

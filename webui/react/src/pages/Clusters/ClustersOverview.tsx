@@ -1,66 +1,38 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useState } from 'react';
 
-import Grid, { GridMode } from 'components/Grid';
-import ResourcePoolCardLight from 'components/ResourcePoolCardLight';
+import Card from 'components/kit/Card';
+import ResourcePoolCard from 'components/ResourcePoolCard';
 import ResourcePoolDetails from 'components/ResourcePoolDetails';
 import Section from 'components/Section';
-import { useStore } from 'contexts/Store';
-import { useFetchAgents, useFetchResourcePools } from 'hooks/useFetch';
-import usePolling from 'hooks/usePolling';
-import { ShirtSize } from 'themes';
-import {
-  ResourcePool,
-} from 'types';
-import { getSlotContainerStates } from 'utils/cluster';
+import clusterStore from 'stores/cluster';
+import { ResourcePool } from 'types';
+import { Loadable } from 'utils/loadable';
+import { useObservable } from 'utils/observable';
 
-import css from './ClustersOverview.module.scss';
+import { ClusterOverallBar } from '../Cluster/ClusterOverallBar';
+import { ClusterOverallStats } from '../Cluster/ClusterOverallStats';
 
 const ClusterOverview: React.FC = () => {
+  const resourcePools = useObservable(clusterStore.resourcePools);
 
-  const { agents, resourcePools } = useStore();
-  const [ rpDetail, setRpDetail ] = useState<ResourcePool>();
-
-  const [ canceler ] = useState(new AbortController());
-
-  const fetchAgents = useFetchAgents(canceler);
-  const fetchResourcePools = useFetchResourcePools(canceler);
-
-  usePolling(fetchResourcePools, { interval: 10000 });
+  const [rpDetail, setRpDetail] = useState<ResourcePool>();
 
   const hideModal = useCallback(() => setRpDetail(undefined), []);
 
-  useEffect(() => {
-    fetchAgents();
-
-    return () => canceler.abort();
-  }, [ canceler, fetchAgents ]);
-
   return (
-    <div className={css.base}>
-      <Section
-        title={'Resource Pools'}>
-        <Grid gap={ShirtSize.medium} minItemWidth={300} mode={GridMode.AutoFill}>
-          {resourcePools.map((rp, idx) => (
-            <ResourcePoolCardLight
-              computeContainerStates={
-                getSlotContainerStates(agents || [], rp.slotType, rp.name)
-              }
-              key={idx}
-              resourcePool={rp}
-              resourceType={rp.slotType}
-              totalComputeSlots={rp.maxAgents * (rp.slotsPerAgent ?? 0)}
-            />
-          ))}
-        </Grid>
+    <>
+      <ClusterOverallStats />
+      <ClusterOverallBar />
+      <Section title="Resource Pools">
+        <Card.Group size="medium">
+          {Loadable.isLoaded(resourcePools) &&
+            resourcePools.data.map((rp, idx) => <ResourcePoolCard key={idx} resourcePool={rp} />)}
+        </Card.Group>
       </Section>
       {!!rpDetail && (
-        <ResourcePoolDetails
-          finally={hideModal}
-          resourcePool={rpDetail}
-          visible={!!rpDetail}
-        />
+        <ResourcePoolDetails finally={hideModal} resourcePool={rpDetail} visible={!!rpDetail} />
       )}
-    </div>
+    </>
   );
 };
 

@@ -1,39 +1,57 @@
 import { V1ResourceAllocationAggregatedEntry } from 'services/api-ts-sdk';
-import { sumArrays } from 'utils/array';
-import { secondToHour } from 'utils/datetime';
+import { sumArrays } from 'shared/utils/array';
+import { secondToHour } from 'shared/utils/datetime';
+import { DetailedUser } from 'types';
+import { getDisplayName } from 'utils/user';
 
 import { GroupBy } from './ClusterHistoricalUsage.settings';
 
 export interface ResourceAllocationChartSeries {
-  groupedBy: GroupBy,
-  hoursByAgentLabel: Record<string, number[]>,
-  hoursByExperimentLabel: Record<string, number[]>,
-  hoursByResourcePool: Record<string, number[]>,
-  hoursByUsername: Record<string, number[]>,
-  hoursTotal: Record<string, number[]>,
-  time: string[],
+  groupedBy: GroupBy;
+  hoursByExperimentLabel: Record<string, number[]>;
+  hoursByResourcePool: Record<string, number[]>;
+  hoursByUsername: Record<string, number[]>;
+  hoursTotal: Record<string, number[]>;
+  time: string[];
 }
 
 export const mapResourceAllocationApiToChartSeries = (
-  apiRes: Array<V1ResourceAllocationAggregatedEntry>,
+  apiRes: Readonly<V1ResourceAllocationAggregatedEntry[]>,
   grouping: GroupBy,
+  users: Readonly<DetailedUser[]>,
 ): ResourceAllocationChartSeries => {
   return {
     groupedBy: grouping,
-    hoursByAgentLabel: mapToChartSeries(apiRes.map(item => item.byAgentLabel)),
-    hoursByExperimentLabel: mapToChartSeries(apiRes.map(item => item.byExperimentLabel)),
-    hoursByResourcePool: mapToChartSeries(apiRes.map(item => item.byResourcePool)),
-    hoursByUsername: mapToChartSeries(apiRes.map(item => item.byUsername)),
-    hoursTotal: { total: apiRes.map(item => secondToHour(item.seconds)) },
-    time: apiRes.map(item => item.periodStart),
+    hoursByExperimentLabel: mapToChartSeries(apiRes.map((item) => item.byExperimentLabel)),
+    hoursByResourcePool: mapToChartSeries(apiRes.map((item) => item.byResourcePool)),
+    hoursByUsername: mapToChartSeries(
+      apiRes.map((item) => {
+        return mapPeriodToDisplayNames(item.byUsername, users);
+      }),
+    ),
+    hoursTotal: { total: apiRes.map((item) => secondToHour(item.seconds)) },
+    time: apiRes.map((item) => item.periodStart),
   };
+};
+
+const mapPeriodToDisplayNames = (
+  period: Readonly<Record<string, number>>,
+  users: Readonly<DetailedUser[]>,
+): Record<string, number> => {
+  const result: Record<string, number> = {};
+  Object.keys(period).forEach((key) => {
+    const user = users.find((u) => u.username === key);
+    const displayName = getDisplayName(user);
+    result[displayName] = period[key];
+  });
+  return result;
 };
 
 const mapToChartSeries = (labelByPeriod: Record<string, number>[]): Record<string, number[]> => {
   // 1. convert [periodIndex: {label: seconds}, ...] to {label: {periodIndex: hours}, ...}
   const periodByLabelIndexed: Record<string, Record<number, number>> = {};
   labelByPeriod.forEach((period, periodIndex) => {
-    Object.keys(period).forEach(label => {
+    Object.keys(period).forEach((label) => {
       periodByLabelIndexed[label] = {
         ...(periodByLabelIndexed[label] || {}),
         [periodIndex]: secondToHour(period[label]),
@@ -43,7 +61,7 @@ const mapToChartSeries = (labelByPeriod: Record<string, number>[]): Record<strin
 
   // 2. convert {label: {periodIndex: hours}, ...} to {label: [hours, ...], ...}
   const periodByLabelIndexedFlat: Record<string, number[]> = {};
-  Object.keys(periodByLabelIndexed).forEach(label => {
+  Object.keys(periodByLabelIndexed).forEach((label) => {
     periodByLabelIndexedFlat[label] = [];
     for (let i = 0; i < labelByPeriod.length; i++) {
       periodByLabelIndexedFlat[label].push(periodByLabelIndexed[label][i] || 0);
@@ -51,18 +69,19 @@ const mapToChartSeries = (labelByPeriod: Record<string, number>[]): Record<strin
   });
 
   // 3. find top 5 labels
-  const topLabels = Object.keys(periodByLabelIndexedFlat).map(label => {
-    const hours = periodByLabelIndexedFlat[label].reduce((acc, val) => acc + val, 0);
-    return [ label, hours ];
-  })
-    .sort((a, b) => ((b[1] as number) - (a[1] as number)))
+  const topLabels = Object.keys(periodByLabelIndexedFlat)
+    .map((label) => {
+      const hours = periodByLabelIndexedFlat[label].reduce((acc, val) => acc + val, 0);
+      return [label, hours];
+    })
+    .sort((a, b) => (b[1] as number) - (a[1] as number))
     .slice(0, 5)
-    .map(item => item[0]);
+    .map((item) => item[0]);
 
   // 4. sum non-top labels hours into "other labels"
   let ret = {};
   let otherLabels: number[] = [];
-  Object.keys(periodByLabelIndexedFlat).forEach(label => {
+  Object.keys(periodByLabelIndexedFlat).forEach((label) => {
     if (topLabels.includes(label)) {
       ret = { ...ret, [label]: periodByLabelIndexedFlat[label] };
     } else {

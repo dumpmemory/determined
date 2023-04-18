@@ -1,11 +1,12 @@
-import { Radio, Tooltip } from 'antd';
+import { Radio } from 'antd';
 import { RadioChangeEvent } from 'antd/lib/radio';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { throttle } from 'throttle-debounce';
 
 import { ConditionalWrapper } from 'components/ConditionalWrapper';
-import Icon, { IconSize } from 'components/Icon';
+import Tooltip from 'components/kit/Tooltip';
 import useResize from 'hooks/useResize';
+import Icon, { IconSize } from 'shared/components/Icon/Icon';
 
 import css from './RadioGroup.module.scss';
 
@@ -44,21 +45,24 @@ const RadioGroup: React.FC<Props> = ({
   const baseRef = useRef<HTMLDivElement>(null);
   const originalWidth = useRef<number>();
   const resize = useResize();
-  const [ showLabels, setShowLabels ] = useState(true);
-  const [ sizes, setSizes ] = useState<SizeInfo>({ baseHeight: 0, baseWidth: 0, parentWidth: 0 });
-  const classes = [ css.base ];
+  const [showLabels, setShowLabels] = useState(true);
+  const [sizes, setSizes] = useState<SizeInfo>({ baseHeight: 0, baseWidth: 0, parentWidth: 0 });
+  const classes = [css.base];
 
   const hasIconsAndLabels = useMemo(() => {
     if (options.length === 0) return false;
     return options.reduce((acc, option) => acc || (!!option.icon && !!option.label), false);
-  }, [ options ]);
+  }, [options]);
 
   if (iconOnly) classes.push(css.iconOnly);
   if (className) classes.push(className);
 
-  const handleChange = useCallback((e: RadioChangeEvent) => {
-    if (onChange) onChange(e.target.value);
-  }, [ onChange ]);
+  const handleChange = useCallback(
+    (e: RadioChangeEvent) => {
+      if (onChange) onChange(e.target.value);
+    },
+    [onChange],
+  );
 
   /*
    * Dynamically check to see if labels can be shown along with the icons,
@@ -68,13 +72,13 @@ const RadioGroup: React.FC<Props> = ({
     if (!hasIconsAndLabels || !baseRef.current) return;
     if (sizes.baseWidth === 0 || sizes.parentWidth === 0) return;
 
-    setShowLabels(prev => {
+    setShowLabels((prev) => {
       if (!originalWidth.current) return prev;
       if (prev && sizes.baseHeight > HEIGHT_LIMIT) return false;
       if (!prev && originalWidth.current < sizes.parentWidth) return true;
       return prev;
     });
-  }, [ hasIconsAndLabels, sizes ]);
+  }, [hasIconsAndLabels, sizes]);
 
   /*
    * Update parent and component sizes upon resize of the window,
@@ -100,20 +104,18 @@ const RadioGroup: React.FC<Props> = ({
     });
 
     throttleFunc();
-  }, [ hasIconsAndLabels, resize ]);
+  }, [hasIconsAndLabels, resize]);
 
   return (
-    <Radio.Group
-      className={classes.join(' ')}
-      ref={baseRef}
-      value={value}
-      onChange={handleChange}>
-      {options.map(option => (
+    <Radio.Group className={classes.join(' ')} ref={baseRef} value={value} onChange={handleChange}>
+      {options.map((option) => (
         <ConditionalWrapper
           condition={!showLabels || iconOnly}
           key={option.id}
-          wrapper={children => (
-            <Tooltip placement="top" title={option.label}>{children}</Tooltip>
+          wrapper={(children) => (
+            <Tooltip placement="top" title={option.label}>
+              {children}
+            </Tooltip>
           )}>
           <Radio.Button className={css.option} value={option.id}>
             {option.icon && <Icon name={option.icon} size={option.iconSize} title={option.label} />}

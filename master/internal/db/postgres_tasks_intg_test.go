@@ -15,23 +15,25 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+	"golang.org/x/exp/slices"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/determined-ai/determined/master/pkg/etc"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/master/pkg/ptrs"
+	"github.com/determined-ai/determined/proto/pkg/taskv1"
 )
 
 // TestJobTaskAndAllocationAPI, in lieu of an ORM, ensures that the mappings into and out of the
 // database are total. We should look into an ORM in the near to medium term future.
 func TestJobTaskAndAllocationAPI(t *testing.T) {
-	etc.SetRootPath(rootFromDB)
+	require.NoError(t, etc.SetRootPath(RootFromDB))
 	db := MustResolveTestPostgres(t)
-	MustMigrateTestPostgres(t, db, migrationsFromDB)
+	MustMigrateTestPostgres(t, db, MigrationsFromDB)
 
 	// Add a mock user.
-	user := requireMockUser(t, db)
+	user := RequireMockUser(t, db)
 
 	// Add a job.
 	jID := model.NewJobID()
@@ -76,17 +78,32 @@ func TestJobTaskAndAllocationAPI(t *testing.T) {
 	require.True(t, reflect.DeepEqual(tIn, tOut), pprintedExpect(tIn, tOut))
 
 	// And an allocation.
-	aID := model.NewAllocationID(string(tID) + "-1")
+	ports := map[string]int{}
+	ports["dtrain_port"] = 0
+	ports["inter_train_process_comm_port1"] = 0
+	ports["inter_train_process_comm_port2"] = 0
+	ports["c10d_port"] = 0
+
+	aID := model.AllocationID(string(tID) + "-1")
 	aIn := &model.Allocation{
 		AllocationID: aID,
 		TaskID:       tID,
 		Slots:        8,
-		AgentLabel:   "something",
 		ResourcePool: "somethingelse",
 		StartTime:    ptrs.Ptr(time.Now().UTC().Truncate(time.Millisecond)),
+		Ports:        ports,
 	}
 	err = db.AddAllocation(aIn)
 	require.NoError(t, err, "failed to add allocation")
+
+	// Update ports
+	ports["dtrain_port"] = 0
+	ports["inter_train_process_comm_port1"] = 0
+	ports["inter_train_process_comm_port2"] = 0
+	ports["c10d_port"] = 0
+	aIn.Ports = ports
+	err = UpdateAllocationPorts(*aIn)
+	require.NoError(t, err, "failed to update port offset")
 
 	// Retrieve it back and make sure the mapping is exhaustive.
 	aOut, err := db.AllocationByID(aIn.AllocationID)
@@ -104,14 +121,78 @@ func TestJobTaskAndAllocationAPI(t *testing.T) {
 	require.True(t, reflect.DeepEqual(aIn, aOut), pprintedExpect(aIn, aOut))
 }
 
-const (
-	postgresExhaustiveEnum = "postgresexhaustiveenum"
-)
+func TestAllocationState(t *testing.T) {
+	require.NoError(t, etc.SetRootPath(RootFromDB))
+	db := MustResolveTestPostgres(t)
+	MustMigrateTestPostgres(t, db, MigrationsFromDB)
+
+	// Add an allocation of every possible state.
+	states := []model.AllocationState{
+		model.AllocationStatePending,
+		model.AllocationStateAssigned,
+		model.AllocationStatePulling,
+		model.AllocationStateStarting,
+		model.AllocationStateRunning,
+		model.AllocationStateTerminating,
+		model.AllocationStateTerminated,
+	}
+	for _, state := range states {
+		tID := model.NewTaskID()
+		task := &model.Task{
+			TaskID:    tID,
+			TaskType:  model.TaskTypeTrial,
+			StartTime: time.Now().UTC().Truncate(time.Millisecond),
+		}
+		require.NoError(t, db.AddTask(task), "failed to add task")
+
+		s := state
+		a := &model.Allocation{
+			TaskID:       tID,
+			AllocationID: model.AllocationID(tID + "allocationID"),
+			ResourcePool: "default",
+			State:        &s,
+		}
+		require.NoError(t, db.AddAllocation(a), "failed to add allocation")
+
+		// Update allocation to every possible state.
+		testNoUpdate := true
+		for j := 0; j < len(states); j++ {
+			if testNoUpdate {
+				testNoUpdate = false
+				j-- // Go to first iteration of loop after this.
+			} else {
+				a.State = &states[j]
+				require.NoError(t, db.UpdateAllocationState(*a),
+					"failed to update allocation state")
+			}
+
+			// Get task back as a proto struct.
+			tOut := &taskv1.Task{}
+			require.NoError(t, db.QueryProto("get_task", tOut, tID), "failed to get task")
+
+			// Ensure our state is the same as allocation.
+			require.Equal(t, len(tOut.Allocations), 1, "failed to get exactly 1 allocation")
+			aOut := tOut.Allocations[0]
+
+			if slices.Contains([]model.AllocationState{
+				model.AllocationStatePending,
+				model.AllocationStateAssigned,
+			}, *a.State) {
+				require.Equal(t, "STATE_QUEUED", aOut.State.String(),
+					"allocation states not converted to queued")
+			} else {
+				require.Equal(t, a.State.Proto(), aOut.State, "proto state not equal")
+				require.Equal(t, fmt.Sprintf("STATE_%s", *a.State), aOut.State.String(),
+					"proto state to strings not equal")
+			}
+		}
+	}
+}
 
 func TestExhaustiveEnums(t *testing.T) {
-	etc.SetRootPath(rootFromDB)
+	require.NoError(t, etc.SetRootPath(RootFromDB))
 	db := MustResolveTestPostgres(t)
-	MustMigrateTestPostgres(t, db, migrationsFromDB)
+	MustMigrateTestPostgres(t, db, MigrationsFromDB)
 
 	type check struct {
 		goType          string
@@ -133,12 +214,14 @@ func TestExhaustiveEnums(t *testing.T) {
 	addCheck("JobType", "public.job_type", map[string]bool{})
 	addCheck("TaskType", "public.task_type", map[string]bool{})
 	addCheck("State", "public.experiment_state", map[string]bool{"DELETED": true})
+	addCheck("AllocationState", "public.allocation_state", map[string]bool{})
 
 	// Populate postgres types.
 	for _, c := range checks {
 		q := fmt.Sprintf("SELECT unnest(enum_range(NULL::%s))::text", c.postgresType)
 		rows, err := db.sql.Queryx(q)
 		require.NoError(t, err, "querying postgres enum members")
+		defer rows.Close()
 		for rows.Next() {
 			var text string
 			require.NoError(t, rows.Scan(&text), "scanning enum value")

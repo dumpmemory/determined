@@ -1,30 +1,29 @@
-from attrdict import AttrMap
-from datetime import datetime
-import traceback
-import numpy as np
-import torch
-import deepspeed
+import logging
 import pathlib
+import traceback
+from datetime import datetime
 
-import megatron.utils as megatron_utils
 import megatron.training as megatron_train
-from megatron.data.data_utils import build_datasets_from_neox_args
-from megatron.checkpointing import save_checkpoint, load_checkpoint
-
-from determined.pytorch import DataLoader
-from determined.tensorboard.metric_writers.pytorch import TorchWriter
-from determined.pytorch.deepspeed import (
-    DeepSpeedTrial,
-    DeepSpeedTrialContext,
-)
-from determined import InvalidHP
+import megatron.utils as megatron_utils
+import torch
+from attrdict import AttrMap
 from det_utils import (
-    get_neox_args,
-    TensorboardWriter,
     EarlyStoppingCallback,
-    LMReducers,
     EvalHarness,
+    LMReducers,
+    TensorboardWriter,
+    get_neox_args,
 )
+from megatron import mpu
+from megatron.checkpointing import load_checkpoint, save_checkpoint
+from megatron.data.data_utils import build_datasets_from_neox_args
+
+import deepspeed
+from determined import LOG_FORMAT, InvalidHP
+from determined.pytorch import DataLoader
+from determined.pytorch.deepspeed import DeepSpeedTrial, DeepSpeedTrialContext, ModelParallelUnit
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 
 class GPT2Trial(DeepSpeedTrial):
@@ -39,8 +38,9 @@ class GPT2Trial(DeepSpeedTrial):
         except:
             traceback.print_exc()
             raise InvalidHP("Could not parse neox_args.")
-        self.wrapped_writer = TorchWriter()
-        self.neox_args.tensorboard_writer = self.wrapped_writer.writer
+        logging.info(self.neox_args)
+        self.writer = self.context.get_tensorboard_writer()
+        self.neox_args.tensorboard_writer = self.writer
         self.neox_args.configure_distributed_args()
         # The tokenizer needs to be built before model initialization in order to set the
         # required padded_vocab_size argument.
@@ -52,12 +52,21 @@ class GPT2Trial(DeepSpeedTrial):
 
         # Model, optimizer, and learning rate.
         self.timers("model and optimizer").start()
-        (
-            model,
-            self.optimizer,
-            self.lr_scheduler,
-        ) = megatron_train.setup_model_and_optimizer(neox_args=self.neox_args)
+        with deepspeed.zero.Init(enabled=self.neox_args.zero_optimization["stage"] == 3):
+            (
+                model,
+                self.optimizer,
+                self.lr_scheduler,
+            ) = megatron_train.setup_model_and_optimizer(neox_args=self.neox_args)
         self.model = self.context.wrap_model_engine(model)
+        self.context.set_mpu(
+            ModelParallelUnit(
+                mpu.get_data_parallel_rank(),
+                mpu.get_data_parallel_world_size(),
+                should_report_metrics=True,
+                should_build_data_loader=self.should_build_data_loader(),
+            )
+        )
         self.timers("model and optimizer").stop()
 
         # Print setup timing.
@@ -79,8 +88,17 @@ class GPT2Trial(DeepSpeedTrial):
         self.noise_scale_logger = megatron_utils.get_noise_scale_logger(self.neox_args)
         self.timers("interval time").start()
 
+    def should_build_data_loader(self):
+        if self.neox_args.is_pipe_parallel:
+            is_first_stage = mpu.get_pipe_parallel_rank() == 0
+            is_last_stage = mpu.get_pipe_parallel_rank() == mpu.get_pipe_parallel_world_size() - 1
+            pipe_load = is_first_stage or is_last_stage
+        else:
+            pipe_load = True
+        return mpu.get_model_parallel_rank() == 0 and pipe_load
+
     def build_callbacks(self):
-        callbacks = {"tb": TensorboardWriter(self.wrapped_writer)}
+        callbacks = {"tb": TensorboardWriter(self.writer)}
         if self.neox_args.eval_tasks:
             callbacks["eval_tasks"] = EvalHarness(
                 self.model, megatron_train.forward_step, self.neox_args
@@ -153,9 +171,7 @@ class GPT2Trial(DeepSpeedTrial):
             total_loss_dict=self.total_train_loss_dict,
             learning_rate=lr,
             iteration=self.neox_args.iteration,
-            loss_scale=self.optimizer.cur_scale
-            if self.neox_args.precision == "fp16"
-            else None,
+            loss_scale=self.optimizer.cur_scale if self.neox_args.precision == "fp16" else None,
             report_memory_flag=self.report_memory_flag,
             skipped_iter=skipped_iter,
             model=self.model,
@@ -176,7 +192,6 @@ class GPT2Trial(DeepSpeedTrial):
         ):
             torch.distributed.barrier()
             time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rank = torch.distributed.get_rank()
             megatron_utils.print_rank_0(
                 "time: {} | exiting the program at iteration {}".format(
                     time_str, self.neox_args.iteration
@@ -197,9 +212,7 @@ class GPT2Trial(DeepSpeedTrial):
 
         if data_iterator is not None:
             if self.neox_args.char_level_ppl:
-                data_iterator = megatron_utils.CharCounter(
-                    data_iterator, self.neox_args.tokenizer
-                )
+                data_iterator = megatron_utils.CharCounter(data_iterator, self.neox_args.tokenizer)
 
         loss = megatron_train.forward_step(
             model=self.model,
@@ -231,14 +244,13 @@ class GPT2Trial(DeepSpeedTrial):
         ) = build_datasets_from_neox_args(self.neox_args)
         self.timers("train/valid/test data dataset").stop()
         self.timers.log(["train/valid/test data dataset"])
-
         return DataLoader(
             self.train_data,
             batch_size=self.neox_args.train_micro_batch_size_per_gpu,
             shuffle=True,
             num_workers=self.neox_args.num_workers,
             drop_last=True,
-            pin_memory=False
+            pin_memory=False,
         )
 
     def build_validation_data_loader(self):

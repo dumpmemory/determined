@@ -1,10 +1,11 @@
 import datetime
 import enum
 import json
-import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
-from determined.common.experimental import checkpoint, session
+from determined.common import api, util
+from determined.common.api import bindings
+from determined.common.experimental import checkpoint
 
 
 class ModelVersion:
@@ -15,16 +16,16 @@ class ModelVersion:
 
     def __init__(
         self,
-        session: session.Session,
+        session: api.Session,
         model_version_id: int,  # unique DB id
         checkpoint: checkpoint.Checkpoint,
         metadata: Dict[str, Any],
-        name: Optional[str] = "",
-        comment: Optional[str] = "",
-        notes: Optional[str] = "",
-        model_id: Optional[int] = 0,
-        model_name: Optional[str] = "",
-        model_version: Optional[int] = None,  # sequential
+        name: str,
+        comment: str,
+        notes: str,
+        model_id: int,
+        model_name: str,
+        model_version: int,  # sequential
     ):
         self._session = session
         self.checkpoint = checkpoint
@@ -46,9 +47,9 @@ class ModelVersion:
         """
 
         self.name = name
-        self._session.patch(
-            "/api/v1/models/{}/versions/{}".format(self.model_name, self.model_version_id),
-            json={"name": self.name},
+        req = bindings.v1PatchModelVersion(name=name)
+        bindings.patch_PatchModelVersion(
+            self._session, body=req, modelName=self.model_name, modelVersionNum=self.model_version
         )
 
     def set_notes(self, notes: str) -> None:
@@ -60,45 +61,33 @@ class ModelVersion:
         """
 
         self.notes = notes
-        self._session.patch(
-            "/api/v1/models/{}/versions/{}".format(self.model_name, self.model_version_id),
-            json={"notes": self.notes},
+        req = bindings.v1PatchModelVersion(notes=notes)
+        bindings.patch_PatchModelVersion(
+            self._session, body=req, modelName=self.model_name, modelVersionNum=self.model_version
         )
 
     def delete(self) -> None:
         """
         Deletes the model version in the registry
         """
-        self._session.delete(
-            "/api/v1/models/{}/versions/{}".format(self.model_name, self.model_version_id),
+        bindings.delete_DeleteModelVersion(
+            self._session, modelName=self.model_name, modelVersionNum=self.model_version
         )
 
     @classmethod
-    def _from_json(cls, data: Dict[str, Any], session: session.Session) -> "ModelVersion":
-        ckpt_data = data.get("checkpoint", {})
-        ckpt = checkpoint.Checkpoint._from_json(ckpt_data, session)
-
+    def _from_bindings(cls, m: bindings.v1ModelVersion, session: api.Session) -> "ModelVersion":
         return cls(
             session,
-            model_version_id=data.get("id", 1),
-            checkpoint=ckpt,
-            metadata=data.get("metadata", {}),
-            name=data.get("name"),
-            comment=data.get("comment"),
-            notes=data.get("notes"),
-            model_id=data.get("model", {}).get("id"),
-            model_name=data.get("model", {}).get("name"),
-            model_version=data.get("version"),
+            model_version_id=m.id,
+            checkpoint=checkpoint.Checkpoint._from_bindings(m.checkpoint, session),
+            metadata=m.metadata or {},
+            name=m.name or "",
+            comment=m.comment or "",
+            notes=m.notes or "",
+            model_id=m.model.id,
+            model_name=m.model.name,
+            model_version=m.version,
         )
-
-    @classmethod
-    def from_json(cls, data: Dict[str, Any], session: session.Session) -> "ModelVersion":
-        warnings.warn(
-            "ModelVersion.from_json() is deprecated and will be removed from the public API "
-            "in a future version",
-            FutureWarning,
-        )
-        return cls._from_json(data, session)
 
 
 class ModelSortBy(enum.Enum):
@@ -111,31 +100,34 @@ class ModelSortBy(enum.Enum):
         DESCRIPTION
         CREATION_TIME
         LAST_UPDATED_TIME
+        WORKSPACE
     """
 
-    UNSPECIFIED = 0
-    NAME = 1
-    DESCRIPTION = 2
-    CREATION_TIME = 4
-    LAST_UPDATED_TIME = 5
+    UNSPECIFIED = bindings.v1GetModelsRequestSortBy.UNSPECIFIED.value
+    NAME = bindings.v1GetModelsRequestSortBy.NAME.value
+    DESCRIPTION = bindings.v1GetModelsRequestSortBy.DESCRIPTION.value
+    CREATION_TIME = bindings.v1GetModelsRequestSortBy.CREATION_TIME.value
+    LAST_UPDATED_TIME = bindings.v1GetModelsRequestSortBy.LAST_UPDATED_TIME.value
+    NUM_VERSIONS = bindings.v1GetModelsRequestSortBy.NUM_VERSIONS.value
+    WORKSPACE = bindings.v1GetModelsRequestSortBy.WORKSPACE.value
+
+    def _to_bindings(self) -> bindings.v1GetModelsRequestSortBy:
+        return bindings.v1GetModelsRequestSortBy(self.value)
 
 
 class ModelOrderBy(enum.Enum):
     """
     Specifies whether a sorted list of models should be in ascending or
     descending order.
-
-    Attributes:
-        ASCENDING
-        ASC
-        DESCENDING
-        DESC
     """
 
-    ASCENDING = 1
-    ASC = 1
-    DESCENDING = 2
-    DESC = 2
+    ASCENDING = bindings.v1OrderBy.ASC.value
+    ASC = bindings.v1OrderBy.ASC.value
+    DESCENDING = bindings.v1OrderBy.DESC.value
+    DESC = bindings.v1OrderBy.DESC.value
+
+    def _to_bindings(self) -> bindings.v1OrderBy:
+        return bindings.v1OrderBy(self.value)
 
 
 class Model:
@@ -161,16 +153,17 @@ class Model:
 
     def __init__(
         self,
-        session: session.Session,
+        session: api.Session,
         model_id: int,
         name: str,
-        description: str = "",
-        creation_time: Optional[datetime.datetime] = None,
-        last_updated_time: Optional[datetime.datetime] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        labels: Optional[List[str]] = None,
-        username: str = "",
-        archived: bool = False,
+        description: str,
+        creation_time: datetime.datetime,
+        last_updated_time: datetime.datetime,
+        metadata: Dict[str, Any],
+        labels: List[str],
+        username: str,
+        archived: bool,
+        workspace_id: Optional[int] = None,
     ):
         self._session = session
         self.model_id = model_id
@@ -181,6 +174,7 @@ class Model:
         self.metadata = metadata or {}
         self.labels = labels
         self.username = username
+        self.workspace_id = workspace_id
         self.archived = archived
 
     def get_version(self, version: int = -1) -> Optional[ModelVersion]:
@@ -197,25 +191,22 @@ class Model:
             version (int, optional): The model version ID requested.
         """
         if version == -1:
-            resp = self._session.get(
-                "/api/v1/models/{}/versions/".format(self.name),
-                {"limit": 1, "order_by": ModelOrderBy.DESC.value},
-            )
-
-            data = resp.json()
-            if data["modelVersions"] == []:
-                return None
-
-            latest_version = data["modelVersions"][0]
-            return ModelVersion._from_json(
-                latest_version,
+            resp = bindings.get_GetModelVersions(
                 self._session,
+                modelName=self.name,
+                limit=1,
+                sortBy=bindings.v1GetModelVersionsRequestSortBy.VERSION,
+                orderBy=bindings.v1OrderBy.DESC,
             )
-        else:
-            resp = self._session.get("/api/v1/models/{}/versions/{}".format(self.name, version))
+            if not resp.modelVersions:
+                return None
+            return ModelVersion._from_bindings(resp.modelVersions[0], self._session)
 
-        data = resp.json()
-        return ModelVersion._from_json(data["modelVersion"], self._session)
+        r = bindings.get_GetModelVersion(
+            self._session, modelName=self.name, modelVersionNum=version
+        )
+
+        return ModelVersion._from_bindings(r.modelVersion, self._session)
 
     def get_versions(self, order_by: ModelOrderBy = ModelOrderBy.DESC) -> List[ModelVersion]:
         """
@@ -226,18 +217,18 @@ class Model:
         Arguments:
             order_by (enum): A member of the :class:`ModelOrderBy` enum.
         """
-        resp = self._session.get(
-            "/api/v1/models/{}/versions/".format(self.name),
-            params={"order_by": order_by.value},
-        )
-        data = resp.json()
+
+        def get_with_offset(offset: int) -> bindings.v1GetModelVersionsResponse:
+            return bindings.get_GetModelVersions(
+                self._session,
+                modelName=self.name,
+                orderBy=order_by._to_bindings(),
+            )
+
+        resps = api.read_paginated(get_with_offset)
 
         return [
-            ModelVersion._from_json(
-                version,
-                self._session,
-            )
-            for version in data["modelVersions"]
+            ModelVersion._from_bindings(m, self._session) for r in resps for m in r.modelVersions
         ]
 
     def register_version(self, checkpoint_uuid: str) -> ModelVersion:
@@ -249,16 +240,14 @@ class Model:
         Arguments:
             checkpoint_uuid: The UUID of the checkpoint to register.
         """
-        resp = self._session.post(
-            "/api/v1/models/{}/versions".format(self.name),
-            json={"checkpointUuid": checkpoint_uuid},
+
+        req = bindings.v1PostModelVersionRequest(
+            checkpointUuid=checkpoint_uuid, modelName=self.name
         )
 
-        data = resp.json()
-        return ModelVersion._from_json(
-            data["modelVersion"],
-            self._session,
-        )
+        resp = bindings.post_PostModelVersion(self._session, body=req, modelName=self.name)
+
+        return ModelVersion._from_bindings(resp.modelVersion, self._session)
 
     def add_metadata(self, metadata: Dict[str, Any]) -> None:
         """
@@ -272,10 +261,8 @@ class Model:
         for key, val in metadata.items():
             self.metadata[key] = val
 
-        self._session.patch(
-            "/api/v1/models/{}".format(self.name),
-            json={"metadata": self.metadata, "description": self.description},
-        )
+        req = bindings.v1PatchModel(metadata=self.metadata)
+        bindings.patch_PatchModel(self._session, body=req, modelName=self.name)
 
     def remove_metadata(self, keys: List[str]) -> None:
         """
@@ -283,16 +270,23 @@ class Model:
         appear in the ``keys`` list are removed from the model.
 
         Arguments:
-            keys (List[string]): Top-level keys to remove from the model metadata.
+            keys (List[str]): Top-level keys to remove from the model metadata.
         """
+        if not isinstance(keys, Iterable) or not all(isinstance(k, str) for k in keys):
+            raise ValueError(
+                f"remove_metadata() requires a list of strings as input but got: {keys}"
+            )
+
         for key in keys:
             if key in self.metadata:
                 del self.metadata[key]
 
-        self._session.patch(
-            "/api/v1/models/{}".format(self.name),
-            json={"metadata": self.metadata, "description": self.description},
-        )
+        req = bindings.v1PatchModel(metadata=self.metadata)
+        bindings.patch_PatchModel(self._session, body=req, modelName=self.name)
+
+    def move_to_workspace(self, workspace_name: str) -> None:
+        req = bindings.v1PatchModel(workspaceName=workspace_name)
+        bindings.patch_PatchModel(self._session, body=req, modelName=self.name)
 
     def set_labels(self, labels: List[str]) -> None:
         """
@@ -300,46 +294,40 @@ class Model:
         array of strings. If the model previously had labels, they are replaced.
 
         Arguments:
-            labels (List[string]): All labels to set on the model.
+            labels (List[str]): All labels to set on the model.
         """
-        self.labels = labels
-        self._session.patch(
-            "/api/v1/models/{}".format(self.name),
-            json={"labels": self.labels},
-        )
+        if not isinstance(labels, Iterable):
+            raise ValueError(f"set_labels() requires a list of strings as input but got: {labels}")
+
+        self.labels = list(labels)
+
+        req = bindings.v1PatchModel(labels=self.labels)
+        bindings.patch_PatchModel(self._session, body=req, modelName=self.name)
 
     def set_description(self, description: str) -> None:
         self.description = description
-        self._session.patch(
-            "/api/v1/models/{}".format(self.name),
-            json={"description": description},
-        )
+        req = bindings.v1PatchModel(description=self.description)
+        bindings.patch_PatchModel(self._session, body=req, modelName=self.name)
 
     def archive(self) -> None:
         """
         Sets the model's state to archived
         """
         self.archived = True
-        self._session.post(
-            "/api/v1/models/{}/archive".format(self.name),
-        )
+        bindings.post_ArchiveModel(self._session, modelName=self.name)
 
     def unarchive(self) -> None:
         """
         Removes the model's archived state
         """
         self.archived = False
-        self._session.post(
-            "/api/v1/models/{}/unarchive".format(self.name),
-        )
+        bindings.post_UnarchiveModel(self._session, modelName=self.name)
 
     def delete(self) -> None:
         """
         Deletes the model in the registry
         """
-        self._session.delete(
-            "/api/v1/models/{}".format(self.name),
-        )
+        bindings.delete_DeleteModel(self._session, modelName=self.name)
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -358,25 +346,17 @@ class Model:
         )
 
     @classmethod
-    def _from_json(cls, data: Dict[str, Any], session: session.Session) -> "Model":
+    def _from_bindings(cls, m: bindings.v1Model, session: api.Session) -> "Model":
         return cls(
             session,
-            data["id"],
-            data["name"],
-            data.get("description", ""),
-            data.get("creationTime"),
-            data.get("lastUpdatedTime"),
-            data.get("metadata", {}),
-            data.get("labels", []),
-            data.get("username", ""),
-            data.get("archived", False),
+            model_id=m.id,
+            name=m.name,
+            description=m.description or "",
+            creation_time=util.parse_protobuf_timestamp(m.creationTime),
+            last_updated_time=util.parse_protobuf_timestamp(m.lastUpdatedTime),
+            metadata=m.metadata,
+            labels=list(m.labels or []),
+            username=m.username or "",
+            archived=m.archived or False,
+            workspace_id=m.workspaceId,
         )
-
-    @classmethod
-    def from_json(cls, data: Dict[str, Any], session: session.Session) -> "Model":
-        warnings.warn(
-            "Model.from_json() is deprecated and will be removed from the public API "
-            "in a future version",
-            FutureWarning,
-        )
-        return cls._from_json(data, session)

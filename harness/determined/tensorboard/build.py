@@ -27,18 +27,16 @@ def get_rank_if_horovod_process_else_return_zero() -> Optional[int]:
     return int(os.getenv("HOROVOD_RANK", 0))
 
 
-def get_base_path(checkpoint_config: Dict[str, Any], manager: bool = False) -> pathlib.Path:
+def get_base_path(checkpoint_config: Dict[str, Any]) -> pathlib.Path:
+    allocation_id = os.environ.get("DET_ALLOCATION_ID", "")
     rank = get_rank_if_horovod_process_else_return_zero()
 
     if checkpoint_config.get("base_path"):
-        return pathlib.Path(checkpoint_config["base_path"]).joinpath("tensorboard")
+        base_path = pathlib.Path(checkpoint_config["base_path"])
+    else:
+        base_path = pathlib.Path("/", "tmp")
 
-    if manager or rank == 0:
-        # In a distributed training job the manager should monitor the chief
-        # trials logs and ignore all other trials.
-        return pathlib.Path("/", "tmp", "tensorboard")
-
-    return pathlib.Path("/", "tmp", f"tensorboard-{rank}")
+    return base_path.joinpath(f"tensorboard-{allocation_id}-{rank}")
 
 
 def build(
@@ -47,6 +45,7 @@ def build(
     trial_id: Optional[str],
     checkpoint_config: Dict[str, Any],
     container_path: Optional[str] = None,
+    async_upload: bool = True,
 ) -> base.TensorboardManager:
     """
     Return a tensorboard manager defined by the value of the `type` key in
@@ -64,7 +63,7 @@ def build(
     if not isinstance(type_name, str):
         raise TypeError("`type` parameter of storage configuration must be a string")
 
-    base_path = get_base_path(checkpoint_config, manager=True)
+    base_path = get_base_path(checkpoint_config)
 
     if trial_id:
         sync_path = get_sync_path(cluster_id, experiment_id, trial_id)
@@ -78,10 +77,17 @@ def build(
             _full_storage_path(host_path, storage_path, container_path),
             base_path,
             sync_path,
+            async_upload=async_upload,
         )
 
     elif type_name == "gcs":
-        return gcs.GCSTensorboardManager(checkpoint_config["bucket"], base_path, sync_path)
+        return gcs.GCSTensorboardManager(
+            checkpoint_config["bucket"],
+            checkpoint_config.get("prefix", None),
+            base_path,
+            sync_path,
+            async_upload=async_upload,
+        )
 
     elif type_name == "s3":
         return s3.S3TensorboardManager(
@@ -92,6 +98,7 @@ def build(
             checkpoint_config.get("prefix", None),
             base_path,
             sync_path,
+            async_upload=async_upload,
         )
 
     elif type_name == "azure":
@@ -107,6 +114,7 @@ def build(
             checkpoint_config.get("credential", None),
             base_path,
             sync_path,
+            async_upload=async_upload,
         )
 
     # Return the base_path.TensorboardManager for known but unsupported storage
@@ -119,6 +127,7 @@ def build(
             checkpoint_config.get("user"),
             base_path,
             sync_path,
+            async_upload=async_upload,
         )
 
     else:

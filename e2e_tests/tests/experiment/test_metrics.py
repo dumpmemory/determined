@@ -1,6 +1,7 @@
 import json
 import multiprocessing as mp
-from typing import Set, Union
+import subprocess
+from typing import Dict, List, Set, Union
 
 import pytest
 
@@ -15,7 +16,7 @@ from tests import experiment as exp
 def test_streaming_metrics_api() -> None:
     # TODO: refactor tests to not use cli singleton auth.
     certs.cli_cert = certs.default_load(conf.make_master_url())
-    authentication.cli_auth = authentication.Authentication(conf.make_master_url(), try_reauth=True)
+    authentication.cli_auth = authentication.Authentication(conf.make_master_url())
 
     pool = mp.pool.ThreadPool(processes=7)
 
@@ -60,27 +61,6 @@ def test_streaming_metrics_api() -> None:
         pytest.fail("trials-sample (training): %s. Results: %s" % train_trials_sample_results)
     if valid_trials_sample_results is not None:
         pytest.fail("trials-sample (validation): %s. Results: %s" % valid_trials_sample_results)
-
-
-@pytest.mark.distributed
-@pytest.mark.timeout(1800)
-def test_hp_importance_api() -> None:
-    certs.cli_cert = certs.default_load(conf.make_master_url())
-    authentication.cli_auth = authentication.Authentication(conf.make_master_url(), try_reauth=True)
-
-    pool = mp.pool.ThreadPool(processes=1)
-
-    experiment_id = exp.create_experiment(
-        conf.fixtures_path("mnist_pytorch/random.yaml"),
-        conf.tutorials_path("mnist_pytorch"),
-    )
-
-    hp_importance_thread = pool.apply_async(request_hp_importance, (experiment_id,))
-
-    hp_importance_results = hp_importance_thread.get()
-
-    if hp_importance_results is not None:
-        pytest.fail("hyperparameter-importance: %s. Results: %s" % hp_importance_results)
 
 
 def request_metric_names(experiment_id):  # type: ignore
@@ -306,40 +286,32 @@ def request_valid_trials_sample(experiment_id):  # type: ignore
     return check_trials_sample_result(results)
 
 
-def request_hp_importance(experiment_id):  # type: ignore
-    response = api.get(
-        conf.make_master_url(),
-        "api/v1/experiments/{}/hyperparameter-importance".format(experiment_id),
-        params={"period_seconds": 1},
+@pytest.mark.e2e_cpu
+def test_trial_describe_metrics() -> None:
+    exp_id = exp.run_basic_test(
+        conf.fixtures_path("no_op/single-one-short-step.yaml"), conf.fixtures_path("no_op"), 1
     )
-    results = [message["result"] for message in map(json.loads, response.text.splitlines())]
+    trials = exp.experiment_trials(exp_id)
+    trial_id = trials[0].trial.id
 
-    lastResult = results[-1]
-    if len(lastResult["trainingMetrics"]) != 1 or len(lastResult["validationMetrics"]) != 1:
-        return ("Unexpected number of metrics", lastResult)
+    cmd = [
+        "det",
+        "-m",
+        conf.make_master_url(),
+        "trial",
+        "describe",
+        "--json",
+        "--metrics",
+        str(trial_id),
+    ]
 
-    def valid_importance(x: float) -> bool:
-        return x >= 0 and x <= 1
+    output = json.loads(subprocess.check_output(cmd))
 
-    loss = lastResult["trainingMetrics"]["loss"]
-    searcherMetric = lastResult["validationMetrics"]["validation_loss"]
+    workloads = output["workloads"]
+    assert len(workloads) == 102
+    flattened_batch_metrics: List[Dict[str, float]] = sum(
+        (w["training"]["metrics"]["batchMetrics"] for w in workloads if w["training"]), []
+    )
+    losses = [m["loss"] for m in flattened_batch_metrics]
 
-    for metric in [loss, searcherMetric]:
-        if not metric["error"] == "":
-            return ("Unexpected error in HP importance", lastResult)
-        if metric["pending"] or metric["inProgress"]:
-            return ("Unexpected incomplete status in HP importance", lastResult)
-        if not metric["experimentProgress"] == 1:
-            return ("HP importance from unfinished experiment included!", lastResult)
-        for hparam in [
-            "dropout1",
-            "dropout2",
-            "learning_rate",
-            "n_filters1",
-            "n_filters2",
-        ]:
-            if hparam not in metric["hpImportance"]:
-                return ("Missing hparams %s" % hparam, lastResult)
-            if not valid_importance(metric["hpImportance"][hparam]):
-                return ("Unexpected importance for hparam %s" % hparam, lastResult)
-    return None
+    assert len(losses) == 100

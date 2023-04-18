@@ -1,16 +1,18 @@
-import React, { PropsWithChildren } from 'react';
+import React from 'react';
 
-import { isString } from 'utils/data';
-import { generateAlphaNumeric, toHtmlId } from 'utils/string';
+import Spinner from 'shared/components/Spinner/Spinner';
+import { isString } from 'shared/utils/data';
+import { generateAlphaNumeric, toHtmlId } from 'shared/utils/string';
 
 import css from './Section.module.scss';
-import Spinner from './Spinner';
 
 interface Props {
   bodyBorder?: boolean;
   bodyDynamic?: boolean;
   bodyNoPadding?: boolean;
   bodyScroll?: boolean;
+  children?: React.ReactNode;
+  className?: string;
   divider?: boolean;
   filters?: React.ReactNode;
   hideTitle?: boolean;
@@ -23,11 +25,11 @@ interface Props {
 
 const defaultProps = { divider: false };
 
-const Section: React.FC<Props> = (props: PropsWithChildren<Props>) => {
+const Section: React.FC<Props> = ({ className = '', ...props }: Props) => {
   const defaultId = isString(props.title) ? toHtmlId(props.title) : generateAlphaNumeric();
   const id = props.id || defaultId;
-  const classes = [ css.base ];
-  const titleClasses = [ css.title ];
+  const classes = [css.base, className];
+  const titleClasses = [css.title];
 
   if (props.bodyBorder) classes.push(css.bodyBorder);
   if (props.bodyDynamic) classes.push(css.bodyDynamic);
@@ -42,16 +44,13 @@ const Section: React.FC<Props> = (props: PropsWithChildren<Props>) => {
     <section className={classes.join(' ')} id={id}>
       {(props.title || props.options) && (
         <div className={css.header}>
-          {props.title && !props.hideTitle &&
-            <h5 className={titleClasses.join(' ')}>{props.title}</h5>}
+          {props.title && !props.hideTitle && (
+            <h5 className={titleClasses.join(' ')}>{props.title}</h5>
+          )}
           {props.options && <div className={css.options}>{props.options}</div>}
         </div>
       )}
-      {!props.loading && props.filters && (
-        <div className={css.filterBar}>
-          {props.filters}
-        </div>
-      )}
+      {props.filters && <div className={css.filterBar}>{props.filters}</div>}
       <div className={css.body}>
         <Spinner spinning={!!props.loading}>{props.children}</Spinner>
       </div>

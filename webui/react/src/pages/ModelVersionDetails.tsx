@@ -1,167 +1,169 @@
-import { Breadcrumb, Card, Tabs } from 'antd';
+import { Card } from 'antd';
+import type { TabsProps } from 'antd';
+import { useObservable } from 'micro-observables';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { useHistory, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 
 import InfoBox from 'components/InfoBox';
+import Breadcrumb from 'components/kit/Breadcrumb';
+import Pivot from 'components/kit/Pivot';
 import Link from 'components/Link';
-import Message, { MessageType } from 'components/Message';
 import MetadataCard from 'components/Metadata/MetadataCard';
 import NotesCard from 'components/NotesCard';
 import Page from 'components/Page';
-import Spinner from 'components/Spinner';
-import usePolling from 'hooks/usePolling';
+import PageNotFound from 'components/PageNotFound';
+import usePermissions from 'hooks/usePermissions';
 import { paths } from 'routes/utils';
-import { deleteModelVersion, getModelVersion, patchModelVersion } from 'services/api';
-import { isAborted, isNotFound } from 'services/utils';
-import { ModelVersion } from 'types';
-import { isEqual } from 'utils/data';
-import handleError, { ErrorType } from 'utils/error';
-import { humanReadableBytes } from 'utils/string';
-import { checkpointSize, getBatchNumber } from 'utils/workload';
+import { getModelVersion, patchModelVersion } from 'services/api';
+import Message, { MessageType } from 'shared/components/Message';
+import Spinner from 'shared/components/Spinner/Spinner';
+import usePolling from 'shared/hooks/usePolling';
+import { ValueOf } from 'shared/types';
+import { isEqual } from 'shared/utils/data';
+import { ErrorType } from 'shared/utils/error';
+import { isAborted, isNotFound } from 'shared/utils/service';
+import { humanReadableBytes } from 'shared/utils/string';
+import workspaceStore from 'stores/workspaces';
+import { Metadata, ModelVersion } from 'types';
+import handleError from 'utils/error';
+import { Loadable } from 'utils/loadable';
+import { checkpointSize } from 'utils/workload';
 
-import css from './ModelVersionDetails.module.scss';
 import ModelVersionHeader from './ModelVersionDetails/ModelVersionHeader';
+import css from './ModelVersionDetails.module.scss';
 
-const { TabPane } = Tabs;
+const TabType = {
+  Model: 'model',
+  Notes: 'notes',
+} as const;
 
-interface Params {
-  modelName: string;
-  tab?: TabType;
-  versionId: string;
-}
-
-enum TabType {
-  CheckpointDetails = 'checkpoint-details',
-  Overview = 'overview',
-}
+type Params = {
+  modelId: string;
+  tab?: ValueOf<typeof TabType>;
+  versionNum: string;
+};
 
 const TAB_KEYS = Object.values(TabType);
-const DEFAULT_TAB_KEY = TabType.Overview;
+const DEFAULT_TAB_KEY = TabType.Model;
 
 const ModelVersionDetails: React.FC = () => {
-  const [ modelVersion, setModelVersion ] = useState<ModelVersion>();
-  const { modelName, versionId, tab } = useParams<Params>();
-  const [ pageError, setPageError ] = useState<Error>();
-  const history = useHistory();
-  const [ tabKey, setTabKey ] = useState(tab && TAB_KEYS.includes(tab) ? tab : DEFAULT_TAB_KEY);
+  const [modelVersion, setModelVersion] = useState<ModelVersion>();
+  const { modelId: modelID, versionNum: versionNUM, tab } = useParams<Params>();
+  const workspace = Loadable.getOrElse(
+    undefined,
+    useObservable(workspaceStore.getWorkspace(modelVersion?.model.workspaceId)),
+  );
+  const [pageError, setPageError] = useState<Error>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [tabKey, setTabKey] = useState(tab && TAB_KEYS.includes(tab) ? tab : DEFAULT_TAB_KEY);
 
-  const basePath = paths.modelVersionDetails(modelName, versionId);
+  const modelId = modelID ?? '0';
+  const versionNum = versionNUM ?? '0';
+
+  const basePath = paths.modelVersionDetails(modelId, versionNum);
+
+  const { canModifyModelVersion, loading: rbacLoading } = usePermissions();
 
   const fetchModelVersion = useCallback(async () => {
     try {
-      const versionData = await getModelVersion(
-        { modelName, versionId: parseInt(versionId) },
-      );
-      setModelVersion(prev => !isEqual(versionData, modelVersion) ? versionData : prev);
+      const versionData = await getModelVersion({
+        modelName: modelId,
+        versionNum: parseInt(versionNum),
+      });
+      /**
+       * TODO: can this compare againt prev instead of modelVersion, so that
+       * modelVersion can be remove from deps? would need to get modelVersion
+       * out of deps in order to repoll on change fn
+       */
+      setModelVersion((prev) => (!isEqual(versionData, modelVersion) ? versionData : prev));
     } catch (e) {
       if (!pageError && !isAborted(e)) setPageError(e as Error);
     }
-  }, [ modelName, modelVersion, pageError, versionId ]);
+  }, [modelId, modelVersion, pageError, versionNum]);
 
   usePolling(fetchModelVersion);
 
-  const handleTabChange = useCallback(key => {
-    setTabKey(key);
-    history.replace(`${basePath}/${key}`);
-  }, [ basePath, history ]);
+  const handleTabChange = useCallback(
+    (key: string) => {
+      navigate(`${basePath}/${key}`, { replace: true });
+    },
+    [basePath, navigate],
+  );
+
+  useEffect(() => workspaceStore.fetch(), []);
+
+  useEffect(() => {
+    setTabKey(tab ?? DEFAULT_TAB_KEY);
+  }, [location.pathname, tab]);
 
   // Sets the default sub route.
   useEffect(() => {
     if (!tab || (tab && !TAB_KEYS.includes(tab))) {
-      history.replace(`${basePath}/${tabKey}`);
+      if (window.location.pathname.includes(basePath))
+        navigate(`${basePath}/${tabKey}`, { replace: true });
     }
-  }, [ basePath, history, tab, tabKey ]);
+  }, [basePath, navigate, tab, tabKey]);
 
-  const saveMetadata = useCallback(async (editedMetadata) => {
-    try {
-      await patchModelVersion({
-        body: { metadata: editedMetadata, modelName },
-        modelName,
-        versionId: parseInt(versionId),
-      });
-      await fetchModelVersion();
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to save metadata.',
-        silent: false,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ fetchModelVersion, modelName, versionId ]);
+  const saveMetadata = useCallback(
+    async (editedMetadata: Metadata) => {
+      try {
+        await patchModelVersion({
+          body: { metadata: editedMetadata, modelName: modelId },
+          modelName: modelId,
+          versionNum: parseInt(versionNum),
+        });
+        await fetchModelVersion();
+      } catch (e) {
+        handleError(e, {
+          publicSubject: 'Unable to save metadata.',
+          silent: false,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [fetchModelVersion, modelId, versionNum],
+  );
 
-  const saveNotes = useCallback(async (editedNotes: string) => {
-    try {
-      const versionResponse = await patchModelVersion({
-        body: { modelName, notes: editedNotes },
-        modelName,
-        versionId: parseInt(versionId),
-      });
-      setModelVersion(versionResponse);
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to update notes.',
-        silent: true,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ modelName, versionId ]);
+  const saveNotes = useCallback(
+    async (editedNotes: string) => {
+      try {
+        await patchModelVersion({
+          body: { modelName: modelId, notes: editedNotes },
+          modelName: modelId,
+          versionNum: parseInt(versionNum),
+        });
+        await fetchModelVersion();
+      } catch (e) {
+        handleError(e, {
+          publicSubject: 'Unable to update notes.',
+          silent: true,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [fetchModelVersion, modelId, versionNum],
+  );
 
-  const saveDescription = useCallback(async (editedDescription: string) => {
-    try {
-      await patchModelVersion({
-        body: { comment: editedDescription, modelName },
-        modelName,
-        versionId: parseInt(versionId),
-      });
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to save description.',
-        silent: false,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ modelName, versionId ]);
-
-  const saveName = useCallback(async (editedName: string) => {
-    try {
-      await patchModelVersion({
-        body: { modelName, name: editedName },
-        modelName,
-        versionId: parseInt(versionId),
-      });
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to save name.',
-        silent: false,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ modelName, versionId ]);
-
-  const saveVersionTags = useCallback(async (newTags) => {
-    try {
-      await patchModelVersion({
-        body: { labels: newTags, modelName },
-        modelName,
-        versionId: parseInt(versionId),
-      });
-      fetchModelVersion();
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to save tags.',
-        silent: false,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ fetchModelVersion, modelName, versionId ]);
-
-  const deleteVersion = useCallback(() => {
-    deleteModelVersion({
-      modelName: modelVersion?.model.name ?? '',
-      versionId: modelVersion?.id ?? 0,
-    });
-    history.push(`/det/models/${modelVersion?.model.name}`);
-  }, [ history, modelVersion?.id, modelVersion?.model.name ]);
+  const saveVersionTags = useCallback(
+    async (newTags: string[]) => {
+      try {
+        await patchModelVersion({
+          body: { labels: newTags, modelName: modelId },
+          modelName: modelId,
+          versionNum: parseInt(versionNum),
+        });
+        fetchModelVersion();
+      } catch (e) {
+        handleError(e, {
+          publicSubject: 'Unable to save tags.',
+          silent: false,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [fetchModelVersion, modelId, versionNum],
+  );
 
   const renderResource = (resource: string, size: string): React.ReactNode => {
     return (
@@ -178,26 +180,35 @@ const ModelVersionDetails: React.FC = () => {
     const checkpointResources = modelVersion.checkpoint.resources || {};
     const resources = Object.keys(modelVersion.checkpoint.resources || {})
       .sort((a, b) => checkpointResources[a] - checkpointResources[b])
-      .map(key => ({ name: key, size: humanReadableBytes(checkpointResources[key]) }));
-    const totalBatchesProcessed = getBatchNumber(modelVersion.checkpoint);
+      .map((key) => ({ name: key, size: humanReadableBytes(checkpointResources[key]) }));
+    const hasExperiment = !!modelVersion.checkpoint.experimentId;
     return [
       {
-        content: (
-          <Breadcrumb className={css.link}>
+        content: hasExperiment ? (
+          <Breadcrumb>
             <Breadcrumb.Item>
               <Link path={paths.experimentDetails(modelVersion.checkpoint.experimentId || '')}>
                 Experiment {modelVersion.checkpoint.experimentId}
               </Link>
             </Breadcrumb.Item>
-            <Breadcrumb.Item>
-              <Link path={paths.trialDetails(
-                modelVersion.checkpoint.trialId,
-                modelVersion.checkpoint.experimentId,
-              )}>
-                Trial {modelVersion.checkpoint.trialId}
-              </Link>
-            </Breadcrumb.Item>
-            <Breadcrumb.Item>Batch {totalBatchesProcessed}</Breadcrumb.Item>
+            {!!modelVersion.checkpoint.trialId && (
+              <Breadcrumb.Item>
+                <Link
+                  path={paths.trialDetails(
+                    modelVersion.checkpoint.trialId,
+                    modelVersion.checkpoint.experimentId,
+                  )}>
+                  Trial {modelVersion.checkpoint.trialId}
+                </Link>
+              </Breadcrumb.Item>
+            )}
+            {!!modelVersion.checkpoint.totalBatches && (
+              <Breadcrumb.Item>Batch {modelVersion.checkpoint.totalBatches}</Breadcrumb.Item>
+            )}
+          </Breadcrumb>
+        ) : (
+          <Breadcrumb>
+            <Breadcrumb.Item>Task {modelVersion.checkpoint.taskId}</Breadcrumb.Item>
           </Breadcrumb>
         ),
         label: 'Source',
@@ -208,53 +219,29 @@ const ModelVersionDetails: React.FC = () => {
         label: 'Total Size',
       },
       {
-        content: resources.map(resource => renderResource(resource.name, resource.size)),
+        content: resources.map((resource) => renderResource(resource.name, resource.size)),
         label: 'Code',
-      } ];
-  }, [ modelVersion?.checkpoint ]);
+      },
+    ];
+  }, [modelVersion?.checkpoint]);
 
   const validationMetrics = useMemo(() => {
     if (!modelVersion?.checkpoint) return [];
-    const metrics = Object.entries(modelVersion?.checkpoint.metrics?.validationMetrics || {});
-    return metrics.map(metric => ({
+    const metrics = Object.entries(modelVersion?.checkpoint?.validationMetrics?.avgMetrics || {});
+    return metrics.map((metric) => ({
       content: metric[1],
       label: metric[0],
     }));
-  }, [ modelVersion?.checkpoint ]);
+  }, [modelVersion?.checkpoint]);
 
-  if (!modelName) {
-    return <Message title="Model name is empty" />;
-  } else if (isNaN(parseInt(versionId))) {
-    return <Message title={`Invalid Version ID ${versionId}`} />;
-  } else if (pageError) {
-    const message = isNotFound(pageError) ?
-      `Unable to find model ${modelName} version ${versionId}` :
-      `Unable to fetch model ${modelName} version ${versionId}`;
-    return <Message title={message} type={MessageType.Warning} />;
-  } else if (!modelVersion) {
-    return <Spinner tip={`Loading model ${modelName} version ${versionId} details...`} />;
-  }
+  const tabItems: TabsProps['items'] = useMemo(() => {
+    if (!modelVersion) {
+      return [];
+    }
 
-  return (
-    <Page
-      bodyNoPadding
-      docTitle="Model Version Details"
-      headerComponent={(
-        <ModelVersionHeader
-          modelVersion={modelVersion}
-          onDeregisterVersion={deleteVersion}
-          onSaveDescription={saveDescription}
-          onSaveName={saveName}
-          onUpdateTags={saveVersionTags}
-        />
-      )}
-      id="modelDetails">
-      <Tabs
-        defaultActiveKey="overview"
-        style={{ height: 'auto' }}
-        tabBarStyle={{ backgroundColor: 'var(--theme-colors-monochrome-17)', paddingLeft: 24 }}
-        onChange={handleTabChange}>
-        <TabPane key="model" tab="Model">
+    return [
+      {
+        children: (
           <div className={css.base}>
             <Card title="Model Checkpoint">
               <InfoBox rows={checkpointInfo} separator />
@@ -263,22 +250,69 @@ const ModelVersionDetails: React.FC = () => {
               <InfoBox rows={validationMetrics} separator />
             </Card>
             <MetadataCard
-              disabled={modelVersion.model.archived}
+              disabled={modelVersion.model.archived || !canModifyModelVersion({ modelVersion })}
               metadata={modelVersion.metadata}
               onSave={saveMetadata}
             />
           </div>
-        </TabPane>
-        <TabPane key="notes" tab="Notes">
+        ),
+        key: TabType.Model,
+        label: 'Model',
+      },
+      {
+        children: (
           <div className={css.base}>
             <NotesCard
-              disabled={modelVersion.model.archived}
+              disabled={modelVersion.model.archived || !canModifyModelVersion({ modelVersion })}
               notes={modelVersion.notes ?? ''}
               onSave={saveNotes}
             />
           </div>
-        </TabPane>
-      </Tabs>
+        ),
+        key: TabType.Notes,
+        label: 'Notes',
+      },
+    ];
+  }, [
+    checkpointInfo,
+    modelVersion,
+    canModifyModelVersion,
+    saveMetadata,
+    saveNotes,
+    validationMetrics,
+  ]);
+
+  if (!modelId) {
+    return <Message title="Model name is empty" />;
+  } else if (isNaN(parseInt(versionNum))) {
+    return <Message title={`Invalid Version ID ${versionNum}`} />;
+  } else if (pageError && !isNotFound(pageError)) {
+    const message = `Unable to fetch model ${modelId} version ${versionNum}`;
+    return <Message title={message} type={MessageType.Warning} />;
+  } else if (pageError && isNotFound(pageError)) {
+    return <PageNotFound />;
+  } else if (!modelVersion || !workspace || rbacLoading) {
+    return <Spinner spinning tip={`Loading model ${modelId} version ${versionNum} details...`} />;
+  }
+
+  return (
+    <Page
+      bodyNoPadding
+      docTitle="Model Version Details"
+      headerComponent={
+        <ModelVersionHeader
+          fetchModelVersion={fetchModelVersion}
+          modelVersion={modelVersion}
+          workspace={workspace}
+          onUpdateTags={saveVersionTags}
+        />
+      }
+      id="modelDetails"
+      notFound={pageError && isNotFound(pageError)}>
+      {/* TODO: Clean up once we standardize page layouts */}
+      <div style={{ padding: 16 }}>
+        <Pivot activeKey={tabKey} items={tabItems} onChange={handleTabChange} />
+      </div>
     </Page>
   );
 };

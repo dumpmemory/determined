@@ -28,9 +28,15 @@ class RendezvousInfo:
      - consumed by the launch layer
     """
 
-    def __init__(self, container_addrs: List[str], container_rank: int):
+    def __init__(
+        self,
+        container_addrs: List[str],
+        container_rank: int,
+        container_slot_counts: List[int],
+    ):
         self.container_addrs = container_addrs
         self.container_rank = container_rank
+        self.container_slot_counts = container_slot_counts
 
     def _to_file(self, path: str = DEFAULT_RENDEZVOUS_INFO_PATH) -> None:
         """
@@ -60,15 +66,25 @@ class TrialInfo:
         trial_seed: int,
         hparams: Dict[str, Any],
         config: Dict[str, Any],
-        latest_batch: int,
+        steps_completed: int,
         trial_run_id: int,
         debug: bool,
-        unique_port_offset: int,
         inter_node_network_interface: Optional[str],
     ):
+        """
+        TrialInfo contains information about the trial that is currently running.
+        """
+
+        #: The Trial ID for the current task.
         self.trial_id = trial_id
+
+        #: The Experiment ID for the current task.
         self.experiment_id = experiment_id
+
+        #: The random seed for the current Trial.
         self.trial_seed = trial_seed
+
+        #: The hyperparameter values selected for the current Trial.
         self.hparams = hparams
 
         # _config is private because it's not a stable API; as the experiment config version
@@ -81,14 +97,12 @@ class TrialInfo:
         # rb: These fields are private because I am pretty confident that we need to find better
         # ways to pass them around the system.  But for now, they're passed in as environment
         # variables and for now we have to be able to handle that.
-        # TODO: decide if we really want to track latest_batch for users or not.
-        self._latest_batch = latest_batch
+        # TODO: decide if we really want to track steps_completed for users or not.
+        self._steps_completed = steps_completed
         # TODO: get rid of trial_run_id in favor of allocation id.
         self._trial_run_id = trial_run_id
         # TODO: decide if the experiment config is the right place for users to set a debug flag.
         self._debug = debug
-        # TODO: is this derivable from the slot ids?
-        self._unique_port_offset = unique_port_offset
         # TODO: Get rid of this in favor of launch layer configs?
         self._inter_node_network_interface = inter_node_network_interface
 
@@ -102,10 +116,9 @@ class TrialInfo:
             trial_seed=int(os.environ["DET_TRIAL_SEED"]),
             hparams=json.loads(os.environ["DET_HPARAMS"]),
             config=experiment_config,
-            latest_batch=int(os.environ["DET_LATEST_BATCH"]),
+            steps_completed=int(os.environ["DET_STEPS_COMPLETED"]),
             trial_run_id=int(os.environ["DET_TRIAL_RUN_ID"]),
             debug=experiment_config.get("debug", False),
-            unique_port_offset=int(os.environ["DET_UNIQUE_PORT_OFFSET"]),
             inter_node_network_interface=os.environ.get("DET_INTER_NODE_NETWORK_INTERFACE"),
         )
 
@@ -150,6 +163,9 @@ class ClusterInfo:
     ClusterInfo exposes various properties that are set for tasks while running on the cluster.
 
     Examples:
+
+    .. code:: python
+
         info = det.get_cluster_info()
         assert info is not None, "this code only runs on-cluster!"
 
@@ -165,7 +181,7 @@ class ClusterInfo:
             print("trial.id", info.trial.id)
             print("trial.hparams", info.trial.hparams)
 
-    .. warn::
+    .. warning::
 
        Be careful with this object!  If you depend on a ClusterInfo object during training for
        anything more than e.g.  informational logging, you run the risk of making your training code
@@ -192,17 +208,45 @@ class ClusterInfo:
         rendezvous_info: Optional[RendezvousInfo] = None,
         resources_info: Optional[ResourcesInfo] = None,
     ):
+        #: The url for reaching the master.
         self.master_url = master_url
+
+        #: The unique identifier for this cluster.
         self.cluster_id = cluster_id
+
+        #: The identifier of the Determined agent this container is running on.
         self.agent_id = agent_id
+
+        #: The slot ids assigned to this container.
         self.slot_ids = slot_ids
+
+        #: The unique identifier for the current task.
         self.task_id = task_id
+
+        #: The unique identifier for the current allocation.
         self.allocation_id = allocation_id
+
+        #: The Determined login session token created for the current task.
         self.session_token = session_token
+
+        #: The type of task.  Currently one of the following string literals:
+        #:    - ``"TRIAL"``
+        #:    - ``"NOTEBOOK"``
+        #:    - ``"SHELL"``
+        #:    - ``"COMMAND"``
+        #:    - ``"TENSORBOARD"``
+        #:    - ``"CHECKPOINT_GC"``
+        #:
+        #: Additional values may be added in the future.
         self.task_type = task_type
 
+        #: The name on the master certificate, when using TLS.
         self.master_cert_name = master_cert_name
+
+        #: The file location for the master certificate, if present, or "noverify" if it has been
+        #: configured not to verify the master cert.
         self.master_cert_file = master_cert_file
+
         self._latest_checkpoint = latest_checkpoint
 
         self._trial_info = trial_info
@@ -264,24 +308,35 @@ class ClusterInfo:
 
     @property
     def latest_checkpoint(self) -> Optional[str]:
+        """
+        The checkpoint ID of the most recent checkpoint that should be loaded.
+
+        Since non-trial-type tasks cannot currently save checkpoints, ``.latest_checkpoint`` is
+        currently always None for non-trial-type tasks.
+        """
         if self.task_type != "TRIAL":
-            raise RuntimeError(
-                "the .latest_checkpoint property is not yet supported when .task_type "
-                f'("{self.task_type}") != "TRIAL"'
-            )
+            return None
         return self._latest_checkpoint
 
     @property
     def user_data(self) -> Dict[str, Any]:
+        """
+        The content of the ``data`` field of the experiment configuration.
+
+        Since other types of configuration files don't allow a ``data`` field, accessing
+        ``user_data`` from non-trial-type tasks will always return an empty dictionary.
+        """
         if self.task_type != "TRIAL":
-            raise RuntimeError(
-                "the .user_data property is not yet supported when .task_type "
-                f'("{self.task_type}") != "TRIAL"'
-            )
+            return {}
         return self.trial._config.get("data", {})
 
     @property
     def trial(self) -> TrialInfo:
+        """
+        The :class:`~determined.TrialInfo` sub-info object for the current trial task.
+
+        Attempting to read ``.trial`` in a non-trial task type will raise a RuntimeError.
+        """
         if self.task_type != "TRIAL":
             raise RuntimeError(
                 f'you cannot use the .trial property when .task_type ("{self.task_type}") != '
@@ -292,16 +347,42 @@ class ClusterInfo:
 
     @property
     def container_addrs(self) -> List[str]:
+        """A list of addresses for all containers in the allocation, ordered by rank."""
+        if self.task_type != "TRIAL":
+            # Presently, only trials are allowed to use the rendezvous API.
+            # But also, only trials are scheduled across multiple nodes, so we can cheat here.
+            return ["127.0.0.1"]
         assert self._rendezvous_info is not None
         return self._rendezvous_info.container_addrs
 
     @property
+    def container_slot_counts(self) -> List[int]:
+        """A list of slots for all containers in the allocation, ordered by rank."""
+        if self.task_type != "TRIAL":
+            # Presently, only trials are allowed to use the rendezvous API.
+            # But also, only trials are scheduled across multiple nodes, so we can cheat here.
+            return [len(self.slot_ids)]
+        assert self._rendezvous_info is not None
+        return self._rendezvous_info.container_slot_counts
+
+    @property
     def container_rank(self) -> int:
+        """
+        The rank assigned to this container.
+
+        When using a distributed training framework, the framework may choose a different rank for
+        this container.
+        """
+        if self.task_type != "TRIAL":
+            # Presently, only trials are allowed to use the rendezvous API.
+            # But also, only trials are scheduled across multiple nodes, so we can cheat here.
+            return 0
         assert self._rendezvous_info is not None
         return self._rendezvous_info.container_rank
 
     @property
     def gpu_uuids(self) -> List[str]:
+        """The UUIDs to the gpus assigned to this container."""
         assert self._resources_info is not None
         return self._resources_info.gpu_uuids
 
@@ -310,6 +391,11 @@ _info = "unloaded"  # type: Union[ClusterInfo, str, None]
 
 
 def get_cluster_info() -> Optional[ClusterInfo]:
+    """
+    Returns either the :class:`~determined.ClusterInfo` object for the current task, or ``None`` if
+    not running in a task.
+    """
+
     global _info
     if isinstance(_info, str):
         _info = ClusterInfo._from_file()

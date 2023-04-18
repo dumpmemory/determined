@@ -24,7 +24,8 @@ type SearchMethod interface {
 	// validationCompleted informs the searcher that the validation workload initiated by the same
 	// searcher has completed. It returns any new operations as a result of this workload
 	// completing.
-	validationCompleted(ctx context, requestID model.RequestID, metric float64) ([]Operation, error)
+	validationCompleted(ctx context, requestID model.RequestID,
+		metric interface{}, op ValidateAfter) ([]Operation, error)
 	// trialClosed informs the searcher that the trial has been closed as a result of a Close
 	// operation.
 	trialClosed(ctx context, requestID model.RequestID) ([]Operation, error)
@@ -34,9 +35,17 @@ type SearchMethod interface {
 	trialExitedEarly(
 		ctx context, requestID model.RequestID, exitedReason model.ExitedReason,
 	) ([]Operation, error)
+
 	// TODO: refactor as model.Snapshotter interface or something
 	model.Snapshotter
 	expconf.InUnits
+}
+
+// CustomSearchMethod is the interface for the custom search method.
+type CustomSearchMethod interface {
+	getSearcherEventQueue() *SearcherEventQueue
+	setCustomSearcherProgress(progress float64)
+	trialProgress(ctx context, requestID model.RequestID, progress PartialUnits)
 }
 
 // SearchMethodType is the type of a SearchMethod. It is saved in snapshots to be used
@@ -56,8 +65,8 @@ const (
 	ASHASearch SearchMethodType = "asha"
 	// AdaptiveASHASearch is the SearchMethodType for an adaptive ASHA searcher.
 	AdaptiveASHASearch SearchMethodType = "adaptive_asha"
-	// PBTSearch is the SearchMethodType for a PBT searcher.
-	PBTSearch SearchMethodType = "pbt"
+	// CustomSearch is the SearchMethodType for a custom searcher.
+	CustomSearch SearchMethodType = "custom_search"
 )
 
 // NewSearchMethod returns a new search method for the provided searcher configuration.
@@ -76,8 +85,8 @@ func NewSearchMethod(c expconf.SearcherConfig) SearchMethod {
 		return newAsyncHalvingSearch(*c.RawAsyncHalvingConfig, c.SmallerIsBetter())
 	case c.RawAdaptiveASHAConfig != nil:
 		return newAdaptiveASHASearch(*c.RawAdaptiveASHAConfig, c.SmallerIsBetter())
-	case c.RawPBTConfig != nil:
-		return newPBTSearch(*c.RawPBTConfig, c.SmallerIsBetter())
+	case c.RawCustomConfig != nil:
+		return newCustomSearch(*c.RawCustomConfig)
 	default:
 		panic("no searcher type specified")
 	}
@@ -90,7 +99,7 @@ func (defaultSearchMethod) trialCreated(context, model.RequestID) ([]Operation, 
 }
 
 func (defaultSearchMethod) validationCompleted(
-	context, model.RequestID, float64,
+	context, model.RequestID, interface{}, ValidateAfter,
 ) ([]Operation, error) {
 	return nil, nil
 }
@@ -100,14 +109,7 @@ func (defaultSearchMethod) trialClosed(context, model.RequestID) ([]Operation, e
 }
 
 func (defaultSearchMethod) trialExitedEarly(
-	context, model.RequestID, model.ExitedReason) ([]Operation, error) {
+	context, model.RequestID, model.ExitedReason,
+) ([]Operation, error) {
 	return []Operation{Shutdown{Failure: true}}, nil
-}
-
-func sumTrialLengths(us map[model.RequestID]PartialUnits) PartialUnits {
-	var sum PartialUnits = 0
-	for _, u := range us {
-		sum += u
-	}
-	return sum
 }

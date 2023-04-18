@@ -11,16 +11,21 @@ import "determined/api/v1/auth.proto";
 import "determined/api/v1/checkpoint.proto";
 import "determined/api/v1/command.proto";
 import "determined/api/v1/experiment.proto";
+import "determined/api/v1/group.proto";
 import "determined/api/v1/job.proto";
 import "determined/api/v1/master.proto";
 import "determined/api/v1/model.proto";
 import "determined/api/v1/notebook.proto";
+import "determined/api/v1/project.proto";
+import "determined/api/v1/rbac.proto";
 import "determined/api/v1/task.proto";
 import "determined/api/v1/template.proto";
 import "determined/api/v1/tensorboard.proto";
 import "determined/api/v1/trial.proto";
 import "determined/api/v1/shell.proto";
 import "determined/api/v1/user.proto";
+import "determined/api/v1/webhook.proto";
+import "determined/api/v1/workspace.proto";
 import "determined/api/v1/resourcepool.proto";
 
 option (grpc.gateway.protoc_gen_swagger.options.openapiv2_swagger) = {
@@ -111,6 +116,36 @@ service Determined {
       tags: "Users"
     };
   }
+  // Get a user's settings for website
+  rpc GetUserSetting(GetUserSettingRequest) returns (GetUserSettingResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/users/setting",
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Users"
+    };
+  }
+  // Reset a user's settings for website
+  rpc ResetUserSetting(ResetUserSettingRequest)
+      returns (ResetUserSettingResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/users/setting/reset",
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Users"
+    };
+  }
+  // Patch a user's settings for website
+  rpc PostUserSetting(PostUserSettingRequest)
+      returns (PostUserSettingResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/users/setting",
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Users"
+    };
+  }
   // Get the requested user.
   rpc GetUser(GetUserRequest) returns (GetUserResponse) {
     option (google.api.http) = {
@@ -120,6 +155,28 @@ service Determined {
       tags: "Users"
     };
   }
+
+  // Get the requested user with username.
+  rpc GetUserByUsername(GetUserByUsernameRequest)
+      returns (GetUserByUsernameResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/users/{username}/by-username"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Users"
+    };
+  }
+
+  // Get the current user.
+  rpc GetMe(GetMeRequest) returns (GetMeResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/me"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Users"
+    };
+  }
+
   // Create a new user.
   rpc PostUser(PostUserRequest) returns (PostUserResponse) {
     option (google.api.http) = {
@@ -258,6 +315,7 @@ service Determined {
   rpc DisableSlot(DisableSlotRequest) returns (DisableSlotResponse) {
     option (google.api.http) = {
       post: "/api/v1/agents/{agent_id}/slots/{slot_id}/disable"
+      body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Cluster"
@@ -302,6 +360,27 @@ service Determined {
       tags: "Experiments"
     };
   }
+  // Get the model definition file tree of an experiment.
+  rpc GetModelDefTree(GetModelDefTreeRequest)
+      returns (GetModelDefTreeResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/experiments/{experiment_id}/file_tree"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+  // Get one file content of model definition of an experiment.
+  rpc GetModelDefFile(GetModelDefFileRequest)
+      returns (GetModelDefFileResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/{experiment_id}/file"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
   // Get a list of unique experiment labels (sorted by popularity).
   rpc GetExperimentLabels(GetExperimentLabelsRequest)
       returns (GetExperimentLabelsResponse) {
@@ -332,11 +411,33 @@ service Determined {
       tags: "Experiments"
     };
   }
+  // Activate multiple experiments.
+  rpc ActivateExperiments(ActivateExperimentsRequest)
+      returns (ActivateExperimentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/activate"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
   // Pause an experiment.
   rpc PauseExperiment(PauseExperimentRequest)
       returns (PauseExperimentResponse) {
     option (google.api.http) = {
       post: "/api/v1/experiments/{id}/pause"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+  // Pause multiple experiments.
+  rpc PauseExperiments(PauseExperimentsRequest)
+      returns (PauseExperimentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/pause"
+      body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Experiments"
@@ -352,10 +453,32 @@ service Determined {
       tags: "Experiments"
     };
   }
+  // Cancel multiple experiments.
+  rpc CancelExperiments(CancelExperimentsRequest)
+      returns (CancelExperimentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/cancel"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
   // Kill an experiment.
   rpc KillExperiment(KillExperimentRequest) returns (KillExperimentResponse) {
     option (google.api.http) = {
       post: "/api/v1/experiments/{id}/kill"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+  // Kill multiple experiments.
+  rpc KillExperiments(KillExperimentsRequest)
+      returns (KillExperimentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/kill"
+      body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Experiments"
@@ -371,11 +494,33 @@ service Determined {
       tags: "Experiments"
     };
   }
+  // Archive multiple experiments.
+  rpc ArchiveExperiments(ArchiveExperimentsRequest)
+      returns (ArchiveExperimentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/archive"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
   // Unarchive an experiment.
   rpc UnarchiveExperiment(UnarchiveExperimentRequest)
       returns (UnarchiveExperimentResponse) {
     option (google.api.http) = {
       post: "/api/v1/experiments/{id}/unarchive"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+  // Unarchive multiple experiments.
+  rpc UnarchiveExperiments(UnarchiveExperimentsRequest)
+      returns (UnarchiveExperimentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/unarchive"
+      body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Experiments"
@@ -387,6 +532,17 @@ service Determined {
     option (google.api.http) = {
       patch: "/api/v1/experiments/{experiment.id}"
       body: "experiment"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+  // Delete multiple experiments.
+  rpc DeleteExperiments(DeleteExperimentsRequest)
+      returns (DeleteExperimentsResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/experiments/delete"
+      body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Experiments"
@@ -446,6 +602,87 @@ service Determined {
       tags: [ "Trials", "Experiments" ]
     };
   }
+
+  // Return a downsampled time series of metrics from multiple trials to compare
+  // them side-by-side.
+  rpc CompareTrials(CompareTrialsRequest) returns (CompareTrialsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/trials/time-series"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+
+  // Return trials matching a set of TrialFilters.
+  rpc QueryTrials(QueryTrialsRequest) returns (QueryTrialsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/trial-comparison/query"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trial Comparison" ]
+    };
+  }
+
+  // Update tags for trials by IDs or filters.
+  rpc UpdateTrialTags(UpdateTrialTagsRequest)
+      returns (UpdateTrialTagsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/trial-comparison/update-trial-tags"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trial Comparison" ]
+    };
+  }
+
+  // Return all collectiions for a specific project.
+  rpc GetTrialsCollections(GetTrialsCollectionsRequest)
+      returns (GetTrialsCollectionsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/trial-comparison/collections"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trial Comparison" ]
+    };
+  }
+
+  // Create a Trial Collection for a set of TrialFilters.
+  rpc CreateTrialsCollection(CreateTrialsCollectionRequest)
+      returns (CreateTrialsCollectionResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/trial-comparison/collections"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trial Comparison" ]
+    };
+  }
+
+  // Modify collection attributes: name, filters, etc.
+  rpc PatchTrialsCollection(PatchTrialsCollectionRequest)
+      returns (PatchTrialsCollectionResponse) {
+    option (google.api.http) = {
+      patch: "/api/v1/trial-comparison/collections"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trial Comparison" ]
+    };
+  }
+
+  // Removes a TrialCollection.
+  rpc DeleteTrialsCollection(DeleteTrialsCollectionRequest)
+      returns (DeleteTrialsCollectionResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/trial-comparison/collections"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trial Comparison" ]
+    };
+  }
+
   // Get a single trial.
   rpc GetTrial(GetTrialRequest) returns (GetTrialResponse) {
     option (google.api.http) = {
@@ -453,6 +690,17 @@ service Determined {
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: [ "Trials", "Experiments" ]
+    };
+  }
+
+  // Get the list of workloads for a trial.
+  rpc GetTrialWorkloads(GetTrialWorkloadsRequest)
+      returns (GetTrialWorkloadsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/trials/{trial_id}/workloads"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trials", "Internal" ]
     };
   }
   // Stream trial logs.
@@ -476,11 +724,31 @@ service Determined {
     };
     option deprecated = true;
   }
+  // Downsample metrics collected during a trial.
+  rpc SummarizeTrial(SummarizeTrialRequest) returns (SummarizeTrialResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/trials/{trial_id}/summarize"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trials", "Experiments" ]
+    };
+  }
   // Set allocation to ready state.
   rpc AllocationReady(AllocationReadyRequest)
       returns (AllocationReadyResponse) {
     option (google.api.http) = {
       post: "/api/v1/allocations/{allocation_id}/ready"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+  // Set allocation to waiting state.
+  rpc AllocationWaiting(AllocationWaitingRequest)
+      returns (AllocationWaitingResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/allocations/{allocation_id}/waiting"
       body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
@@ -537,6 +805,27 @@ service Determined {
       tags: [ "Internal" ]
     };
   }
+  // Stream one or more trial's training metrics.
+  rpc GetTrainingMetrics(GetTrainingMetricsRequest)
+      returns (stream GetTrainingMetricsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/trials/metrics/training_metrics"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trials" ]
+    };
+  }
+  // Stream one or more trial's validation metrics.
+  rpc GetValidationMetrics(GetValidationMetricsRequest)
+      returns (stream GetValidationMetricsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/trials/metrics/validation_metrics"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Trials" ]
+    };
+  }
+
   // Kill a trial.
   rpc KillTrial(KillTrialRequest) returns (KillTrialResponse) {
     option (google.api.http) = {
@@ -565,6 +854,21 @@ service Determined {
       returns (AllocationPreemptionSignalResponse) {
     option (google.api.http) = {
       get: "/api/v1/allocations/{allocation_id}/signals/preemption"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+  // Report the receipt of a signal to stop the given allocation early.
+  // This is used to communicate back from a SLURM job that it has been
+  // notified of a pending preememption. Upon a call to this API
+  // the RM should then trigger a checkpoint and immediate exit.
+  rpc AllocationPendingPreemptionSignal(
+      AllocationPendingPreemptionSignalRequest)
+      returns (AllocationPendingPreemptionSignalResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/allocations/{allocation_id}/signals/pending_preemption"
+      body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Internal"
@@ -611,6 +915,19 @@ service Determined {
       tags: "Internal"
     };
   }
+  // PostAllocationProxyAddress sets the proxy address to use when proxying to
+  // services provided by an allocation. Upon receipt, the master will also
+  // register any proxies specified by the task.
+  rpc PostAllocationProxyAddress(PostAllocationProxyAddressRequest)
+      returns (PostAllocationProxyAddressResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/allocations/{allocation_id}/proxy_address"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
 
   // AllocationAllGather performs an all gather through the master. An
   // allocation can only perform once all gather at a time.
@@ -618,6 +935,23 @@ service Determined {
       returns (AllocationAllGatherResponse) {
     option (google.api.http) = {
       post: "/api/v1/allocations/{allocation_id}/all_gather"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+
+  // NotifyContainterRunning is used to notify the master that the container
+  // is running.  On HPC, the launcher will report a state of "Running" as
+  // soon as Slurm starts the job, but the container may be in the process
+  // of getting pulled down from the Internet, so the experiment is not
+  // really considered to be in a "Running" state until all the containers
+  // that are part of the experiment are running and not being pulled.
+  rpc NotifyContainerRunning(NotifyContainerRunningRequest)
+      returns (NotifyContainerRunningResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/allocations/{allocation_id}/notify_container_running"
       body: "*"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
@@ -706,11 +1040,11 @@ service Determined {
     };
   }
   // Record a checkpoint.
-  rpc ReportTrialCheckpointMetadata(ReportTrialCheckpointMetadataRequest)
-      returns (ReportTrialCheckpointMetadataResponse) {
+  rpc ReportCheckpoint(ReportCheckpointRequest)
+      returns (ReportCheckpointResponse) {
     option (google.api.http) = {
-      post: "/api/v1/trials/{checkpoint_metadata.trial_id}/checkpoint_metadata"
-      body: "checkpoint_metadata"
+      post: "/api/v1/checkpoints"
+      body: "checkpoint"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Internal"
@@ -832,15 +1166,6 @@ service Determined {
     option (google.api.http) = {
       post: "/api/v1/notebooks/{notebook_id}/set_priority"
       body: "*"
-    };
-    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
-      tags: "Notebooks"
-    };
-  }
-  // Stream notebook logs.
-  rpc NotebookLogs(NotebookLogsRequest) returns (stream NotebookLogsResponse) {
-    option (google.api.http) = {
-      get: "/api/v1/notebooks/{notebook_id}/logs"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Notebooks"
@@ -1007,10 +1332,31 @@ service Determined {
     };
   }
 
+  // Get a count of active tasks.
+  rpc GetActiveTasksCount(GetActiveTasksCountRequest)
+      returns (GetActiveTasksCountResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/tasks/count"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Tasks"
+    };
+  }
+
   // Check the status of a requested task.
   rpc GetTask(GetTaskRequest) returns (GetTaskResponse) {
     option (google.api.http) = {
       get: "/api/v1/tasks/{task_id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Tasks"
+    };
+  }
+
+  // Get all tasks.
+  rpc GetTasks(GetTasksRequest) returns (GetTasksResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/tasks"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Tasks"
@@ -1064,6 +1410,16 @@ service Determined {
       tags: "Models"
     };
   }
+  // Move a model into a workspace
+  rpc MoveModel(MoveModelRequest) returns (MoveModelResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/models/{model_name}/move",
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Models"
+    };
+  }
   // Delete a model
   rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse) {
     option (google.api.http) = {
@@ -1095,7 +1451,7 @@ service Determined {
   rpc GetModelVersion(GetModelVersionRequest)
       returns (GetModelVersionResponse) {
     option (google.api.http) = {
-      get: "/api/v1/models/{model_name}/versions/{model_version}"
+      get: "/api/v1/models/{model_name}/versions/{model_version_num}"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Models"
@@ -1127,7 +1483,7 @@ service Determined {
   rpc PatchModelVersion(PatchModelVersionRequest)
       returns (PatchModelVersionResponse) {
     option (google.api.http) = {
-      patch: "/api/v1/models/{model_name}/versions/{model_version_id}"
+      patch: "/api/v1/models/{model_name}/versions/{model_version_num}"
       body: "model_version"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
@@ -1139,7 +1495,7 @@ service Determined {
   rpc DeleteModelVersion(DeleteModelVersionRequest)
       returns (DeleteModelVersionResponse) {
     option (google.api.http) = {
-      delete: "/api/v1/models/{model_name}/versions/{model_version_id}"
+      delete: "/api/v1/models/{model_name}/versions/{model_version_num}"
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Models"
@@ -1165,6 +1521,41 @@ service Determined {
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Checkpoints"
+    };
+  }
+
+  // Delete Checkpoints.
+  rpc DeleteCheckpoints(DeleteCheckpointsRequest)
+      returns (DeleteCheckpointsResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/checkpoints"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Checkpoints"
+    };
+  }
+
+  // Get the list of custom searcher events with long polling.
+  rpc GetSearcherEvents(GetSearcherEventsRequest)
+      returns (GetSearcherEventsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/experiments/{experiment_id}/searcher_events"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+
+  // Submit operations to a custom searcher.
+  rpc PostSearcherOperations(PostSearcherOperationsRequest)
+      returns (PostSearcherOperationsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/{experiment_id}/searcher_operations"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
     };
   }
 
@@ -1223,33 +1614,6 @@ service Determined {
     };
   }
 
-  // Trigger the computation of hyperparameter importance on-demand for a
-  // specific metric on a specific experiment. The status and results can be
-  // retrieved with GetHPImportance.
-  rpc ComputeHPImportance(ComputeHPImportanceRequest)
-      returns (ComputeHPImportanceResponse) {
-    option (google.api.http) = {
-      post: "/api/v1/experiments/{experiment_id}/hyperparameter-importance"
-    };
-    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
-      tags: "Internal"
-    };
-  }
-
-  // Retrieve the latest computation of hyperparameter importance. Currently
-  // this is triggered for training loss (if emitted) and the searcher metric
-  // after 10% increments in an experiment's progress, but no more than every 10
-  // minutes.
-  rpc GetHPImportance(GetHPImportanceRequest)
-      returns (stream GetHPImportanceResponse) {
-    option (google.api.http) = {
-      get: "/api/v1/experiments/{experiment_id}/hyperparameter-importance"
-    };
-    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
-      tags: "Internal"
-    };
-  }
-
   // Get a detailed view of resource allocation during the given time period.
   rpc ResourceAllocationRaw(ResourceAllocationRawRequest)
       returns (ResourceAllocationRawResponse) {
@@ -1270,6 +1634,458 @@ service Determined {
     };
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
       tags: "Cluster"
+    };
+  }
+
+  // Get the requested workspace.
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/workspaces/{id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Get projects associated with a workspace.
+  rpc GetWorkspaceProjects(GetWorkspaceProjectsRequest)
+      returns (GetWorkspaceProjectsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/workspaces/{id}/projects"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Get a list of workspaces.
+  rpc GetWorkspaces(GetWorkspacesRequest) returns (GetWorkspacesResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/workspaces"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Create a workspace.
+  rpc PostWorkspace(PostWorkspaceRequest) returns (PostWorkspaceResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/workspaces"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Update a workspace.
+  rpc PatchWorkspace(PatchWorkspaceRequest) returns (PatchWorkspaceResponse) {
+    option (google.api.http) = {
+      patch: "/api/v1/workspaces/{id}"
+      body: "workspace"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Delete a workspace.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest)
+      returns (DeleteWorkspaceResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/workspaces/{id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Archive a workspace.
+  rpc ArchiveWorkspace(ArchiveWorkspaceRequest)
+      returns (ArchiveWorkspaceResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/workspaces/{id}/archive"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Unarchive a workspace.
+  rpc UnarchiveWorkspace(UnarchiveWorkspaceRequest)
+      returns (UnarchiveWorkspaceResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/workspaces/{id}/unarchive"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Pin a workspace.
+  rpc PinWorkspace(PinWorkspaceRequest) returns (PinWorkspaceResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/workspaces/{id}/pin"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+  // Unpin a workspace.
+  rpc UnpinWorkspace(UnpinWorkspaceRequest) returns (UnpinWorkspaceResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/workspaces/{id}/unpin"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Workspaces"
+    };
+  }
+
+  // Get the requested project.
+  rpc GetProject(GetProjectRequest) returns (GetProjectResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/projects/{id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Get a list of columns for experiment list table.
+  rpc GetProjectColumns(GetProjectColumnsRequest)
+      returns (GetProjectColumnsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/projects/{id}/columns"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+  // Create a project.
+  rpc PostProject(PostProjectRequest) returns (PostProjectResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/workspaces/{workspace_id}/projects"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Add a note to a project.
+  rpc AddProjectNote(AddProjectNoteRequest) returns (AddProjectNoteResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/projects/{project_id}/notes"
+      body: "note"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Set project notes.
+  rpc PutProjectNotes(PutProjectNotesRequest)
+      returns (PutProjectNotesResponse) {
+    option (google.api.http) = {
+      put: "/api/v1/projects/{project_id}/notes"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Update a project.
+  rpc PatchProject(PatchProjectRequest) returns (PatchProjectResponse) {
+    option (google.api.http) = {
+      patch: "/api/v1/projects/{id}"
+      body: "project"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Delete a project.
+  rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/projects/{id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Archive a project.
+  rpc ArchiveProject(ArchiveProjectRequest) returns (ArchiveProjectResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/projects/{id}/archive"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Unarchive a project.
+  rpc UnarchiveProject(UnarchiveProjectRequest)
+      returns (UnarchiveProjectResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/projects/{id}/unarchive"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Move a project into a workspace.
+  rpc MoveProject(MoveProjectRequest) returns (MoveProjectResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/projects/{project_id}/move"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+  // Move an experiment into a project.
+  rpc MoveExperiment(MoveExperimentRequest) returns (MoveExperimentResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/{experiment_id}/move"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+  // Move multiple experiments into a project.
+  rpc MoveExperiments(MoveExperimentsRequest)
+      returns (MoveExperimentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/experiments/move"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Experiments"
+    };
+  }
+
+  // Get a list of webhooks.
+  rpc GetWebhooks(GetWebhooksRequest) returns (GetWebhooksResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/webhooks"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Webhooks"
+    };
+  }
+
+  // Create a webhook.
+  // TODO(???): Simplify req/response structs?
+  rpc PostWebhook(PostWebhookRequest) returns (PostWebhookResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/webhooks"
+      body: "webhook"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Webhooks"
+    };
+  }
+
+  // Delete a webhook.
+  rpc DeleteWebhook(DeleteWebhookRequest) returns (DeleteWebhookResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/webhooks/{id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Webhooks"
+    };
+  }
+
+  // Test a webhook.
+  rpc TestWebhook(TestWebhookRequest) returns (TestWebhookResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/webhooks/{id}/test"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Webhooks"
+    };
+  }
+
+  // Get a group by id.
+  rpc GetGroup(GetGroupRequest) returns (GetGroupResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/groups/{group_id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+
+  // Search for groups with optional filters.
+  rpc GetGroups(GetGroupsRequest) returns (GetGroupsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/groups/search"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+
+  // Create a group with optional members on creation.
+  rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/groups"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+
+  // Update group info.
+  rpc UpdateGroup(UpdateGroupRequest) returns (UpdateGroupResponse) {
+    option (google.api.http) = {
+      put: "/api/v1/groups/{group_id}"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+
+  // Remove a group.
+  rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/groups/{group_id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Internal"
+    };
+  }
+
+  // List all permissions for the logged in user in all scopes.
+  rpc GetPermissionsSummary(GetPermissionsSummaryRequest)
+      returns (GetPermissionsSummaryResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/permissions/summary"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // Get groups and users assigned to a given workspace with what roles are
+  // assigned.
+  rpc GetGroupsAndUsersAssignedToWorkspace(
+      GetGroupsAndUsersAssignedToWorkspaceRequest)
+      returns (GetGroupsAndUsersAssignedToWorkspaceResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/roles/workspace/{workspace_id}"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // Get a set of roles with the corresponding IDs.
+  rpc GetRolesByID(GetRolesByIDRequest) returns (GetRolesByIDResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/roles/search/by-ids"
+      body: "*"
+    };
+
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // Get the roles which are assigned to a user.
+  rpc GetRolesAssignedToUser(GetRolesAssignedToUserRequest)
+      returns (GetRolesAssignedToUserResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/roles/search/by-user/{user_id}"
+    };
+
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // Get the roles which are assigned to a group.
+  rpc GetRolesAssignedToGroup(GetRolesAssignedToGroupRequest)
+      returns (GetRolesAssignedToGroupResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/roles/search/by-group/{group_id}"
+    };
+
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // Search for roles assignable to a given scope.
+  rpc SearchRolesAssignableToScope(SearchRolesAssignableToScopeRequest)
+      returns (SearchRolesAssignableToScopeResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/roles/search/by-assignability"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // ListRoles returns roles and groups/users granted that role.
+  rpc ListRoles(ListRolesRequest) returns (ListRolesResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/roles/search"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // AssignRoles adds a set of role assignments to the system.
+  rpc AssignRoles(AssignRolesRequest) returns (AssignRolesResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/roles/add-assignments"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // RemoveAssignments removes a set of role assignments from the system.
+  rpc RemoveAssignments(RemoveAssignmentsRequest)
+      returns (RemoveAssignmentsResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/roles/remove-assignments"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "RBAC"
+    };
+  }
+
+  // Patch a user's activity
+  rpc PostUserActivity(PostUserActivityRequest)
+      returns (PostUserActivityResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/users/activity",
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Users"
+    };
+  }
+
+  // Get projects by user activity
+  rpc GetProjectsByUserActivity(GetProjectsByUserActivityRequest)
+      returns (GetProjectsByUserActivityResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/user/projects/activity"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: "Projects"
+    };
+  }
+
+  // Get experiments with grouping and search syntax
+  rpc SearchExperiments(SearchExperimentsRequest)
+      returns (SearchExperimentsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/experiments-search"
+    };
+    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_operation) = {
+      tags: [ "Experiments", "Internal" ]
     };
   }
 }

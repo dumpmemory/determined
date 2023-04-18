@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional
 import docker
 import docker.errors
 import pytest
-import yaml
 
+from determined.common import yaml
 from tests import command as cmd
 from tests import config as conf
 from tests.filetree import FileTree
@@ -39,7 +39,7 @@ def _run_and_verify_exit_code_zero(args: List[str], **kwargs: Any) -> None:
     """Wraps subprocess.check_output and verifies a successful exit code."""
     # TODO(#2903): remove this once exit status are propagated through cli
     output = subprocess.check_output(args, **kwargs)
-    assert re.search(b"command exited successfully", output) is not None, "Output is: {}".format(
+    assert re.search(b"resources exited successfully", output) is not None, "Output is: {}".format(
         output.decode("utf-8")
     )
 
@@ -250,6 +250,54 @@ def test_singleton_command() -> None:
 
 @pytest.mark.slow
 @pytest.mark.e2e_cpu
+def test_environment_variables_command() -> None:
+    _run_and_verify_exit_code_zero(
+        [
+            "det",
+            "-m",
+            conf.make_master_url(),
+            "cmd",
+            "run",
+            "--config",
+            "environment.environment_variables='THISISTRUE=true','WONTCAUSEPANIC'",
+            'if [ "$THISISTRUE" != "true" ]; then exit 1; fi',
+        ]
+    )
+
+
+@pytest.mark.parametrize("actual,expected", [("24576", "24"), ("1.5g", "1572864")])
+@pytest.mark.parametrize("use_config_file", [True, False])
+@pytest.mark.slow
+@pytest.mark.e2e_cpu
+def test_shm_size_command(
+    tmp_path: Path, actual: str, expected: str, use_config_file: bool
+) -> None:
+    with FileTree(
+        tmp_path,
+        {
+            "config.yaml": f"""
+resources:
+  shm_size: {actual}
+"""
+        },
+    ) as tree:
+        config_path = tree.joinpath("config.yaml")
+        cmd = ["det", "-m", conf.make_master_url(), "cmd", "run"]
+        if use_config_file:
+            cmd += ["--config-file", str(config_path)]
+        else:
+            cmd += ["--config", f"resources.shm_size={actual}"]
+        cmd += [
+            f"""df /dev/shm && \
+df /dev/shm | \
+tail -1 | \
+[ "$(awk '{{print $2}}')" = '{expected}' ]"""
+        ]
+        _run_and_verify_exit_code_zero(cmd)
+
+
+@pytest.mark.slow
+@pytest.mark.e2e_cpu
 def test_absolute_bind_mount(tmp_path: Path) -> None:
     _run_and_verify_exit_code_zero(
         [
@@ -384,11 +432,13 @@ def test_image_pull_after_remove() -> None:
 @pytest.mark.e2e_cpu
 def test_killed_pending_command_terminates() -> None:
     # Specify an outrageous number of slots to be sure that it can't be scheduled.
+    # NB: slot # higher than postgres smallint (i.e. 32k) is rejected outright.
     with cmd.interactive_command(
-        "cmd", "run", "--config", "resources.slots=1048576", "sleep infinity"
+        "cmd", "run", "--config", "resources.slots=10485", "sleep infinity"
     ) as command:
+        assert command.task_id is not None
         for _ in range(10):
-            assert cmd.get_command(command.task_id)["state"] == "STATE_PENDING"
+            assert cmd.get_command(command.task_id)["state"] == "STATE_QUEUED"
             time.sleep(1)
 
     # The command is killed when the context is exited; now it should reach TERMINATED soon.
@@ -434,7 +484,7 @@ def test_k8_mount(using_k8s: bool, sidecar: bool) -> None:
     if sidecar:
         sidecar_container = {
             "name": "sidecar",
-            "image": conf.TF1_CPU_IMAGE,
+            "image": conf.TF2_CPU_IMAGE,
             "command": ["/bin/bash"],
             "args": ["-c", "exit 0"],
         }
@@ -512,3 +562,62 @@ def test_k8_sidecars(using_k8s: bool) -> None:
         )
 
         _run_cmd_with_config_expecting_success(cmd="sleep 3", config=config)
+
+
+@pytest.mark.e2e_gpu
+@pytest.mark.parametrize("slots", [0, 1])
+def test_k8_resource_limits(using_k8s: bool, slots: int) -> None:
+    if not using_k8s:
+        pytest.skip("only need to run test on kubernetes")
+
+    config = {
+        "environment": {
+            "pod_spec": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "determined-container",
+                            "resources": {
+                                "requests": {
+                                    "cpu": 0.1,
+                                    "memory": "1Gi",
+                                },
+                                "limits": {
+                                    "cpu": 1,
+                                    "memory": "1Gi",
+                                },
+                            },
+                        }
+                    ],
+                }
+            }
+        },
+        "resources": {
+            "slots": slots,
+        },
+    }
+
+    _run_cmd_with_config_expecting_success(cmd="sleep 3; echo hello", config=config)
+
+
+@pytest.mark.e2e_cpu
+def test_log_wait_timeout(tmp_path: Path, secrets: Dict[str, str]) -> None:
+    # Start a subshell that prints after 5 and 20 seconds, then exit.
+    cmd = 'sh -c "sleep 5; echo after 5; sleep 15; echo after 20" & echo main shell exiting'
+
+    config = {"environment": {"environment_variables": ["DET_LOG_WAIT_TIME=10"]}}
+    with tempfile.NamedTemporaryFile() as tf:
+        with open(tf.name, "w") as f:
+            yaml.dump(config, f)
+
+        cli = ["det", "-m", conf.make_master_url(), "cmd", "run", "--config-file", tf.name, cmd]
+        p = subprocess.run(cli, stdout=subprocess.PIPE, check=True)
+        assert p.stdout is not None
+        stdout = p.stdout.decode("utf8")
+
+    # Logs should wait for the main process to die, plus 10 seconds, then shut down.
+    # That should capture the "after 5" but not the "after 60".
+    # By making the "after 20" occur before the default DET_LOG_WAIT_TIME of 30, we also are testing
+    # that the escape hatch keeps working.
+    assert "after 5" in stdout, stdout
+    assert "after 20" not in stdout, stdout

@@ -48,7 +48,7 @@ def numpify(x: Union[List, np.ndarray, torch.Tensor]) -> np.ndarray:
     if isinstance(x, List):
         return np.array(x)
     if isinstance(x, torch.Tensor):
-        return x.cpu().numpy()
+        return x.cpu().numpy()  # type: ignore
     raise TypeError("Expected input of type List, np.ndarray, or torch.Tensor.")
 
 

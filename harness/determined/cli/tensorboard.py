@@ -1,42 +1,47 @@
-import sys
-from argparse import ONE_OR_MORE, FileType, Namespace
+from argparse import ONE_OR_MORE, ArgumentError, FileType, Namespace
+from functools import partial
 from pathlib import Path
 from typing import Any, List
 
 from termcolor import colored
 
+from determined import cli
 from determined.cli import command, task
-from determined.common import api, constants, context
-from determined.common.api import authentication
+from determined.common import api, context
+from determined.common.api import authentication, bindings, request
 from determined.common.check import check_eq
-from determined.common.declarative_argparse import Arg, Cmd
-
-from .command import CONFIG_DESC, CONTEXT_DESC, parse_config, render_event_stream
+from determined.common.declarative_argparse import Arg, Cmd, Group
 
 
 @authentication.required
 def start_tensorboard(args: Namespace) -> None:
-    if args.trial_ids is None and args.experiment_ids is None:
-        print("Either experiment_ids or trial_ids must be specified.")
-        sys.exit(1)
+    if not (args.trial_ids or args.experiment_ids):
+        raise ArgumentError(None, "Either experiment_ids or trial_ids must be specified.")
 
-    config = parse_config(args.config_file, None, args.config, [])
-    req_body = {
-        "config": config,
-        "trial_ids": args.trial_ids,
-        "experiment_ids": args.experiment_ids,
-    }
+    config = command.parse_config(args.config_file, None, args.config, [])
 
-    if args.context is not None:
-        req_body["files"], _ = context.read_context(args.context, constants.MAX_CONTEXT_SIZE)
+    workspace_id = cli.workspace.get_workspace_id_from_args(args)
 
-    resp = api.post(args.master, "api/v1/tensorboards", json=req_body).json()["tensorboard"]
+    body = bindings.v1LaunchTensorboardRequest(
+        config=config,
+        trialIds=args.trial_ids,
+        experimentIds=args.experiment_ids,
+        files=context.read_v1_context(args.context, args.include),
+        workspaceId=workspace_id,
+    )
+
+    resp = bindings.post_LaunchTensorboard(cli.setup_session(args), body=body)
 
     if args.detach:
-        print(resp["id"])
+        print(resp.tensorboard.id)
         return
 
-    url = "tensorboard/{}/events".format(resp["id"])
+    if resp.warnings:
+        cli.print_warnings(resp.warnings)
+    currentSlotsExceeded = (resp.warnings is not None) and (
+        bindings.v1LaunchWarning.CURRENT_SLOTS_EXCEEDED in resp.warnings
+    )
+    url = "tensorboard/{}/events".format(resp.tensorboard.id)
     with api.ws(args.master, url) as ws:
         for msg in ws:
             if msg["log_event"] is not None:
@@ -45,16 +50,26 @@ def start_tensorboard(args: Namespace) -> None:
                 if "http" in msg["log_event"]:
                     continue
 
-            if msg["service_ready_event"]:
+            if msg["service_ready_event"] and resp.tensorboard.serviceAddress is not None:
                 if args.no_browser:
-                    url = api.make_url(args.master, resp["serviceAddress"])
+                    url = api.make_url(args.master, resp.tensorboard.serviceAddress)
                 else:
-                    url = api.browser_open(args.master, resp["serviceAddress"])
+                    url = api.browser_open(
+                        args.master,
+                        request.make_interactive_task_url(
+                            task_id=resp.tensorboard.id,
+                            service_address=resp.tensorboard.serviceAddress,
+                            resource_pool=resp.tensorboard.resourcePool,
+                            description=resp.tensorboard.description,
+                            task_type="tensorboard",
+                            currentSlotsExceeded=currentSlotsExceeded,
+                        ),
+                    )
 
                 print(colored("TensorBoard is running at: {}".format(url), "green"))
-                render_event_stream(msg)
+                command.render_event_stream(msg)
                 break
-            render_event_stream(msg)
+            command.render_event_stream(msg)
 
 
 @authentication.required
@@ -64,18 +79,30 @@ def open_tensorboard(args: Namespace) -> None:
         "tensorboard"
     ]
     check_eq(resp["state"], "STATE_RUNNING", "TensorBoard must be in a running state")
-    api.browser_open(args.master, resp["serviceAddress"])
+    api.browser_open(
+        args.master,
+        request.make_interactive_task_url(
+            task_id=resp["id"],
+            service_address=resp["serviceAddress"],
+            resource_pool=resp["resourcePool"],
+            description=resp["description"],
+            task_type="tensorboard",
+            currentSlotsExceeded=False,
+        ),
+    )
 
 
 # fmt: off
 
 args_description = [
     Cmd("tensorboard", None, "manage TensorBoard instances", [
-        Cmd("list ls", command.list_tasks, "list TensorBoard instances", [
+        Cmd("list ls", partial(command.list_tasks), "list TensorBoard instances", [
             Arg("-q", "--quiet", action="store_true",
                 help="only display the IDs"),
             Arg("--all", "-a", action="store_true",
-                help="show all TensorBoards (including other users')")
+                help="show all TensorBoards (including other users')"),
+            cli.workspace.workspace_arg,
+            Group(cli.output_format_args["json"], cli.output_format_args["csv"]),
         ], is_default=True),
         Cmd("start", start_tensorboard, "start new TensorBoard instance", [
             Arg("experiment_ids", type=int, nargs="*",
@@ -86,34 +113,43 @@ args_description = [
             Arg("-t", "--trial-ids", nargs=ONE_OR_MORE, type=int,
                 help="trial IDs to load into TensorBoard; at most 100 trials are "
                      "allowed per TensorBoard instance"),
+            cli.workspace.workspace_arg,
             Arg("--config-file", default=None, type=FileType("r"),
                 help="command config file (.yaml)"),
-            Arg("-c", "--context", default=None, type=Path, help=CONTEXT_DESC),
-            Arg("--config", action="append", default=[], help=CONFIG_DESC),
+            Arg("-c", "--context", default=None, type=Path, help=command.CONTEXT_DESC),
+            Arg(
+                "-i",
+                "--include",
+                default=[],
+                action="append",
+                type=Path,
+                help=command.INCLUDE_DESC
+            ),
+            Arg("--config", action="append", default=[], help=command.CONFIG_DESC),
             Arg("--no-browser", action="store_true",
                 help="don't open TensorBoard in a browser after startup"),
             Arg("-d", "--detach", action="store_true",
                 help="run in the background and print the ID")
         ]),
-        Cmd("config", command.config,
+        Cmd("config", partial(command.config),
             "display TensorBoard config", [
                 Arg("tensorboard_id", type=str, help="TensorBoard ID")
-            ]),
+        ]),
         Cmd("open", open_tensorboard,
             "open existing TensorBoard instance", [
                 Arg("tensorboard_id", help="TensorBoard ID")
             ]),
-        Cmd("logs", lambda *args, **kwargs: task.logs(*args, **kwargs),
+        Cmd("logs", partial(task.logs),
             "fetch TensorBoard instance logs", [
             Arg("task_id", help="TensorBoard ID", metavar="tensorboard_id"),
             *task.common_log_options,
         ]),
-        Cmd("kill", command.kill, "kill TensorBoard instance", [
+        Cmd("kill", partial(command.kill), "kill TensorBoard instance", [
             Arg("tensorboard_id", help="TensorBoard ID", nargs=ONE_OR_MORE),
             Arg("-f", "--force", action="store_true", help="ignore errors"),
         ]),
         Cmd("set", None, "set TensorBoard attributes", [
-            Cmd("priority", command.set_priority, "set TensorBoard priority", [
+            Cmd("priority", partial(command.set_priority), "set TensorBoard priority", [
                 Arg("tensorboard_id", help="TensorBoard ID"),
                 Arg("priority", type=int, help="priority"),
             ]),

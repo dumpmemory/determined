@@ -1,4 +1,5 @@
 import json as _json
+import os
 import webbrowser
 from types import TracebackType
 from typing import Any, Dict, Iterator, Optional, Tuple, Union
@@ -6,6 +7,7 @@ from urllib import parse
 
 import lomond
 import requests
+import urllib3
 
 import determined as det
 import determined.common.requests
@@ -41,23 +43,34 @@ def maybe_upgrade_ws_scheme(master_address: str) -> str:
         return master_address
 
 
-def add_token_to_headers(
-    headers: Dict[str, str],
-    auth: Optional[authentication.Authentication],
-) -> Dict[str, str]:
-    # Try to get user token first since it will include the user token that is used
-    # for queries in some restful APIs.
-    user_token = ""
-    if auth is not None:
-        user_token = auth.get_session_token()
-    if user_token:
-        return {**headers, "Authorization": "Bearer {}".format(user_token)}
-
-    allocation_token = authentication.get_allocation_token()
-    if allocation_token:
-        return {**headers, "Grpc-Metadata-x-allocation-token": "Bearer {}".format(allocation_token)}
-
-    return headers
+def make_interactive_task_url(
+    task_id: str,
+    service_address: str,
+    description: str,
+    resource_pool: str,
+    task_type: str,
+    currentSlotsExceeded: bool,
+) -> str:
+    wait_path = (
+        "/notebooks/{}/events".format(task_id)
+        if task_type == "notebook"
+        else "/tensorboard/{}/events?tail=1".format(task_id)
+    )
+    wait_path_url = service_address + wait_path
+    public_url = os.environ.get("PUBLIC_URL", "/det")
+    wait_page_url = "{}/wait/{}/{}?eventUrl={}&serviceAddr={}".format(
+        public_url, task_type, task_id, wait_path_url, service_address
+    )
+    task_web_url = "{}/interactive/{}/{}/{}/{}/{}?{}".format(
+        public_url,
+        task_id,
+        task_type,
+        parse.quote(description),
+        resource_pool,
+        parse.quote_plus(wait_page_url),
+        f"currentSlotsExceeded={str(currentSlotsExceeded).lower()}",
+    )
+    return task_web_url
 
 
 def do_request(
@@ -73,23 +86,40 @@ def do_request(
     cert: Optional[certs.Cert] = None,
     stream: bool = False,
     timeout: Optional[Union[Tuple, float]] = None,
+    max_retries: Optional[urllib3.util.retry.Retry] = None,
 ) -> requests.Response:
-    # If no explicit Authentication object was provided, use the cli's singleton Authentication.
-    if auth is None:
-        auth = authentication.cli_auth
-    if cert is None:
-        cert = certs.cli_cert
-
     if headers is None:
-        h = {}  # type: Dict[str, str]
+        h: Dict[str, str] = {}
     else:
         h = headers
 
+    if cert is None:
+        cert = certs.cli_cert
+
+    # set the token and username based on this order:
+    # - argument `auth`
+    # - header `Authorization`
+    # - existing cli_auth
+    # - allocation_token
+
+    username = ""
+    if auth is not None:
+        if authenticated:
+            h["Authorization"] = "Bearer {}".format(auth.get_session_token())
+        username = auth.get_session_user()
+    elif h.get("Authorization") is not None:
+        pass
+    elif authentication.cli_auth is not None:
+        if authenticated:
+            h["Authorization"] = "Bearer {}".format(authentication.cli_auth.get_session_token())
+        username = authentication.cli_auth.get_session_user()
+    elif authenticated and h.get("Grpc-Metadata-x-allocation-token") is None:
+        allocation_token = authentication.get_allocation_token()
+        if allocation_token:
+            h["Grpc-Metadata-x-allocation-token"] = "Bearer {}".format(allocation_token)
+
     if params is None:
         params = {}
-
-    if authenticated:
-        h = add_token_to_headers(h, auth)
 
     # Allow the json json to come pre-encoded, if we need custom encoding.
     if json is not None and data is not None:
@@ -109,6 +139,7 @@ def do_request(
             stream=stream,
             timeout=timeout,
             server_hostname=cert.name if cert else None,
+            max_retries=max_retries,
         )
     except requests.exceptions.SSLError:
         raise
@@ -117,17 +148,21 @@ def do_request(
     except requests.exceptions.RequestException as e:
         raise errors.BadRequestException(str(e))
 
-    def _get_message(r: requests.models.Response) -> str:
+    def _get_error_str(r: requests.models.Response) -> str:
         try:
-            return str(_json.loads(r.text).get("message"))
+            json_resp = _json.loads(r.text)
+            mes = json_resp.get("message")
+            if mes is not None:
+                return str(mes)
+            # Try getting GRPC error description if message does not exist.
+            return str(json_resp.get("error").get("error"))
         except Exception:
             return ""
 
     if r.status_code == 403:
-        username = ""
-        if auth is not None:
-            username = auth.get_session_user()
-        raise errors.ForbiddenException(username=username, message=_get_message(r))
+        raise errors.ForbiddenException(username=username, message=_get_error_str(r))
+    if r.status_code == 401:
+        raise errors.UnauthenticatedException(username=username)
     elif r.status_code == 404:
         raise errors.NotFoundException(r)
     elif r.status_code >= 300:

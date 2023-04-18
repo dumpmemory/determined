@@ -10,7 +10,6 @@ import requests_mock
 
 from determined.common.api.authentication import Authentication, TokenStore
 from determined.common.api.certs import default_load as certs_default_load
-from determined.common.api.errors import UnauthenticatedException
 from tests.confdir import use_test_config_dir
 
 MOCK_MASTER_URL = "http://localhost:8080"
@@ -30,13 +29,6 @@ AUTH_JSON = {
 }
 
 
-@pytest.mark.parametrize("user", [None, "Bob"])
-def test_auth_no_store_no_reauth(user: Optional[str]) -> None:
-    with use_test_config_dir():
-        with pytest.raises(UnauthenticatedException):
-            Authentication(MOCK_MASTER_URL, user)
-
-
 @pytest.mark.parametrize("user", [None, "bob", "determined"])
 def test_auth_with_store(requests_mock: requests_mock.Mocker, user: Optional[str]) -> None:
     with use_test_config_dir() as config_dir:
@@ -47,7 +39,7 @@ def test_auth_with_store(requests_mock: requests_mock.Mocker, user: Optional[str
         expected_user = "determined" if user == "determined" else "bob"
         expected_token = "det.token" if user == "determined" else "bob.token"
         requests_mock.get(
-            "/users/me",
+            "/api/v1/me",
             status_code=200,
             json={"username": expected_user},
         )
@@ -78,7 +70,7 @@ def test_auth_user_from_env(
             with open(auth_json_path, "w") as f:
                 json.dump(AUTH_JSON, f)
 
-        requests_mock.get("/users/me", status_code=200, json={"username": "alice"})
+        requests_mock.get("/api/v1/me", status_code=200, json={"username": "alice"})
 
         authentication = Authentication(MOCK_MASTER_URL, user)
         if has_token_store:

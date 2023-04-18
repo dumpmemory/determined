@@ -1,22 +1,27 @@
-import React, { PropsWithChildren } from 'react';
+import { useObservable } from 'micro-observables';
+import React from 'react';
 
-import Logo, { LogoType } from 'components/Logo';
+import Logo, { Orientation } from 'components/Logo';
 import Page from 'components/Page';
-import { useStore } from 'contexts/Store';
+import determinedStore, { BrandingType } from 'stores/determinedInfo';
 
 import css from './PageMessage.module.scss';
 
-interface Props extends PropsWithChildren<unknown> {
+interface Props {
+  children: React.ReactNode;
   title: string;
 }
 
 const PageMessage: React.FC<Props> = ({ title, children }: Props) => {
-  const { info } = useStore();
-  return(
+  const info = useObservable(determinedStore.info);
+  return (
     <Page docTitle={title}>
       <div className={css.base}>
         <div className={css.content}>
-          <Logo branding={info.branding} type={LogoType.OnLightVertical} />
+          <Logo
+            branding={info.branding || BrandingType.Determined}
+            orientation={Orientation.Vertical}
+          />
           {children}
         </div>
       </div>

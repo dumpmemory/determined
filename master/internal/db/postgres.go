@@ -19,10 +19,30 @@ import (
 	"github.com/determined-ai/determined/master/pkg/model"
 )
 
-var bunMutex sync.Mutex
-var theOneBun *bun.DB
+var (
+	bunMutex         sync.Mutex
+	theOneBun        *bun.DB
+	theOneDB         *PgDB
+	modelsToRegister []interface{} // TODO (eliu): currently allows duplicate models
+	tokenKeys        *model.AuthTokenKeypair
+)
 
-func initTheOneBun(db *sql.DB) {
+const id = "id"
+
+// RegisterModel registers a model in Bun or, if theOneBun is not yet initialized,
+// sets it up to be registered once initialized. It's generally best to pass a nil
+// pointer of your model's type as argument m.
+func RegisterModel(m interface{}) {
+	bunMutex.Lock()
+	defer bunMutex.Unlock()
+
+	if theOneBun != nil {
+		theOneBun.RegisterModel(m)
+	}
+	modelsToRegister = append(modelsToRegister, m)
+}
+
+func initTheOneBun(db *PgDB) {
 	bunMutex.Lock()
 	defer bunMutex.Unlock()
 	if theOneBun != nil {
@@ -30,7 +50,12 @@ func initTheOneBun(db *sql.DB) {
 			"detected re-initialization of Bun that should never occur outside of tests",
 		)
 	}
-	theOneBun = bun.NewDB(db, pgdialect.New())
+	theOneBun = bun.NewDB(db.sql.DB, pgdialect.New())
+	theOneDB = db
+
+	for _, m := range modelsToRegister {
+		theOneBun.RegisterModel(m)
+	}
 
 	// This will print every query that runs.
 	// theOneBun.AddQueryHook(bundebug.NewQueryHook(bundebug.WithVerbose(true)))
@@ -39,8 +64,20 @@ func initTheOneBun(db *sql.DB) {
 	theOneBun.AddQueryHook(bundebug.NewQueryHook())
 }
 
+func setTokenKeys(tk *model.AuthTokenKeypair) {
+	bunMutex.Lock()
+	defer bunMutex.Unlock()
+
+	tokenKeys = tk
+}
+
+// GetTokenKeys returns tokenKeys.
+func GetTokenKeys() *model.AuthTokenKeypair {
+	return tokenKeys
+}
+
 // Bun returns the singleton database connection through the bun library. bun is the database
-// library we we have decided to use for new code in the future due to its superior composability
+// library we have decided to use for new code in the future due to its superior composability
 // over bare SQL, and its superior flexibility over e.g. gorm.  New code should not use the old bare
 // SQL tooling.
 func Bun() *bun.DB {
@@ -48,6 +85,85 @@ func Bun() *bun.DB {
 		panic("Bun is not yet initialized!  Did you use the database before initializing it?")
 	}
 	return theOneBun
+}
+
+// SingleDB returns a singleton database client. Bun() should be preferred over this for all new
+// queries.
+func SingleDB() *PgDB {
+	if theOneDB == nil {
+		panic("DB is not yet initialized!  Did you use the database before initializing it?")
+	}
+	return theOneDB
+}
+
+// SortDirection represents the order by in a query.
+type SortDirection string
+
+const (
+	// SortDirectionAsc represents ordering by ascending.
+	SortDirectionAsc SortDirection = "ASC"
+	// SortDirectionDesc represents ordering by descending.
+	SortDirectionDesc SortDirection = "DESC"
+	// SortDirectionAscNullsFirst represents ordering by ascending with nulls first.
+	SortDirectionAscNullsFirst SortDirection = "ASC NULLS FIRST"
+	// SortDirectionDescNullsLast represents ordering by descending with nulls last.
+	SortDirectionDescNullsLast SortDirection = "DESC NULLS LAST"
+)
+
+// PaginateBun adds sorting and pagination to the provided bun query, defaulting to certain values
+// if they are not specified. By default, we order by ascending on the id column, with no limit.
+func PaginateBun(
+	query *bun.SelectQuery,
+	orderColumn string,
+	direction SortDirection,
+	offset,
+	limit int,
+) *bun.SelectQuery {
+	if orderColumn == "" {
+		orderColumn = id
+	}
+	if len(direction) == 0 {
+		direction = SortDirectionAsc
+	}
+	orderExp := fmt.Sprintf("%s %s", orderColumn, direction)
+
+	query = query.Order(orderExp)
+
+	query = query.Offset(offset)
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	return query
+}
+
+// PaginateBunUnsafe is a version of PaginateBun that
+// allows an arbitrary order expression like `metrics->>'loss'`.
+func PaginateBunUnsafe(
+	query *bun.SelectQuery,
+	orderColumn string,
+	direction SortDirection,
+	offset,
+	limit int,
+) *bun.SelectQuery {
+	if orderColumn == "" {
+		orderColumn = id
+	}
+	if len(direction) == 0 {
+		direction = SortDirectionAsc
+	}
+	orderExp := fmt.Sprintf("%s %s", orderColumn, direction)
+
+	query = query.OrderExpr(orderExp)
+
+	query = query.Offset(offset)
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	return query
 }
 
 // PgDB represents a Postgres database connection.  The type definition is needed to define methods.
@@ -64,8 +180,9 @@ func ConnectPostgres(url string) (*PgDB, error) {
 	for {
 		sql, err := sqlx.Connect("pgx", url)
 		if err == nil {
-			initTheOneBun(sql.DB)
-			return &PgDB{sql: sql, queries: &staticQueryMap{queries: make(map[string]string)}, url: url}, err
+			db := &PgDB{sql: sql, queries: &staticQueryMap{queries: make(map[string]string)}, url: url}
+			initTheOneBun(db)
+			return db, nil
 		}
 		numTries++
 		if numTries >= 15 {
@@ -78,10 +195,14 @@ func ConnectPostgres(url string) (*PgDB, error) {
 }
 
 const (
-	// uniqueViolation is the error code that Postgres uses to indicate that an attempted insert/update
-	// violates a uniqueness constraint.  Obtained from:
+	// CodeUniqueViolation is the error code that Postgres uses to indicate that an attempted
+	// insert/update violates a uniqueness constraint.  Obtained from:
 	// https://www.postgresql.org/docs/10/errcodes-appendix.html
-	uniqueViolation = "23505"
+	CodeUniqueViolation = "23505"
+	// CodeForeignKeyViolation is the error code that Postgres uses to indicate that an attempted
+	// insert/update violates a foreign key constraint.  Obtained from:
+	// https://www.postgresql.org/docs/10/errcodes-appendix.html
+	CodeForeignKeyViolation = "23503"
 )
 
 // Close closes the underlying pq connection.
@@ -95,6 +216,9 @@ func (db *PgDB) namedGet(dest interface{}, query string, arg interface{}) error 
 	if err != nil {
 		return errors.Wrapf(err, "error preparing query %s", query)
 	}
+
+	defer nstmt.Close()
+
 	if sErr := nstmt.QueryRowx(arg).Scan(dest); sErr != nil {
 		err = errors.Wrapf(sErr, "error scanning query %s", query)
 	}
@@ -122,22 +246,6 @@ func (db *PgDB) namedExecOne(query string, arg interface{}) error {
 		return errors.Errorf("error: %v rows affected on query %v \narg %v", num, query, arg)
 	}
 	return nil
-}
-
-// namedGet is a convenience method for a named query for a single value.
-func namedGet(tx *sqlx.Tx, dest interface{}, query string, arg interface{}) error {
-	nstmt, err := tx.PrepareNamed(query)
-	if err != nil {
-		return errors.Wrapf(err, "error preparing query %s", query)
-	}
-	if sErr := nstmt.QueryRowx(arg).Scan(dest); sErr != nil {
-		err = errors.Wrapf(sErr, "error scanning query %s", query)
-	}
-	if cErr := nstmt.Close(); cErr != nil && err != nil {
-		err = errors.Wrap(cErr, "error closing named DB statement")
-	}
-
-	return err
 }
 
 // namedExecOne is a convenience method for a NamedExec that should affect only one row.
@@ -209,7 +317,11 @@ func (db *PgDB) queryRowsWithParser(
 	if err != nil {
 		return err
 	}
+
+	// Defer once now, ignoring errors, to ensure cleanup occurs.  Also close at the end, capturing
+	// the error, to ensure we don't drop any errors.
 	defer rows.Close()
+
 	vType := reflect.TypeOf(v).Elem()
 	switch kind := vType.Kind(); kind {
 	case reflect.Slice:
@@ -220,13 +332,13 @@ func (db *PgDB) queryRowsWithParser(
 			case reflect.Ptr:
 				sValue := reflect.New(vValue.Type().Elem().Elem())
 				if err = p(rows, sValue.Interface()); err != nil {
-					return err
+					return errors.Wrap(err, "queryRowsWithParser[ptr]")
 				}
 				vValue = reflect.Append(vValue, sValue)
 			case reflect.Struct:
 				sValue := reflect.New(vValue.Type().Elem())
 				if err = p(rows, sValue.Interface()); err != nil {
-					return err
+					return errors.Wrap(err, "queryRowsWithParser[struct]")
 				}
 				vValue = reflect.Append(vValue, sValue.Elem())
 			default:
@@ -234,15 +346,22 @@ func (db *PgDB) queryRowsWithParser(
 			}
 		}
 		reflect.ValueOf(v).Elem().Set(vValue)
-		return nil
 	case reflect.Struct:
-		if rows.Next() {
-			return p(rows, v)
+		if !rows.Next() {
+			return ErrNotFound
 		}
-		return ErrNotFound
+		if err = p(rows, v); err != nil {
+			return err
+		}
 	default:
 		panic(fmt.Sprintf("unsupported query type: %s", kind))
 	}
+
+	if err := rows.Close(); err != nil { //nolint: sqlclosecheck
+		return errors.Wrapf(err, "rows.Close()")
+	}
+
+	return nil
 }
 
 // Query returns the result of the query. Any placeholder parameters are replaced
@@ -255,7 +374,8 @@ func (db *PgDB) Query(queryName string, v interface{}, params ...interface{}) er
 // QueryF returns the result of the formatted query. Any placeholder parameters are replaced
 // with supplied params.
 func (db *PgDB) QueryF(
-	queryName string, args []interface{}, v interface{}, params ...interface{}) error {
+	queryName string, args []interface{}, v interface{}, params ...interface{},
+) error {
 	parser := func(rows *sqlx.Rows, val interface{}) error { return rows.StructScan(val) }
 	query := db.queries.getOrLoad(queryName)
 	if len(args) > 0 {

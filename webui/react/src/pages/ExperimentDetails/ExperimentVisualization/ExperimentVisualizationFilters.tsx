@@ -1,62 +1,80 @@
-import { Select } from 'antd';
-import { SelectValue } from 'antd/es/select';
+import { Tooltip } from 'antd';
 import React, { useCallback, useEffect, useMemo, useReducer } from 'react';
 
-import HpSelectFilter from 'components/HpSelectFilter';
-import IconButton from 'components/IconButton';
-import MetricSelectFilter from 'components/MetricSelectFilter';
+import HpSelect from 'components/HpSelect';
+import Button from 'components/kit/Button';
+import Select, { Option, SelectValue } from 'components/kit/Select';
+import MetricSelect from 'components/MetricSelect';
 import RadioGroup from 'components/RadioGroup';
-import SelectFilter from 'components/SelectFilter';
-import { ExperimentVisualizationType, HpImportance, MetricName } from 'types';
+import ScaleSelect from 'components/ScaleSelect';
+import Icon from 'shared/components/Icon';
+import { ValueOf } from 'shared/types';
+import { Metric, Scale } from 'types';
+
+import { ExperimentVisualizationType } from '../ExperimentVisualization';
 
 import css from './ExperimentVisualizationFilters.module.scss';
-
-const { Option } = Select;
 
 export interface VisualizationFilters {
   batch: number;
   batchMargin: number;
   hParams: string[];
   maxTrial: number;
-  metric: MetricName;
+  metric: Metric | null;
+  scale: Scale;
   view: ViewType;
 }
 
-export enum FilterError {
-  MetricBatches,
-  MetricNames,
-}
+export const FilterError = {
+  MetricBatches: 'MetricBatches',
+  Metrics: 'Metrics',
+} as const;
 
-export enum ViewType {
-  Grid = 'grid',
-  List = 'list',
-}
+export type FilterError = ValueOf<typeof FilterError>;
+
+export const ViewType = {
+  Grid: 'grid',
+  List: 'list',
+} as const;
+
+export type ViewType = ValueOf<typeof ViewType>;
 
 interface Props {
   batches: number[];
   filters: VisualizationFilters;
   fullHParams: string[];
-  hpImportance?: HpImportance;
-  metrics: MetricName[];
+  metrics: Metric[];
   onChange?: (filters: VisualizationFilters) => void;
-  onMetricChange?: (metric: MetricName) => void;
+  onMetricChange?: (metric: Metric) => void;
   onReset?: () => void;
-  type: ExperimentVisualizationType,
+  type: ExperimentVisualizationType;
 }
 
-enum ActionType { Set, SetBatch, SetBatchMargin, SetHParams, SetMaxTrial, SetMetric, SetView }
+const ActionType = {
+  Set: 0,
+  SetBatch: 1,
+  SetBatchMargin: 2,
+  SetHParams: 3,
+  SetMaxTrial: 4,
+  SetMetric: 5,
+  SetScale: 6,
+  SetView: 7,
+} as const;
+
+type ActionType = ValueOf<typeof ActionType>;
 
 type Action =
-| { type: ActionType.Set; value: VisualizationFilters }
-| { type: ActionType.SetBatch; value: number }
-| { type: ActionType.SetBatchMargin; value: number }
-| { type: ActionType.SetHParams; value: string[] }
-| { type: ActionType.SetMaxTrial; value: number }
-| { type: ActionType.SetMetric; value: MetricName }
-| { type: ActionType.SetView; value: ViewType }
+  | { type: typeof ActionType.Set; value: VisualizationFilters }
+  | { type: typeof ActionType.SetBatch; value: number }
+  | { type: typeof ActionType.SetBatchMargin; value: number }
+  | { type: typeof ActionType.SetHParams; value: string[] }
+  | { type: typeof ActionType.SetMaxTrial; value: number }
+  | { type: typeof ActionType.SetMetric; value: Metric }
+  | { type: typeof ActionType.SetView; value: ViewType }
+  | { type: typeof ActionType.SetScale; value: Scale };
 
-const TOP_TRIALS_OPTIONS = [ 1, 10, 20, 50, 100 ];
-const BATCH_MARGIN_OPTIONS = [ 1, 5, 10, 20, 50 ];
+const TOP_TRIALS_OPTIONS = [1, 10, 20, 50, 100];
+const BATCH_MARGIN_OPTIONS = [1, 5, 10, 20, 50];
 
 export const MAX_HPARAM_COUNT = 10;
 
@@ -76,6 +94,8 @@ const reducer = (state: VisualizationFilters, action: Action) => {
       return { ...state, metric: action.value };
     case ActionType.SetView:
       return { ...state, view: action.value };
+    case ActionType.SetScale:
+      return { ...state, scale: action.value };
     default:
       return state;
   }
@@ -85,37 +105,39 @@ const ExperimentVisualizationFilters: React.FC<Props> = ({
   batches,
   filters,
   fullHParams,
-  hpImportance,
   metrics,
   onChange,
   onMetricChange,
   onReset,
   type,
 }: Props) => {
-  const [ localFilters, dispatch ] = useReducer(reducer, filters);
+  const [localFilters, dispatch] = useReducer(reducer, filters);
 
-  const [ showMaxTrials, showBatches, showMetrics, showHParams, showViews ] = useMemo(() => {
-    return [
-      [ ExperimentVisualizationType.LearningCurve ].includes(type),
-      [
-        ExperimentVisualizationType.HpHeatMap,
-        ExperimentVisualizationType.HpParallelCoordinates,
-        ExperimentVisualizationType.HpScatterPlots,
-      ].includes(type),
-      [
-        ExperimentVisualizationType.HpHeatMap,
-        ExperimentVisualizationType.HpParallelCoordinates,
-        ExperimentVisualizationType.HpScatterPlots,
-        ExperimentVisualizationType.LearningCurve,
-      ].includes(type),
-      [
-        ExperimentVisualizationType.HpHeatMap,
-        ExperimentVisualizationType.HpParallelCoordinates,
-        ExperimentVisualizationType.HpScatterPlots,
-      ].includes(type),
-      [ ExperimentVisualizationType.HpHeatMap ].includes(type),
-    ];
-  }, [ type ]);
+  const [showMaxTrials, showBatches, showMetrics, showHParams, showViews, showScales] =
+    useMemo(() => {
+      return [
+        ExperimentVisualizationType.LearningCurve === type,
+        ExperimentVisualizationType.HpHeatMap === type ||
+          ExperimentVisualizationType.HpParallelCoordinates === type ||
+          ExperimentVisualizationType.HpScatterPlots === type,
+        [
+          ExperimentVisualizationType.HpHeatMap,
+          ExperimentVisualizationType.HpParallelCoordinates,
+          ExperimentVisualizationType.HpScatterPlots,
+          ExperimentVisualizationType.LearningCurve,
+        ].includes(type),
+        ExperimentVisualizationType.HpHeatMap === type ||
+          ExperimentVisualizationType.HpParallelCoordinates === type ||
+          ExperimentVisualizationType.HpScatterPlots === type,
+        ExperimentVisualizationType.HpHeatMap === type,
+        [
+          ExperimentVisualizationType.HpHeatMap,
+          ExperimentVisualizationType.HpScatterPlots,
+          ExperimentVisualizationType.LearningCurve,
+          ExperimentVisualizationType.HpParallelCoordinates,
+        ].includes(type),
+      ];
+    }, [type]);
 
   const handleBatchChange = useCallback((batch: SelectValue) => {
     dispatch({ type: ActionType.SetBatch, value: batch as number });
@@ -125,99 +147,113 @@ const ExperimentVisualizationFilters: React.FC<Props> = ({
     dispatch({ type: ActionType.SetBatchMargin, value: margin as number });
   }, []);
 
-  const handleHParamChange = useCallback((hParams?: SelectValue) => {
-    if (!hParams || (Array.isArray(hParams) && hParams.length === 0)) {
-      dispatch({ type: ActionType.SetHParams, value: fullHParams.slice(0, MAX_HPARAM_COUNT) });
-    } else {
-      dispatch({ type: ActionType.SetHParams, value: hParams as string[] });
-    }
-  }, [ fullHParams ]);
+  const handleHParamChange = useCallback(
+    (hParams?: SelectValue) => {
+      if (!hParams || (Array.isArray(hParams) && hParams.length === 0)) {
+        dispatch({ type: ActionType.SetHParams, value: fullHParams.slice(0, MAX_HPARAM_COUNT) });
+      } else {
+        dispatch({ type: ActionType.SetHParams, value: hParams as string[] });
+      }
+    },
+    [fullHParams],
+  );
 
   const handleMaxTrialsChange = useCallback((count: SelectValue) => {
     dispatch({ type: ActionType.SetMaxTrial, value: count as number });
   }, []);
 
-  const handleMetricChange = useCallback((metric: MetricName) => {
-    dispatch({ type: ActionType.SetMetric, value: metric });
-    if (onMetricChange) onMetricChange(metric);
-  }, [ onMetricChange ]);
+  const handleMetricChange = useCallback(
+    (metric: Metric) => {
+      dispatch({ type: ActionType.SetMetric, value: metric });
+      if (onMetricChange) onMetricChange(metric);
+    },
+    [onMetricChange],
+  );
 
   const handleViewChange = useCallback((view: SelectValue) => {
     dispatch({ type: ActionType.SetView, value: view as ViewType });
   }, []);
 
-  const handleApply = useCallback(() => {
+  const handleScaleChange = useCallback((scale: Scale) => {
+    dispatch({ type: ActionType.SetScale, value: scale });
+  }, []);
+
+  useEffect(() => {
     if (onChange) onChange(localFilters);
-  }, [ localFilters, onChange ]);
+  }, [localFilters, onChange]);
 
   const handleReset = useCallback(() => {
     dispatch({ type: ActionType.Set, value: filters });
     if (onReset) onReset();
-  }, [ filters, onReset ]);
+  }, [filters, onReset]);
 
   // Pick the first valid option if the current local batch is invalid.
   useEffect(() => {
     if (batches.includes(localFilters.batch)) return;
     dispatch({ type: ActionType.SetBatch, value: batches.first() });
-  }, [ batches, localFilters.batch ]);
+  }, [batches, localFilters.batch]);
 
   return (
     <>
       {showMaxTrials && (
-        <SelectFilter
-          enableSearchFilter={false}
+        <Select
           label="Top Trials"
-          showSearch={false}
-          style={{ width: 70 }}
+          searchable={false}
           value={localFilters.maxTrial}
           onChange={handleMaxTrialsChange}>
-          {TOP_TRIALS_OPTIONS.map(option => (
-            <Option key={option} value={option}>{option}</Option>
+          {TOP_TRIALS_OPTIONS.map((option) => (
+            <Option key={option} value={option}>
+              {option}
+            </Option>
           ))}
-        </SelectFilter>
+        </Select>
       )}
       {showBatches && (
         <>
-          <SelectFilter
-            enableSearchFilter={false}
+          <Select
             label="Batches Processed"
-            showSearch={false}
+            searchable={false}
             value={localFilters.batch}
             onChange={handleBatchChange}>
-            {batches.map(batch => <Option key={batch} value={batch}>{batch}</Option>)}
-          </SelectFilter>
-          <SelectFilter
-            enableSearchFilter={false}
+            {batches.map((batch) => (
+              <Option key={batch} value={batch}>
+                {batch}
+              </Option>
+            ))}
+          </Select>
+          <Select
             label="Batch Margin"
-            showSearch={false}
+            searchable={false}
             value={localFilters.batchMargin}
             onChange={handleBatchMarginChange}>
-            {BATCH_MARGIN_OPTIONS.map(option => (
-              <Option key={option} value={option}>{option}</Option>
+            {BATCH_MARGIN_OPTIONS.map((option) => (
+              <Option key={option} value={option}>
+                {option}
+              </Option>
             ))}
-          </SelectFilter>
+          </Select>
         </>
       )}
-      {showMetrics && (
-        <MetricSelectFilter
-          defaultMetricNames={metrics}
-          label="Metric"
-          metricNames={metrics}
-          multiple={false}
-          value={localFilters.metric}
-          width={'100%'}
-          onChange={handleMetricChange}
-        />
-      )}
       {showHParams && (
-        <HpSelectFilter
+        <HpSelect
           fullHParams={fullHParams}
-          hpImportance={hpImportance}
           label={`HP (max ${MAX_HPARAM_COUNT})`}
           value={localFilters.hParams}
           onChange={handleHParamChange}
         />
       )}
+      {showMetrics && (
+        <MetricSelect
+          defaultMetrics={metrics}
+          label="Metric"
+          metrics={metrics}
+          multiple={false}
+          value={localFilters.metric || undefined}
+          width={250}
+          onChange={handleMetricChange}
+        />
+      )}
+      {showScales && <ScaleSelect value={localFilters.scale} onChange={handleScaleChange} />}
       {showViews && (
         <RadioGroup
           iconOnly
@@ -230,8 +266,11 @@ const ExperimentVisualizationFilters: React.FC<Props> = ({
         />
       )}
       <div className={css.buttons}>
-        <IconButton icon="reset" label="Reset" onClick={handleReset} />
-        <IconButton icon="checkmark" label="Apply" onClick={handleApply} />
+        <Tooltip title="Reset">
+          <Button onClick={handleReset}>
+            <Icon name="reset" />
+          </Button>
+        </Tooltip>
       </div>
     </>
   );

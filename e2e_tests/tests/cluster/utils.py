@@ -1,10 +1,12 @@
 import json
 import subprocess
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 import pytest
 import requests
+from typing_extensions import Literal
 
 from determined.common import api
 from determined.common.api import authentication, certs
@@ -18,11 +20,21 @@ def cluster_slots() -> Dict[str, Any]:
     """
     # TODO: refactor tests to not use cli singleton auth.
     certs.cli_cert = certs.default_load(conf.make_master_url())
-    authentication.cli_auth = authentication.Authentication(conf.make_master_url(), try_reauth=True)
-    r = api.get(conf.make_master_url(), "agents")
+    authentication.cli_auth = authentication.Authentication(conf.make_master_url())
+    r = api.get(conf.make_master_url(), "api/v1/agents")
     assert r.status_code == requests.codes.ok, r.text
-    json = r.json()  # type: Dict[str, Any]
-    return {agent["id"]: agent["slots"].values() for agent in json.values()}
+    jvals = r.json()  # type: Dict[str, Any]
+    return {agent["id"]: agent["slots"].values() for agent in jvals["agents"]}
+
+
+def get_master_port(loaded_config: dict) -> str:
+    for d in loaded_config["stages"]:
+        for k in d.keys():
+            if k == "master":
+                if "port" in d["master"]["config_file"]:
+                    return str(d["master"]["config_file"]["port"])
+
+    return "8080"  # default value if not explicit in config file
 
 
 def num_slots() -> int:
@@ -37,6 +49,24 @@ def num_free_slots() -> int:
     )
 
 
+def run_command_set_priority(sleep: int = 30, slots: int = 1, priority: int = 0) -> str:
+    command = [
+        "det",
+        "-m",
+        conf.make_master_url(),
+        "command",
+        "run",
+        "-d",
+        "--config",
+        f"resources.slots={slots}",
+        "--config",
+        f"resources.priority={priority}",
+        "sleep",
+        str(sleep),
+    ]
+    return subprocess.check_output(command).decode().strip()
+
+
 def run_command(sleep: int = 30, slots: int = 1) -> str:
     command = [
         "det",
@@ -46,7 +76,7 @@ def run_command(sleep: int = 30, slots: int = 1) -> str:
         "run",
         "-d",
         "--config",
-        "resources.slots=0",
+        f"resources.slots={slots}",
         "sleep",
         str(sleep),
     ]
@@ -57,17 +87,46 @@ def run_zero_slot_command(sleep: int = 30) -> str:
     return run_command(sleep=sleep, slots=0)
 
 
+TaskType = Literal["command", "notebook", "tensorboard", "shell"]
+
+
+def get_task_info(task_type: TaskType, task_id: str) -> Dict[str, Any]:
+    task = ["det", "-m", conf.make_master_url(), task_type, "list", "--json"]
+    task_data = json.loads(subprocess.check_output(task).decode())
+    return next((d for d in task_data if d["id"] == task_id), {})
+
+
 def get_command_info(command_id: str) -> Dict[str, Any]:
-    command = ["det", "-m", conf.make_master_url(), "command", "list", "--json"]
-    command_data = json.loads(subprocess.check_output(command).decode())
-    return next((d for d in command_data if d["id"] == command_id), {})
+    return get_task_info("command", command_id)
 
 
-def wait_for_command_state(command_id: str, state: str, ticks: int = 60) -> None:
+def command_succeeded(command_id: str) -> bool:
+    print(get_command_info(command_id))
+
+    return "success" in get_command_info(command_id)["exitStatus"]
+
+
+def wait_for_task_state(task_type: TaskType, task_id: str, state: str, ticks: int = 60) -> None:
     for _ in range(ticks):
-        info = get_command_info(command_id)
-        if info.get("state") == state:
+        info = get_task_info(task_type, task_id)
+        gotten_state = info.get("state")
+        if gotten_state == state:
             return
         time.sleep(1)
 
-    pytest.fail(f"Command did't reach {state} state after {ticks} secs")
+    print(subprocess.check_output(["det", "-m", conf.make_master_url(), "task", "logs", task_id]))
+    pytest.fail(f"{task_type} expected {state} state got {gotten_state} instead after {ticks} secs")
+
+
+def wait_for_command_state(command_id: str, state: str, ticks: int = 60) -> None:
+    return wait_for_task_state("command", command_id, state, ticks)
+
+
+def now_ts() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def set_master_port(config: str) -> None:
+    lc = conf.load_config(config_path=config)
+    port = get_master_port(lc)
+    conf.MASTER_PORT = port

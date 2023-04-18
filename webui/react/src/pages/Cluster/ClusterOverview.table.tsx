@@ -1,8 +1,8 @@
 import { ColumnType } from 'antd/es/table';
 
 import { V1ResourcePoolTypeToLabel } from 'constants/states';
+import { alphaNumericSorter, numericSorter } from 'shared/utils/sort';
 import { ResourcePool } from 'types';
-import { alphaNumericSorter, numericSorter } from 'utils/sort';
 
 export const columns: ColumnType<ResourcePool>[] = [
   {
@@ -32,15 +32,11 @@ export const columns: ColumnType<ResourcePool>[] = [
   {
     dataIndex: 'numAgents',
     key: 'numAgents',
-    sorter: (a: ResourcePool, b: ResourcePool): number =>
-      numericSorter(a.numAgents, b.numAgents),
+    sorter: (a: ResourcePool, b: ResourcePool): number => numericSorter(a.numAgents, b.numAgents),
     title: 'Agents',
   },
   {
-    dataIndex: 'slotsAvailable',
     key: 'slotsAvailable',
-    sorter: (a: ResourcePool, b: ResourcePool): number =>
-      numericSorter(a.slotsAvailable, b.slotsAvailable),
     title: 'Total Slots',
   },
   {

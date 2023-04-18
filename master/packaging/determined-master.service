@@ -13,7 +13,8 @@ StartLimitInterval=20
 RestartSec=1
 Restart=always
 TimeoutStartSec=0
-ExecStart=/usr/local/bin/determined-master
+CacheDirectory=determined
+ExecStart=/usr/bin/determined-master
 
 [Install]
 WantedBy=multi-user.target

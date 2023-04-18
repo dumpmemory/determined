@@ -1,381 +1,433 @@
-import { Button, Dropdown, Menu, Modal } from 'antd';
-import { ColumnsType } from 'antd/lib/table';
-import { SorterResult } from 'antd/lib/table/interface';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { useHistory, useParams } from 'react-router-dom';
+import { Typography } from 'antd';
+import { FilterValue, SorterResult, TablePaginationConfig } from 'antd/lib/table/interface';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useParams } from 'react-router-dom';
 
-import DownloadModelModal from 'components/DownloadModelModal';
-import Icon from 'components/Icon';
-import InlineEditor from 'components/InlineEditor';
-import Message, { MessageType } from 'components/Message';
+import Input from 'components/kit/Input';
+import { useModal } from 'components/kit/Modal';
+import Tags, { tagsActionHelper } from 'components/kit/Tags';
 import MetadataCard from 'components/Metadata/MetadataCard';
+import ModelDownloadModal from 'components/ModelDownloadModal';
+import ModelVersionDeleteModal from 'components/ModelVersionDeleteModal';
 import NotesCard from 'components/NotesCard';
 import Page from 'components/Page';
-import ResponsiveTable from 'components/ResponsiveTable';
-import Spinner from 'components/Spinner';
-import { getFullPaginationConfig, modelVersionNameRenderer, modelVersionNumberRenderer,
-  relativeTimeRenderer, userRenderer } from 'components/Table';
-import TagList from 'components/TagList';
-import { useStore } from 'contexts/Store';
-import usePolling from 'hooks/usePolling';
-import useSettings from 'hooks/useSettings';
-import { paths, routeToReactUrl } from 'routes/utils';
-import { archiveModel, deleteModel, deleteModelVersion, getModelDetails, patchModel,
-  patchModelVersion, unarchiveModel } from 'services/api';
+import PageNotFound from 'components/PageNotFound';
+import InteractiveTable, {
+  ColumnDef,
+  InteractiveTableSettings,
+} from 'components/Table/InteractiveTable';
+import {
+  defaultRowClassName,
+  getFullPaginationConfig,
+  modelVersionNameRenderer,
+  modelVersionNumberRenderer,
+  relativeTimeRenderer,
+  userRenderer,
+} from 'components/Table/Table';
+import usePermissions from 'hooks/usePermissions';
+import { UpdateSettings, useSettings } from 'hooks/useSettings';
+import {
+  archiveModel,
+  getModelDetails,
+  patchModel,
+  patchModelVersion,
+  unarchiveModel,
+} from 'services/api';
 import { V1GetModelVersionsRequestSortBy } from 'services/api-ts-sdk';
-import { isAborted, isNotFound, validateDetApiEnum } from 'services/utils';
-import { ModelVersion, ModelVersions } from 'types';
-import { isEqual } from 'utils/data';
-import handleError, { ErrorType } from 'utils/error';
+import Message, { MessageType } from 'shared/components/Message';
+import Spinner from 'shared/components/Spinner/Spinner';
+import usePolling from 'shared/hooks/usePolling';
+import { isEqual } from 'shared/utils/data';
+import { ErrorType } from 'shared/utils/error';
+import { isAborted, isNotFound, validateDetApiEnum } from 'shared/utils/service';
+import userStore from 'stores/users';
+import workspaceStore from 'stores/workspaces';
+import { Metadata, ModelVersion, ModelVersions } from 'types';
+import handleError from 'utils/error';
+import { Loadable } from 'utils/loadable';
+import { useObservable } from 'utils/observable';
 
-import css from './ModelDetails.module.scss';
-import settingsConfig, { Settings } from './ModelDetails/ModelDetails.settings';
+import settingsConfig, {
+  DEFAULT_COLUMN_WIDTHS,
+  isOfSortKey,
+  Settings,
+} from './ModelDetails/ModelDetails.settings';
 import ModelHeader from './ModelDetails/ModelHeader';
+import ModelVersionActionDropdown from './ModelDetails/ModelVersionActionDropdown';
+import css from './ModelDetails.module.scss';
 
-interface Params {
-  modelName: string;
-}
+type Params = {
+  modelId: string;
+};
 
 const ModelDetails: React.FC = () => {
-  const { auth: { user } } = useStore();
-  const [ model, setModel ] = useState<ModelVersions>();
-  const modelName = decodeURIComponent(useParams<Params>().modelName);
-  const [ isLoading, setIsLoading ] = useState(true);
-  const [ pageError, setPageError ] = useState<Error>();
-  const [ total, setTotal ] = useState(0);
-  const history = useHistory();
+  const [model, setModel] = useState<ModelVersions>();
+  const [modelVersion, setModelVersion] = useState<ModelVersion | undefined>(undefined);
+  const modelId = decodeURIComponent(useParams<Params>().modelId ?? '');
+  const [isLoading, setIsLoading] = useState(true);
+  const [pageError, setPageError] = useState<Error>();
+  const [total, setTotal] = useState(0);
+  const pageRef = useRef<HTMLElement>(null);
+  const users = Loadable.getOrElse([], useObservable(userStore.getUsers()));
+  const workspasces = useObservable(workspaceStore.workspaces);
+  const workspace = Loadable.getOrElse(
+    undefined,
+    useObservable(workspaceStore.getWorkspace(model?.model.workspaceId)),
+  );
+
+  const { canModifyModel, canModifyModelVersion, loading: rbacLoading } = usePermissions();
 
   const {
     settings,
+    isLoading: isLoadingSettings,
     updateSettings,
-  } = useSettings<Settings>(settingsConfig);
+  } = useSettings<Settings>(settingsConfig(modelId));
 
   const fetchModel = useCallback(async () => {
+    if (!settings) return;
+
     try {
-      const modelData = await getModelDetails(
-        {
-          limit: settings.tableLimit,
-          modelName,
-          offset: settings.tableOffset,
-          orderBy: settings.sortDesc ? 'ORDER_BY_DESC' : 'ORDER_BY_ASC',
-          sortBy: validateDetApiEnum(V1GetModelVersionsRequestSortBy, settings.sortKey),
-        },
-      );
+      const modelData = await getModelDetails({
+        limit: settings.tableLimit,
+        modelName: modelId,
+        offset: settings.tableOffset,
+        orderBy: settings.sortDesc ? 'ORDER_BY_DESC' : 'ORDER_BY_ASC',
+        sortBy: validateDetApiEnum(V1GetModelVersionsRequestSortBy, settings.sortKey),
+      });
       setTotal(modelData?.pagination.total || 0);
-      setModel(prev => !isEqual(modelData, prev) ? modelData : prev);
+      setModel((prev) => (!isEqual(modelData, prev) ? modelData : prev));
     } catch (e) {
       if (!pageError && !isAborted(e)) setPageError(e as Error);
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
-  }, [ modelName, pageError, settings ]);
+  }, [modelId, pageError, settings]);
 
-  usePolling(fetchModel);
+  const modelDownloadModal = useModal(ModelDownloadModal);
+  const modelVersionDeleteModal = useModal(ModelVersionDeleteModal);
+
+  usePolling(fetchModel, { rerunOnNewFn: true });
 
   useEffect(() => {
     setIsLoading(true);
     fetchModel();
-  }, [ fetchModel ]);
+    const abortFetchWorkspaces = workspaceStore.fetch();
 
-  const deleteVersion = useCallback(async (version: ModelVersion) => {
-    try {
-      setIsLoading(true);
-      await deleteModelVersion({ modelName: version.model.name, versionId: version.id });
-      await fetchModel();
-    } catch (e) {
-      handleError(e, {
-        publicSubject: `Unable to delete model version ${version.id}.`,
-        silent: true,
-        type: ErrorType.Api,
-      });
-      setIsLoading(false);
-    }
-  }, [ fetchModel ]);
+    return () => abortFetchWorkspaces();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const saveModelVersionTags = useCallback(async (modelName, versionId, tags) => {
-    try {
-      setIsLoading(true);
-      await patchModelVersion({ body: { labels: tags, modelName }, modelName, versionId });
-      await fetchModel();
-    } catch (e) {
-      handleError(e, {
-        publicSubject: `Unable to update model version ${versionId} tags.`,
-        silent: true,
-        type: ErrorType.Api,
-      });
-      setIsLoading(false);
-    }
-  }, [ fetchModel ]);
-
-  const showConfirmDelete = useCallback((version: ModelVersion) => {
-    Modal.confirm({
-      closable: true,
-      content: `Are you sure you want to delete this version "Version ${version.version}"
-      from this model?`,
-      icon: null,
-      maskClosable: true,
-      okText: 'Delete Version',
-      okType: 'danger',
-      onOk: () => deleteVersion(version),
-      title: 'Confirm Delete',
-    });
-  }, [ deleteVersion ]);
-
-  const saveVersionDescription =
-    useCallback(async (editedDescription: string, versionId: number) => {
+  const saveModelVersionTags = useCallback(
+    async (modelName: string, versionNum: number, tags: string[]) => {
       try {
         await patchModelVersion({
-          body: { comment: editedDescription, modelName },
+          body: { labels: tags, modelName },
           modelName,
-          versionId,
+          versionNum: versionNum,
         });
+        await fetchModel();
+      } catch (e) {
+        handleError(e, {
+          publicSubject: `Unable to update model version ${versionNum} tags.`,
+          silent: true,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [fetchModel],
+  );
+
+  const saveVersionDescription = useCallback(
+    async (editedDescription: string, versionNum: number) => {
+      try {
+        const modelName = model?.model.name;
+        if (modelName) {
+          await patchModelVersion({
+            body: { comment: editedDescription, modelName },
+            modelName,
+            versionNum: versionNum,
+          });
+        }
       } catch (e) {
         handleError(e, {
           publicSubject: 'Unable to save version description.',
           silent: false,
           type: ErrorType.Api,
         });
-        return e;
       }
-    }, [ modelName ]);
+    },
+    [model?.model.name],
+  );
 
   const columns = useMemo(() => {
     const tagsRenderer = (value: string, record: ModelVersion) => (
-      <TagList
-        compact
-        disabled={record.model.archived}
-        tags={record.labels ?? []}
-        onChange={(tags) => saveModelVersionTags(record.model.name, record.id, tags)}
+      <div className={css.tagsRenderer}>
+        <Typography.Text
+          ellipsis={{
+            tooltip: <Tags disabled tags={record.labels ?? []} />,
+          }}>
+          <div>
+            <Tags
+              compact
+              disabled={record.model.archived}
+              tags={record.labels ?? []}
+              onAction={tagsActionHelper(record.labels ?? [], (tags) =>
+                saveModelVersionTags(record.model.name, record.version, tags),
+              )}
+            />
+          </div>
+        </Typography.Text>
+      </div>
+    );
+
+    const actionRenderer = (_: string, record: ModelVersion) => (
+      <ModelVersionActionDropdown
+        version={record}
+        onDelete={() => {
+          setModelVersion(record);
+          modelVersionDeleteModal.open();
+        }}
+        onDownload={() => {
+          setModelVersion(record);
+          modelDownloadModal.open();
+        }}
       />
     );
 
-    const OverflowRenderer = (_:string, record: ModelVersion) => {
-      const isDeletable = user?.isAdmin
-        || user?.username === model?.model.username
-        || user?.username === record.username;
-      return (
-        <Dropdown
-          overlay={(
-            <Menu>
-              {useActionRenderer(_, record)}
-              <Menu.Item
-                danger
-                disabled={!isDeletable}
-                key="delete-version"
-                onClick={() => showConfirmDelete(record)}>
-                Delete Version
-              </Menu.Item>
-            </Menu>
-          )}
-          trigger={[ 'click' ]}>
-          <Button className={css.overflow} type="text">
-            <Icon name="overflow-vertical" size="tiny" />
-          </Button>
-        </Dropdown>
-      );
-    };
-
-    const descriptionRenderer = (value:string, record: ModelVersion) => (
-      <InlineEditor
-        disabled={record.model.archived}
-        placeholder="Add description..."
-        value={value}
-        onSave={(newDescription: string) => saveVersionDescription(newDescription, record.id)}
+    const descriptionRenderer = (value: string, record: ModelVersion) => (
+      <Input
+        className={css.descriptionRenderer}
+        defaultValue={record.comment ?? ''}
+        disabled={record.model.archived || !canModifyModelVersion({ modelVersion: record })}
+        placeholder={record.model.archived ? 'Archived' : 'Add description...'}
+        title={record.model.archived ? 'Archived description' : 'Edit description'}
+        onBlur={(e) => {
+          const newDesc = e.currentTarget.value;
+          saveVersionDescription(newDesc, record.version);
+        }}
+        onPressEnter={(e) => {
+          // when enter is pressed,
+          // input box gets blurred and then value will be saved in onBlur
+          e.currentTarget.blur();
+        }}
       />
     );
 
-    const tableColumns: ColumnsType<ModelVersion> = [
+    return [
       {
         dataIndex: 'version',
+        defaultWidth: DEFAULT_COLUMN_WIDTHS['version'],
         key: V1GetModelVersionsRequestSortBy.VERSION,
         render: modelVersionNumberRenderer,
         sorter: true,
         title: 'V',
-        width: 1,
       },
       {
         dataIndex: 'name',
+        defaultWidth: DEFAULT_COLUMN_WIDTHS['name'],
         render: modelVersionNameRenderer,
         title: 'Name',
-        width: 250,
       },
       {
-        dataIndex: 'comment',
+        dataIndex: 'description',
+        defaultWidth: DEFAULT_COLUMN_WIDTHS['description'],
         render: descriptionRenderer,
         title: 'Description',
       },
       {
         dataIndex: 'lastUpdatedTime',
+        defaultWidth: DEFAULT_COLUMN_WIDTHS['lastUpdatedTime'],
         render: (date: Date, record: ModelVersion) =>
           relativeTimeRenderer(date ?? record.creationTime),
         title: 'Last updated',
-        width: 140,
       },
       {
-        dataIndex: 'username',
-        render: (username: string, record: ModelVersion, index) =>
-          username ?
-            userRenderer(username, record, index) :
-            userRenderer(record.model.username, record.model, index),
+        dataIndex: 'user',
+        defaultWidth: DEFAULT_COLUMN_WIDTHS['user'],
+        key: 'user',
+        render: (_, r) => userRenderer(users.find((u) => u.id === r.userId)),
         title: 'User',
-        width: 1,
       },
-      { dataIndex: 'labels', render: tagsRenderer, title: 'Tags', width: 120 },
-      { render: OverflowRenderer, title: '', width: 1 },
-    ];
-
-    return tableColumns.map(column => {
-      column.sortOrder = null;
-      if (column.key === settings.sortKey) {
-        column.sortOrder = settings.sortDesc ? 'descend' : 'ascend';
-      }
-      return column;
-    });
-  }, [ showConfirmDelete,
-    model?.model.username,
+      {
+        dataIndex: 'tags',
+        defaultWidth: DEFAULT_COLUMN_WIDTHS['tags'],
+        render: tagsRenderer,
+        title: 'Tags',
+      },
+      {
+        dataIndex: 'action',
+        defaultWidth: DEFAULT_COLUMN_WIDTHS['action'],
+        render: actionRenderer,
+        title: '',
+      },
+    ] as ColumnDef<ModelVersion>[];
+  }, [
+    users,
     saveModelVersionTags,
-    user,
-    settings.sortKey,
-    settings.sortDesc,
-    saveVersionDescription ]);
+    modelVersionDeleteModal,
+    modelDownloadModal,
+    canModifyModelVersion,
+    saveVersionDescription,
+  ]);
 
-  const handleTableChange = useCallback((tablePagination, tableFilters, tableSorter) => {
-    if (Array.isArray(tableSorter)) return;
+  const tableIsLoading = useMemo(
+    () => isLoading || isLoadingSettings,
+    [isLoading, isLoadingSettings],
+  );
 
-    const { columnKey, order } = tableSorter as SorterResult<ModelVersion>;
-    if (!columnKey || !columns.find(column => column.key === columnKey)) return;
+  const handleTableChange = useCallback(
+    (
+      tablePagination: TablePaginationConfig,
+      tableFilters: Record<string, FilterValue | null>,
+      tableSorter: SorterResult<ModelVersion> | SorterResult<ModelVersion>[],
+    ) => {
+      if (Array.isArray(tableSorter) || !settings.tableOffset) return;
 
-    const newSettings = {
-      sortDesc: order === 'descend',
-      /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
-      sortKey: columnKey as any,
-      tableLimit: tablePagination.pageSize,
-      tableOffset: (tablePagination.current - 1) * tablePagination.pageSize,
-    };
-    const shouldPush = settings.tableOffset !== newSettings.tableOffset;
-    updateSettings(newSettings, shouldPush);
-  }, [ columns, settings.tableOffset, updateSettings ]);
+      const { columnKey, order } = tableSorter as SorterResult<ModelVersion>;
+      if (!columnKey || !columns.find((column) => column.key === columnKey)) return;
 
-  const saveMetadata = useCallback(async (editedMetadata) => {
-    try {
-      await patchModel({
-        body: { metadata: editedMetadata, name: modelName },
-        modelName,
-      });
-      await fetchModel();
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to save metadata.',
-        silent: false,
-        type: ErrorType.Api,
-      });
-    }
+      const newSettings = {
+        sortDesc: order === 'descend',
+        sortKey: isOfSortKey(columnKey) ? columnKey : V1GetModelVersionsRequestSortBy.UNSPECIFIED,
+        tableLimit: tablePagination.pageSize,
+        tableOffset: ((tablePagination.current ?? 1) - 1) * (tablePagination.pageSize ?? 0),
+      };
+      updateSettings(newSettings);
+    },
+    [columns, settings.tableOffset, updateSettings],
+  );
 
-  }, [ fetchModel, modelName ]);
+  const saveMetadata = useCallback(
+    async (editedMetadata: Metadata) => {
+      try {
+        const modelName = model?.model.name;
+        if (modelName) {
+          await patchModel({
+            body: { metadata: editedMetadata, name: modelName },
+            modelName,
+          });
+        }
+        await fetchModel();
+      } catch (e) {
+        handleError(e, {
+          publicSubject: 'Unable to save metadata.',
+          silent: false,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [fetchModel, model?.model.name],
+  );
 
-  const saveDescription = useCallback(async (editedDescription: string) => {
-    try {
-      await patchModel({
-        body: { description: editedDescription, name: modelName },
-        modelName,
-      });
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to save description.',
-        silent: false,
-        type: ErrorType.Api,
-      });
-      setIsLoading(false);
-    }
-  }, [ modelName ]);
+  const saveNotes = useCallback(
+    async (editedNotes: string) => {
+      try {
+        const modelName = model?.model.name;
+        if (modelName) {
+          await patchModel({
+            body: { name: modelName, notes: editedNotes },
+            modelName,
+          });
+        }
+        await fetchModel();
+      } catch (e) {
+        handleError(e, {
+          publicSubject: 'Unable to update notes.',
+          silent: true,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [model?.model.name, fetchModel],
+  );
 
-  const saveName = useCallback(async (editedName: string) => {
-    try {
-      await patchModel({
-        body: { name: editedName },
-        modelName,
-      });
-      routeToReactUrl(paths.modelDetails(editedName));
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to save name.',
-        silent: false,
-        type: ErrorType.Api,
-      });
-      return e;
-    }
-  }, [ modelName ]);
-
-  const saveNotes = useCallback(async (editedNotes: string) => {
-    try {
-      await patchModel({
-        body: { name: modelName, notes: editedNotes },
-        modelName,
-      });
-      await fetchModel();
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to update notes.',
-        silent: true,
-        type: ErrorType.Api,
-      });
-    }
-  }, [ modelName, fetchModel ]);
-
-  const saveModelTags = useCallback(async (editedTags) => {
-    try {
-      await patchModel({
-        body: { labels: editedTags, name: modelName },
-        modelName,
-      });
-      fetchModel();
-    } catch (e) {
-      handleError(e, {
-        publicSubject: 'Unable to update model tags.',
-        silent: true,
-        type: ErrorType.Api,
-      });
-      setIsLoading(false);
-    }
-  }, [ fetchModel, modelName ]);
+  const saveModelTags = useCallback(
+    async (editedTags: string[]) => {
+      try {
+        const modelName = model?.model.name;
+        if (modelName) {
+          await patchModel({
+            body: { labels: editedTags, name: modelName },
+            modelName,
+          });
+          await fetchModel();
+        }
+      } catch (e) {
+        handleError(e, {
+          publicSubject: 'Unable to update model tags.',
+          silent: true,
+          type: ErrorType.Api,
+        });
+      }
+    },
+    [fetchModel, model?.model.name],
+  );
 
   const switchArchive = useCallback(() => {
-    if (model?.model.archived) {
-      unarchiveModel({ modelName });
-    } else {
-      archiveModel({ modelName });
+    const modelName = model?.model.name;
+    if (modelName) {
+      if (model?.model.archived) {
+        unarchiveModel({ modelName });
+      } else {
+        archiveModel({ modelName });
+      }
     }
-  }, [ model?.model.archived, modelName ]);
+  }, [model?.model.archived, model?.model.name]);
 
-  const deleteCurrentModel = useCallback(() => {
-    deleteModel({ modelName });
-    history.push('/det/models');
-  }, [ history, modelName ]);
+  const actionDropdown = useCallback(
+    ({
+      record,
+      onVisibleChange,
+      children,
+    }: {
+      children: React.ReactNode;
+      onVisibleChange?: (visible: boolean) => void;
+      record: ModelVersion;
+    }) => (
+      <ModelVersionActionDropdown
+        trigger={['contextMenu']}
+        version={record}
+        onDelete={() => {
+          setModelVersion(record);
+          modelVersionDeleteModal.open();
+        }}
+        onDownload={() => {
+          setModelVersion(record);
+          modelDownloadModal.open();
+        }}
+        onVisibleChange={onVisibleChange}>
+        {children}
+      </ModelVersionActionDropdown>
+    ),
+    [modelDownloadModal, modelVersionDeleteModal],
+  );
 
-  if (!modelName) {
+  if (!modelId) {
     return <Message title="Model name is empty" />;
-  } else if (pageError) {
-    const message = isNotFound(pageError) ?
-      `Unable to find model ${modelName}` :
-      `Unable to fetch model ${modelName}`;
+  } else if (pageError && !isNotFound(pageError)) {
+    const message = `Unable to fetch model ${modelId}`;
     return <Message title={message} type={MessageType.Warning} />;
-  } else if (!model) {
-    return <Spinner tip={`Loading model ${modelName} details...`} />;
+  } else if (pageError && isNotFound(pageError)) {
+    return <PageNotFound />;
+  } else if (!model || Loadable.isLoading(workspasces) || rbacLoading) {
+    return <Spinner spinning tip={`Loading model ${modelId} details...`} />;
   }
 
   return (
     <Page
+      containerRef={pageRef}
       docTitle="Model Details"
-      headerComponent={(
+      headerComponent={
         <ModelHeader
+          fetchModel={fetchModel}
           model={model.model}
-          onDelete={deleteCurrentModel}
-          onSaveDescription={saveDescription}
-          onSaveName={saveName}
+          workspace={workspace}
           onSwitchArchive={switchArchive}
           onUpdateTags={saveModelTags}
         />
-      )}
-      id="modelDetails">
+      }
+      id="modelDetails"
+      notFound={pageError && isNotFound(pageError)}>
       <div className={css.base}>
         {model.modelVersions.length === 0 ? (
           <div className={css.noVersions}>
@@ -385,51 +437,42 @@ const ModelDetails: React.FC = () => {
             </p>
           </div>
         ) : (
-          <ResponsiveTable
+          <InteractiveTable
             columns={columns}
+            containerRef={pageRef}
+            ContextMenu={actionDropdown}
             dataSource={model.modelVersions}
-            loading={isLoading}
-            pagination={getFullPaginationConfig({
-              limit: settings.tableLimit,
-              offset: settings.tableOffset,
-            }, total)}
-            rowKey="id"
+            loading={tableIsLoading}
+            pagination={getFullPaginationConfig(
+              {
+                limit: settings.tableLimit,
+                offset: settings.tableOffset,
+              },
+              total,
+            )}
+            rowClassName={defaultRowClassName({ clickable: false })}
+            rowKey="version"
+            settings={settings as InteractiveTableSettings}
             showSorterTooltip={false}
             size="small"
+            updateSettings={updateSettings as UpdateSettings}
             onChange={handleTableChange}
           />
         )}
         <NotesCard
-          disabled={model.model.archived}
+          disabled={model.model.archived || !canModifyModel({ model: model.model })}
           notes={model.model.notes ?? ''}
           onSave={saveNotes}
         />
         <MetadataCard
-          disabled={model.model.archived}
+          disabled={model.model.archived || !canModifyModel({ model: model.model })}
           metadata={model.model.metadata}
           onSave={saveMetadata}
         />
       </div>
+      {modelVersion && <modelDownloadModal.Component modelVersion={modelVersion} />}
+      {modelVersion && <modelVersionDeleteModal.Component modelVersion={modelVersion} />}
     </Page>
-  );
-};
-
-const useActionRenderer = (_:string, record: ModelVersion) => {
-  const [ showModal, setShowModal ] = useState(false);
-
-  return (
-    <>
-      <Menu.Item
-        key="download"
-        onClick={() => setShowModal(true)}>
-        Download
-      </Menu.Item>
-      <DownloadModelModal
-        modelVersion={record}
-        visible={showModal}
-        onClose={() => setShowModal(false)}
-      />
-    </>
   );
 };
 

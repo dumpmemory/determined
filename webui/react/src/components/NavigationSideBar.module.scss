@@ -1,40 +1,70 @@
 /* stylelint-disable no-descending-specificity */
 
 .base {
-  background-color: var(--theme-colors-base-2);
+  background-color: var(--theme-stage);
+  border-right: solid var(--theme-stroke-width) var(--theme-stage-border);
+  box-sizing: border-box;
   display: flex;
-  flex-basis: var(--theme-sizes-navigation-maxWidth);
+  flex: 0 0 var(--nav-side-bar-width-max);
   flex-direction: column;
-  flex-grow: 0;
-  flex-shrink: 0;
+  max-height: calc(var(--vh, 1vh) * 100);
   overflow: visible;
 
   header {
     display: flex;
     flex-direction: column;
   }
-  main {
+  & > section {
     display: flex;
     flex-direction: column;
     flex-grow: 1;
+    min-height: 0;
   }
   section.launch {
     align-items: center;
     display: flex;
     justify-content: center;
-    padding: var(--theme-sizes-layout-big) 0;
-    width: var(--theme-sizes-navigation-maxWidth);
+    padding: 16px 0;
+    width: var(--nav-side-bar-width-max);
   }
-  section.top {
+  section.workspaces {
+    display: flex;
+    flex-direction: column;
     flex-grow: 1;
+    min-height: 0;
+    overflow: hidden;
+
+    .actionButtons {
+      // action buttons are hidden when the cursor is not hovered on buttons
+      display: none;
+    }
+    .navItemContainer:hover .actionButtons {
+      align-items: center;
+      display: flex;
+    }
+    .noWorkspaces {
+      align-self: center;
+      color: var(--theme-stage-on-weak);
+      font-size: 12px;
+      padding: 6px;
+      text-align: center;
+    }
+    .pinnedWorkspaces {
+      list-style: none;
+      margin: 0;
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      padding: 0;
+    }
   }
   footer {
     position: relative;
   }
   .version {
-    background-color: var(--theme-colors-base-1);
-    color: var(--theme-colors-base-12);
-    font-size: var(--theme-sizes-font-tiny);
+    background-color: var(--theme-stage-strong);
+    color: var(--theme-stage-on-strong);
+    font-size: 11px;
     font-style: italic;
     height: 32px;
     width: 100%;
@@ -54,84 +84,113 @@
     width: 206px;
 
     .launchButton {
-      background-color: transparent;
-      border-color: var(--theme-colors-monochrome-9);
-      border-radius: var(--theme-sizes-border-radius);
-      border-style: solid;
-      border-width: var(--theme-sizes-border-width);
-      color: var(--theme-colors-monochrome-17);
-      flex-grow: 1;
-      flex-shrink: 1;
-      overflow: hidden;
+      width: 100%;
     }
     .launchIcon {
       align-items: center;
       background-color: transparent;
-      border-color: var(--theme-colors-monochrome-9);
-      border-radius: 0 var(--theme-sizes-border-radius) var(--theme-sizes-border-radius) 0;
+      border-color: var(--theme-stage-border);
+      border-radius: 0 var(--theme-border-radius) var(--theme-border-radius) 0;
       border-style: solid;
-      border-width: var(--theme-sizes-border-width);
-      color: var(--theme-colors-monochrome-17);
+      border-width: var(--theme-stroke-width);
+      color: var(--theme-stage-on);
       display: flex;
       flex-shrink: 0;
       justify-content: center;
-      width: var(--theme-sizes-layout-giant);
+      width: 32px;
     }
   }
   .launchBlock:hover {
     .launchButton,
-    .launchIcon { border-color: var(--theme-colors-monochrome-17); }
+    .launchIcon {
+      border-color: var(--theme-stage-border-strong);
+    }
   }
-  .navItem {
-    color: var(--theme-colors-monochrome-17);
-    cursor: pointer;
-    display: block;
-    height: 48px;
-    position: relative;
-    width: var(--theme-sizes-navigation-maxWidth);
+  .navItemContainer {
+    align-items: center;
+    background-color: var(--theme-stage);
+    display: flex;
+    flex-wrap: nowrap;
+    width: var(--nav-side-bar-width-max);
 
-    [class*=Icon_base_] {
-      left: var(--theme-sizes-layout-big);
-      position: absolute;
-      top: var(--theme-sizes-layout-large);
+    &.active {
+      background-color: var(--theme-stage-strong);
+      cursor: default;
     }
-    .label {
-      font-size: var(--theme-sizes-font-small);
-      height: var(--theme-sizes-layout-enormous);
-      left: 56px;
-      line-height: var(--theme-sizes-layout-enormous);
-      overflow: hidden;
-      position: absolute;
-      top: var(--theme-sizes-layout-large);
-      white-space: nowrap;
-      width: auto;
+    &:hover {
+      background-color: var(--theme-stage-strong);
+      color: var(--theme-stage-on-strong);
     }
-    .status {
-      background-color: var(--theme-colors-action-normal);
-      border-radius: var(--theme-sizes-layout-medium);
-      bottom: var(--theme-sizes-layout-big);
-      color: var(--theme-colors-monochrome-17);
-      font-size: var(--theme-sizes-font-tiny);
-      height: 0 var(--theme-sizes-layout-big);
-      padding: 0 var(--theme-sizes-layout-small);
-      position: absolute;
-      right: var(--theme-sizes-layout-big);
-      white-space: nowrap;
+    .navItem {
+      align-items: center;
+      align-self: flex-start;
+      color: var(--theme-stage-on);
+      cursor: pointer;
+      display: flex;
+      flex-grow: 1;
+      height: 48px;
+      max-width: 100%;
+
+      .icon {
+        min-width: 56px;
+        padding-inline: 16px;
+        text-align: center;
+      }
+      .label {
+        font-size: 13px;
+        height: 24px;
+        line-height: 24px;
+        overflow: hidden;
+        padding-right: 16px;
+        white-space: nowrap;
+        width: 100%;
+      }
     }
-  }
-  .navItem.active {
-    background-color: var(--theme-colors-base-0);
-    cursor: default;
-  }
-  .navItem:hover {
-    background-color: var(--theme-colors-base-3);
-    color: var(--theme-colors-monochrome-17);
+    .navItem.active,
+    .navItem.active:hover {
+      background-color: var(--theme-stage-strong);
+      color: var(--theme-stage-on-strong);
+    }
+    .navItemExtra {
+      align-items: center;
+      display: flex;
+      flex-direction: column;
+
+      & a {
+        align-items: center;
+        display: flex;
+        flex-grow: 1;
+      }
+      & span {
+        cursor: default;
+      }
+      .status {
+        background-color: var(--theme-status-active);
+        border-radius: 8px;
+        color: var(--theme-status-active-on);
+        flex-grow: 0;
+        font-size: 11px;
+        height: 16px;
+        margin-right: 16px;
+        padding: 0 6px;
+        white-space: nowrap;
+      }
+      .action {
+        height: 100%;
+
+        & * {
+          color: #bfbfbf;
+          height: 100%;
+        }
+      }
+    }
   }
   .user {
-    background-color: var(--theme-colors-base-4);
+    background-color: var(--theme-stage-weak);
+    padding: 9px 16px;
   }
   .user:hover {
-    background-color: var(--theme-colors-base-3);
+    background-color: var(--theme-stage-strong);
   }
 }
 .collapsedAppear {
@@ -140,122 +199,122 @@
 }
 .collapsedEnter,
 .collapsedExitDone {
-  flex-basis: var(--theme-sizes-navigation-maxWidth);
+  flex-basis: var(--nav-side-bar-width-max);
 
   section.launch {
-    width: var(--theme-sizes-navigation-maxWidth);
+    width: var(--nav-side-bar-width-max);
   }
-  .navItem {
-    width: var(--theme-sizes-navigation-maxWidth);
+  .noWorkspaces {
+    opacity: 1;
+  }
+  .navItemContainer {
+    width: var(--nav-side-bar-width-max);
 
-    .label { opacity: 1; }
-    .status {
-      right: var(--theme-sizes-layout-big);
-      transform: translateX(0);
+    .action,
+    .label {
+      opacity: 1;
     }
   }
-  .navItem.hasStatus {
+  .navItemContainer.hasStatus {
     height: 48px;
-
-    .status { bottom: var(--theme-sizes-layout-big); }
   }
   .user {
-    width: var(--theme-sizes-navigation-maxWidth);
+    width: var(--nav-side-bar-width-max);
 
-    span { opacity: 1; }
+    span {
+      opacity: 1;
+    }
   }
 }
 .collapsedEnterActive {
-  flex-basis: var(--theme-sizes-navigation-minWidth);
-  transition: flex-basis var(--theme-animationCurve);
+  flex-basis: var(--nav-side-bar-width-min);
+  transition: flex-basis var(--animation-curve);
 
   section.launch {
-    transition: width var(--theme-animationCurve);
-    width: var(--theme-sizes-navigation-minWidth);
+    transition: width var(--animation-curve);
+    width: var(--nav-side-bar-width-min);
   }
   .logo {
     height: 24px;
     left: 12px;
     top: 16px;
-    transition:
-      height var(--theme-animationCurve),
-      left var(--theme-animationCurve),
-      top var(--theme-animationCurve),
-      width var(--theme-animationCurve);
+    transition: height var(--animation-curve), left var(--animation-curve),
+      top var(--animation-curve), width var(--animation-curve);
     width: 32px;
   }
   .logoIcon {
     height: 24px;
     left: 0;
-    transition:
-      height var(--theme-animationCurve),
-      left var(--theme-animationCurve),
-      width var(--theme-animationCurve);
+    transition: height var(--animation-curve), left var(--animation-curve),
+      width var(--animation-curve);
     width: 32px;
   }
   .logoLabel {
     opacity: 0;
-    transition:
-      opacity var(--theme-animationCurve),
-      width var(--theme-animationCurve);
+    transition: opacity var(--animation-curve), width var(--animation-curve);
     width: 0;
   }
   .launchBlock {
-    transition: width var(--theme-animationCurve);
+    transition: width var(--animation-curve);
     width: 32px;
 
     .launchButton {
       opacity: 0;
       padding: 0;
-      transition:
-        opacity var(--theme-animationCurve),
-        padding var(--theme-animationCurve),
-        width var(--theme-animationCurve);
+      transition: opacity var(--animation-curve), padding var(--animation-curve),
+        width var(--animation-curve);
       width: 0;
     }
     .launchIcon {
       border-radius: 100%;
-      transition: border-radius var(--theme-animationCurve);
+      transition: border-radius var(--animation-curve);
     }
   }
-  .navItem {
-    transition: height var(--theme-animationCurve), width var(--theme-animationCurve);
-    width: var(--theme-sizes-navigation-minWidth);
+  .noWorkspaces {
+    opacity: 0;
+    transition: opacity var(--animation-curve);
+  }
+  .navItemContainer {
+    flex-direction: column;
+    transition: height var(--animation-curve), width var(--animation-curve);
+    width: var(--nav-side-bar-width-min);
 
+    .action,
     .label {
       opacity: 0;
-      transition: opacity var(--theme-animationCurve);
+      transition: opacity var(--animation-curve);
     }
-    .status {
-      right: 50%;
-      transform: translateX(50%);
-      transition:
-        bottom var(--theme-animationCurve),
-        right var(--theme-animationCurve),
-        transform var(--theme-animationCurve);
+    .navItemExtra {
+      display: none;
+
+      & * {
+        flex-direction: column;
+        justify-content: center;
+      }
+      .status {
+        margin: 0;
+      }
     }
   }
-  .navItem.hasStatus {
+  .navItemContainer.hasStatus {
     height: 72px;
-
-    .status { bottom: var(--theme-sizes-layout-large); }
   }
   .user {
-    transition: width var(--theme-animationCurve);
-    width: var(--theme-sizes-navigation-minWidth);
+    transition: width var(--animation-curve);
+    width: var(--nav-side-bar-width-min);
 
     span {
       opacity: 0;
-      transition: opacity var(--theme-animationCurve);
+      transition: opacity var(--animation-curve);
     }
   }
 }
 .collapsedExit,
 .collapsedEnterDone {
-  flex-basis: var(--theme-sizes-navigation-minWidth);
+  flex-basis: var(--nav-side-bar-width-min);
 
   section.launch {
-    width: var(--theme-sizes-navigation-minWidth);
+    width: var(--nav-side-bar-width-min);
   }
   .logo {
     height: 24px;
@@ -280,120 +339,134 @@
       padding: 0;
       width: 0;
     }
-    .launchIcon { border-radius: 100%; }
-  }
-  .navItem {
-    width: var(--theme-sizes-navigation-minWidth);
-
-    .label { opacity: 0; }
-    .status {
-      right: 50%;
-      transform: translateX(50%);
+    .launchIcon {
+      border-radius: 100%;
     }
   }
-  .navItem.hasStatus {
-    height: 72px;
+  .noWorkspaces {
+    opacity: 0;
+  }
+  .navItemContainer {
+    flex-direction: column;
+    width: var(--nav-side-bar-width-min);
 
-    .status { bottom: var(--theme-sizes-layout-large); }
+    .action,
+    .label {
+      opacity: 0;
+    }
+    .navItemExtra {
+      & * {
+        justify-content: center;
+      }
+      .status {
+        margin: 0;
+      }
+    }
+  }
+  .navItemContainer.hasStatus {
+    height: 72px;
   }
   .user {
-    width: var(--theme-sizes-navigation-minWidth);
+    width: var(--nav-side-bar-width-min);
 
-    span { opacity: 0; }
+    span {
+      opacity: 0;
+    }
   }
 }
 .collapsedExit {
-  .navItem {
-    .label { display: block; }
+  .noWorkspaces {
+    display: block;
+  }
+  .navItemContainer {
+    .action,
+    .label {
+      display: block;
+    }
   }
 }
 .collapsedEnterDone {
-  .navItem {
-    .label { display: none; }
+  .navItemContainer {
+    .action,
+    .label {
+      display: none;
+    }
+  }
+  .noWorkspaces {
+    display: none;
   }
 }
 .collapsedExitActive {
-  flex-basis: var(--theme-sizes-navigation-maxWidth);
-  transition: flex-basis var(--theme-animationCurve);
+  flex-basis: var(--nav-side-bar-width-max);
+  transition: flex-basis var(--animation-curve);
 
   section.launch {
-    transition: width var(--theme-animationCurve);
-    width: var(--theme-sizes-navigation-maxWidth);
+    transition: width var(--animation-curve);
+    width: var(--nav-side-bar-width-max);
   }
   .logo {
     height: 64.94px;
     left: 60px;
     top: 24px;
-    transition:
-      height var(--theme-animationCurve),
-      left var(--theme-animationCurve),
-      top var(--theme-animationCurve),
-      width var(--theme-animationCurve);
+    transition: height var(--animation-curve), left var(--animation-curve),
+      top var(--animation-curve), width var(--animation-curve);
     width: 128px;
   }
   .logoIcon {
     height: 40px;
     left: 32px;
-    transition:
-      height var(--theme-animationCurve),
-      left var(--theme-animationCurve),
-      width var(--theme-animationCurve);
+    transition: height var(--animation-curve), left var(--animation-curve),
+      width var(--animation-curve);
     width: 52px;
   }
   .logoLabel {
     opacity: 1;
-    transition:
-      opacity var(--theme-animationCurve),
-      width var(--theme-animationCurve);
+    transition: opacity var(--animation-curve), width var(--animation-curve);
     width: 120px;
   }
   .launchBlock {
-    transition: width var(--theme-animationCurve);
+    transition: width var(--animation-curve);
     width: 206px;
 
     .launchButton {
       opacity: 1;
-      padding: 0 var(--theme-sizes-layout-big);
-      transition:
-        opacity var(--theme-animationCurve),
-        padding var(--theme-animationCurve),
-        width var(--theme-animationCurve);
+      padding: 0 16px;
+      transition: opacity var(--animation-curve), padding var(--animation-curve),
+        width var(--animation-curve);
       width: 100%;
     }
     .launchIcon {
-      border-radius: 0 var(--theme-sizes-border-radius) var(--theme-sizes-border-radius) 0;
-      transition: border-radius var(--theme-animationCurve);
+      border-radius: 0 var(--theme-border-radius) var(--theme-border-radius) 0;
+      transition: border-radius var(--animation-curve);
     }
   }
-  .navItem {
-    transition: height var(--theme-animationCurve), width var(--theme-animationCurve);
-    width: var(--theme-sizes-navigation-maxWidth);
+  .noWorkspaces {
+    opacity: 1;
+    transition: opacity var(--animation-curve);
+  }
+  .navItemContainer {
+    transition: height var(--animation-curve), width var(--animation-curve);
+    width: var(--nav-side-bar-width-max);
 
+    .action,
     .label {
       opacity: 1;
-      transition: opacity var(--theme-animationCurve);
+      transition: opacity var(--animation-curve);
     }
-    .status {
-      right: var(--theme-sizes-layout-big);
-      transform: translateX(0);
-      transition:
-        bottom var(--theme-animationCurve),
-        right var(--theme-animationCurve),
-        transform var(--theme-animationCurve);
+    .navItemExtra {
+      display: none;
     }
   }
-  .navItem.hasStatus {
+  .navItemContainer.hasStatus {
     height: 48px;
-
-    .status { bottom: var(--theme-sizes-layout-big); }
   }
   .user {
-    transition: width var(--theme-animationCurve);
-    width: var(--theme-sizes-navigation-maxWidth);
+    transition: width var(--animation-curve);
+    width: var(--nav-side-bar-width-max);
 
     span {
       opacity: 1;
-      transition: opacity var(--theme-animationCurve);
+      transition: opacity var(--animation-curve);
     }
   }
 }

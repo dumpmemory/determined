@@ -1,4 +1,6 @@
-.base { display: grid; }
+.base {
+  display: grid;
+}
 .border {
   grid-gap: 1px;
 
@@ -7,4 +9,10 @@
     position: relative;
     z-index: 0;
   }
+}
+.row {
+  grid-auto-flow: column;
+  -webkit-overflow-scrolling: touch;
+  overflow-x: auto;
+  padding-bottom: 6px;
 }

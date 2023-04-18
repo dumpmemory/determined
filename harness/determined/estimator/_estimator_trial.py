@@ -18,10 +18,11 @@ from tensorflow.python.util import function_utils
 from tensorflow_estimator.python.estimator.training import _NewCheckpointListenerForEvaluate
 
 import determined as det
-from determined import estimator, horovod, layers, monkey_patch, tensorboard, workload
+from determined import estimator, horovod, layers, monkey_patch, tensorboard, util, workload
 from determined._tf_rng import get_rng_state, set_rng_state
 from determined.common import check
 from determined.horovod import hvd
+from determined.tensorboard.metric_writers import tensorflow
 
 VERY_LARGE_NUMBER = 9999999999999999
 
@@ -50,8 +51,8 @@ class DeterminedControlHook(estimator.RunHook):
     cases, execute non-training workloads.
 
     At the beginning of the train_and_evaluate() call and after each training
-    step ends, control_loop() is triggered and blocks on recieving instructions
-    for the next workload. Once instructions are recieved from the main
+    step ends, control_loop() is triggered and blocks on receiving instructions
+    for the next workload. Once instructions are received from the main
     process, control_loop() will compute validation, take a checkpoint, or
     break out of the loop to re-enter train_and_evaluate().
     """
@@ -76,7 +77,7 @@ class DeterminedControlHook(estimator.RunHook):
 
         self.prof = estimator_trial_controller.prof
 
-        self.latest_batch = estimator_trial_controller.env.latest_batch
+        self.steps_completed = estimator_trial_controller.env.steps_completed
 
     def begin(self) -> None:
         # For performance reasons, we collect per batch metrics
@@ -104,7 +105,7 @@ class DeterminedControlHook(estimator.RunHook):
     ) -> tf.estimator.SessionRunArgs:
         # On resuming from checkpoint, _current_global_step is None for one batch
         if self._current_global_step is None:
-            self.prof.update_batch_idx(self.estimator_trial_controller.env.latest_batch)
+            self.prof.update_batch_idx(self.estimator_trial_controller.env.steps_completed)
         else:
             self.prof.update_batch_idx(self._current_global_step)
         return tf.estimator.SessionRunArgs(
@@ -138,7 +139,7 @@ class DeterminedControlHook(estimator.RunHook):
         )
         self._session = run_context.session
         self._current_global_step = int(run_values.results["global_step"])
-        self.latest_batch += 1
+        self.steps_completed += 1
 
         self.num_batches = cast(int, self.num_batches)
         self._collect_batch_metrics(run_values)
@@ -158,14 +159,21 @@ class DeterminedControlHook(estimator.RunHook):
         check.is_not_none(self.train_response_func, "no response_func at end of train_for_step")
         assert self.train_response_func is not None
         if self.estimator_trial_controller.is_chief:
+            metrics = det.util.make_metrics(self.batches_processed_in_step, self.step_metrics)
             response = {
-                "metrics": det.util.make_metrics(self.batches_processed_in_step, self.step_metrics),
+                "metrics": metrics,
                 "stop_requested": self.estimator_trial_controller.context.get_stop_requested(),
             }  # type: workload.Response
+            self.estimator_trial_controller.metric_writer.on_train_step_end(
+                self.steps_completed,
+                metrics["avg_metrics"],
+                metrics["batch_metrics"],
+            )
         else:
             response = {}
 
         self.train_response_func(response)
+        self.estimator_trial_controller.upload_tb_files()
 
         # Reset step counter and clear the step metrics from memory.
         self.train_response_func = None
@@ -282,7 +290,7 @@ class DeterminedControlHook(estimator.RunHook):
         return self.estimator_trial_controller.compute_validation_metrics()
 
     def control_loop(self) -> None:
-        _core = self.estimator_trial_controller.context._core
+        core = self.estimator_trial_controller.context._core
 
         assert self.estimator_trial_controller.workloads is not None
         for wkld, response_func in self.estimator_trial_controller.workloads:
@@ -299,23 +307,29 @@ class DeterminedControlHook(estimator.RunHook):
 
                 elif wkld.kind == workload.Workload.Kind.COMPUTE_VALIDATION_METRICS:
                     action = "validation"
+                    metrics = self._compute_validation_metrics()
                     response = {
-                        "metrics": self._compute_validation_metrics(),
+                        "metrics": metrics,
                         "stop_requested": (
                             self.estimator_trial_controller.context.get_stop_requested()
                         ),
                     }  # type: workload.Response
+                    if isinstance(metrics, Dict) and self.estimator_trial_controller.is_chief:
+                        self.estimator_trial_controller._write_validation_metrics(
+                            self.steps_completed, metrics["validation_metrics"]
+                        )
 
                 elif wkld.kind == workload.Workload.Kind.CHECKPOINT_MODEL:
                     action = "checkpointing"
                     self._save_model()
                     if self.estimator_trial_controller.is_chief:
                         metadata = {
-                            "latest_batch": self.latest_batch,
+                            "determined_version": det.__version__,
+                            "steps_completed": self.steps_completed,
                             "framework": f"tensorflow-{tf.__version__}",
                             "format": "saved_model",
                         }
-                        with _core.checkpoint.store_path(metadata) as (path, storage_id):
+                        with core.checkpoint.store_path(metadata) as (path, storage_id):
                             self._checkpoint_model(path)
                         response = {"uuid": storage_id}
                     else:
@@ -329,6 +343,7 @@ class DeterminedControlHook(estimator.RunHook):
                 response = workload.InvalidHP()
 
             response_func(response)
+            self.estimator_trial_controller.upload_tb_files()
 
         # End-of-training.
         raise det.errors.WorkerFinishedGracefully("Exiting normally.")
@@ -373,6 +388,8 @@ class EstimatorTrialController(det.TrialController):
         **kwargs: Any,
     ) -> None:
         super().__init__(context, *args, **kwargs)
+
+        self.metric_writer = self._create_metric_writer()
 
         # Catch if the estimator has been configured to use a tf.distribute.Strategy
         # as this can conflict with Determined's distributed training and lead to
@@ -462,6 +479,10 @@ class EstimatorTrialController(det.TrialController):
         # tf.estimator.RunConfig.tf_random_seed.
         tf.compat.v1.set_random_seed(seed)
 
+    def _create_metric_writer(self) -> tensorboard.BatchMetricWriter:
+        writer = tensorflow.TFWriter()
+        return tensorboard.BatchMetricWriter(writer)
+
     @classmethod
     def _set_default_tensorflow_session(
         cls: Type["EstimatorTrialController"],
@@ -518,17 +539,8 @@ class EstimatorTrialController(det.TrialController):
         def wrapper(*args: Any, **kwargs: Any) -> tf.data.Dataset:
             ds = f(*args, **kwargs)
 
-            if self.context.experimental.get_train_cacheable().is_decorator_used():
-                check.false(
-                    self.context.dataset_initialized,
-                    "Please do not use: `context.wrap_dataset(dataset)` if using "
-                    "`@context.experimental.cache_train_dataset(dataset_name, dataset_version)` "
-                    "and `@context.experimental.cache_validation_dataset(dataset_name, "
-                    "dataset_version)`.",
-                )
-            else:
-                check.true(
-                    self.context.dataset_initialized,
+            if not self.context.dataset_initialized:
+                raise RuntimeError(
                     "Please pass your datasets (train and test) into "
                     "`context.wrap_dataset(dataset)` right after creating them.",
                 )
@@ -698,6 +710,13 @@ class EstimatorTrialController(det.TrialController):
         logging.debug(f"Initialized RunConfig with args: {config}.")
         return config
 
+    def _write_validation_metrics(self, steps_completed: int, metrics: Dict[str, Any]) -> None:
+        if self.is_chief:
+            self.metric_writer.on_validation_step_end(
+                steps_completed,
+                metrics,
+            )
+
     def run(self) -> None:
         with self.prof:
             try:
@@ -741,7 +760,7 @@ class EstimatorTrialController(det.TrialController):
 
             self.estimator_dir = pathlib.Path(tempfile.mkdtemp(suffix=suffix))
             if self.estimator_dir.exists():
-                shutil.rmtree(str(self.estimator_dir))
+                util.rmtree_nfs_safe(str(self.estimator_dir))
             logging.debug(f"Copying from {load_path} to {self.estimator_dir}.")
             shutil.copytree(str(load_path), str(self.estimator_dir))
 
@@ -799,7 +818,7 @@ class EstimatorTrial(det.Trial):
     """
     By default, experiments run with TensorFlow 1.x. To configure your trial to
     use TensorFlow 2.x, set a TF 2.x image in the experiment configuration
-    (e.g. ``determinedai/environments:cuda-11.3-pytorch-1.10-lightning-1.5-tf-2.8-gpu-0.17.15``).
+    (e.g. ``determinedai/environments:cuda-11.3-pytorch-1.12-tf-2.8-gpu-0.21.2``).
 
     ``EstimatorTrial`` supports TF 2.x; however it uses TensorFlow V1
     behavior. We have disabled TensorFlow V2 behavior for ``EstimatorTrial``,

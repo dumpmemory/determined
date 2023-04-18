@@ -2,12 +2,11 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Tuple
 
 import pkg_resources
 from termcolor import colored
 
-import determined
 import determined.deploy
 from determined.common.declarative_argparse import Arg, ArgGroup, Cmd
 from determined.deploy.errors import MasterTimeoutExpired
@@ -19,18 +18,6 @@ def validate_cluster_id() -> Callable:
         if isinstance(s, str) and len(s) <= 35:
             return s
         raise argparse.ArgumentTypeError("must be at most 35 characters")
-
-    return validate
-
-
-def validate_scheduler_type() -> Callable:
-    def validate(s: str) -> str:
-        supported_scheduler_types = ["fair_share", "priority", "round_robin"]
-        if s not in supported_scheduler_types:
-            raise argparse.ArgumentTypeError(
-                f"supported schedulers are: {supported_scheduler_types}"
-            )
-        return s
 
     return validate
 
@@ -69,9 +56,20 @@ def deploy_gcp(command: str, args: argparse.Namespace) -> None:
 
     # Handle down subcommand.
     if command == "down":
-        gcp.delete(det_configs, env, args.no_prompt)
+        gcp.delete(det_configs, env, args.yes)
         print("Delete Successful")
         return
+
+    det_configs["labels"] = dict(det_configs.get("add_label", []))
+    reserved_labels = {
+        "determined-master-host",
+        "determined-master-port",
+        "determined-resource-pool",
+        "managed-by",
+    }
+    if reserved_labels.intersection(det_configs["labels"]):
+        print(f"The labels {reserved_labels} are reserved for agents.")
+        sys.exit(1)
 
     # Handle Up subcommand.
     if (args.cpu_env_image and not args.gpu_env_image) or (
@@ -100,10 +98,12 @@ def deploy_gcp(command: str, args: argparse.Namespace) -> None:
         "user",
         "no_preflight_checks",
         "no_wait_for_master",
+        "yes",
         "no_prompt",
         "master_config_template_path",
         "tf_state_gcs_bucket_name",
         "func",
+        "add_label",
         "_command",
         "_subcommand",
         "_subsubcommand",
@@ -155,6 +155,22 @@ def handle_dump_master_config_template(args: argparse.Namespace) -> None:
         print(fin.read())
 
 
+def parse_add_label() -> Callable:
+    def parse(s: str) -> Tuple[str, str]:
+        try:
+            key, value = s.split("=", 1)
+        except ValueError:
+            raise argparse.ArgumentTypeError("key=value format requires both a key and a value")
+
+        if not key or not value:
+            raise argparse.ArgumentTypeError(
+                "both key and value must be defined in key=value format"
+            )
+        return key, value
+
+    return parse
+
+
 args_description = Cmd(
     "gcp",
     None,
@@ -176,9 +192,15 @@ args_description = Cmd(
                             help="local directory for storing cluster state",
                         ),
                         Arg(
-                            "--no-prompt",
+                            "--yes",
                             action="store_true",
                             help="no prompt when deleting resources",
+                        ),
+                        Arg(
+                            "--no-prompt",
+                            dest="yes",
+                            action="store_true",
+                            help=argparse.SUPPRESS,
                         ),
                     ],
                 ),
@@ -265,6 +287,18 @@ args_description = Cmd(
                             help="zone to create the cluster in (defaults to `region`-b)",
                         ),
                         Arg(
+                            "--disk-size",
+                            type=int,
+                            default=constants.defaults.BOOT_DISK_SIZE,
+                            help="Boot disk size for cluster agents, in GB",
+                        ),
+                        Arg(
+                            "--disk-type",
+                            type=str,
+                            default=constants.defaults.BOOT_DISK_TYPE,
+                            help="Boot disk type for cluster agents",
+                        ),
+                        Arg(
                             "--environment-image",
                             type=str,
                             default=constants.defaults.ENVIRONMENT_IMAGE,
@@ -299,16 +333,14 @@ args_description = Cmd(
                             "--gpu-agent-instance-type",
                             type=str,
                             default=constants.defaults.COMPUTE_AGENT_INSTANCE_TYPE,
-                            help="instance type for agent in the compute "
-                            "(previously, GPU) resource pool",
+                            help="instance type for agents in the compute resource pool",
                         ),
                         Arg(
                             "--aux-agent-instance-type",
                             "--cpu-agent-instance-type",
                             type=str,
                             default=constants.defaults.AUX_AGENT_INSTANCE_TYPE,
-                            help="instance type for agent in the auxiliary "
-                            "(previously, CPU) resource pool",
+                            help="instance type for agents in the auxiliary resource pool",
                         ),
                         Arg(
                             "--db-password",
@@ -321,8 +353,8 @@ args_description = Cmd(
                             "--max-cpu-containers-per-agent",
                             type=int,
                             default=constants.defaults.MAX_AUX_CONTAINERS_PER_AGENT,
-                            help="maximum number of containers on agent in the "
-                            "auxiliary (previously, CPU) resource pool",
+                            help="maximum number of containers on agents in the "
+                            "auxiliary resource pool",
                         ),
                         Arg(
                             "--max-idle-agent-period",
@@ -368,12 +400,6 @@ args_description = Cmd(
                             help="maximum number of dynamic agent instances at one time",
                         ),
                         Arg(
-                            "--static-agents",
-                            type=int,
-                            default=constants.defaults.STATIC_AGENTS,
-                            help=argparse.SUPPRESS,
-                        ),
-                        Arg(
                             "--min-cpu-platform-master",
                             type=str,
                             default=constants.defaults.MIN_CPU_PLATFORM_MASTER,
@@ -387,9 +413,10 @@ args_description = Cmd(
                         ),
                         Arg(
                             "--scheduler-type",
-                            type=validate_scheduler_type(),
+                            type=str,
+                            choices=["fair_share", "priority", "round_robin"],
                             default=constants.defaults.SCHEDULER_TYPE,
-                            help="scheduler to use (defaults to fair_share).",
+                            help="scheduler to use",
                         ),
                         Arg(
                             "--preemption-enabled",
@@ -422,6 +449,14 @@ args_description = Cmd(
                             default=None,
                             help="use the GCS bucket to store the terraform state "
                             "instead of a local directory",
+                        ),
+                        Arg(
+                            "--add-label",
+                            type=parse_add_label(),
+                            action="append",
+                            default=None,
+                            help="apply label to master instance in key=value format, "
+                            "can be repeated",
                         ),
                     ],
                 ),

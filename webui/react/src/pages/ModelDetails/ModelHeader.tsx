@@ -1,90 +1,161 @@
 import { LeftOutlined } from '@ant-design/icons';
-import { Alert, Breadcrumb, Button, Dropdown, Menu, Modal, Space } from 'antd';
-import React, { useCallback, useMemo } from 'react';
+import { Alert, Dropdown, Space, Typography } from 'antd';
+import type { DropDownProps, MenuProps } from 'antd';
+import React, { useMemo } from 'react';
 
-import Avatar from 'components/Avatar';
-import Icon from 'components/Icon';
+import DeleteModelModal from 'components/DeleteModelModal';
 import InfoBox, { InfoRow } from 'components/InfoBox';
-import InlineEditor from 'components/InlineEditor';
+import Breadcrumb from 'components/kit/Breadcrumb';
+import Button from 'components/kit/Button';
+import { useModal } from 'components/kit/Modal';
+import Tags, { tagsActionHelper } from 'components/kit/Tags';
+import Avatar from 'components/kit/UserAvatar';
 import Link from 'components/Link';
-import { relativeTimeRenderer } from 'components/Table';
-import TagList from 'components/TagList';
-import { useStore } from 'contexts/Store';
+import ModelEditModal from 'components/ModelEditModal';
+import ModelMoveModal from 'components/ModelMoveModal';
+import TimeAgo from 'components/TimeAgo';
+import usePermissions from 'hooks/usePermissions';
+import { WorkspaceDetailsTab } from 'pages/WorkspaceDetails';
 import { paths } from 'routes/utils';
-import { ModelItem } from 'types';
-import { formatDatetime } from 'utils/datetime';
+import Icon from 'shared/components/Icon/Icon';
+import Spinner from 'shared/components/Spinner';
+import { ValueOf } from 'shared/types';
+import { formatDatetime } from 'shared/utils/datetime';
+import userStore from 'stores/users';
+import { ModelItem, Workspace } from 'types';
+import { Loadable } from 'utils/loadable';
+import { useObservable } from 'utils/observable';
 import { getDisplayName } from 'utils/user';
 
 import css from './ModelHeader.module.scss';
 
 interface Props {
   model: ModelItem;
-  onDelete: () => void;
-  onSaveDescription: (editedDescription: string) => Promise<void>
-  onSaveName: (editedName: string) => Promise<void>;
+  fetchModel: () => Promise<void>;
   onSwitchArchive: () => void;
   onUpdateTags: (newTags: string[]) => Promise<void>;
+  workspace?: Workspace;
 }
 
-const ModelHeader: React.FC<Props> = (
-  {
-    model, onDelete, onSwitchArchive,
-    onSaveDescription, onUpdateTags, onSaveName,
-  }: Props,
-) => {
-  const { auth: { user }, users } = useStore();
+const ModelHeader: React.FC<Props> = ({
+  model,
+  workspace,
+  fetchModel,
+  onSwitchArchive,
+  onUpdateTags,
+}: Props) => {
+  const loadableUsers = useObservable(userStore.getUsers());
+  const users = Loadable.getOrElse([], loadableUsers);
+  const deleteModelModal = useModal(DeleteModelModal);
+  const modelMoveModal = useModal(ModelMoveModal);
+  const modelEditModal = useModal(ModelEditModal);
+  const { canDeleteModel, canModifyModel } = usePermissions();
+  const canDeleteModelFlag = canDeleteModel({ model });
+  const canModifyModelFlag = canModifyModel({ model });
 
   const infoRows: InfoRow[] = useMemo(() => {
-    return [ {
-      content: (
-        <Space>
-          <Avatar username={model.username} />
-          {`${getDisplayName(users.find(user => user.username === model.username))} on 
-          ${formatDatetime(model.creationTime, { format: 'MMM D, YYYY' })}`}
-        </Space>
-      ),
-      label: 'Created by',
-    },
-    { content: relativeTimeRenderer(new Date(model.lastUpdatedTime)), label: 'Updated' },
-    {
-      content: (
-        <InlineEditor
-          disabled={model.archived}
-          placeholder="Add description..."
-          value={model.description ?? ''}
-          onSave={onSaveDescription}
-        />
-      ),
-      label: 'Description',
-    },
-    {
-      content: (
-        <TagList
-          disabled={model.archived}
-          ghost={false}
-          tags={model.labels ?? []}
-          onChange={onUpdateTags}
-        />
-      ),
-      label: 'Tags',
-    } ] as InfoRow[];
-  }, [ model, onSaveDescription, onUpdateTags, users ]);
+    const user = users.find((user) => user.id === model.userId);
 
-  const isDeletable = user?.isAdmin || user?.username === model.username;
+    return [
+      {
+        content: (
+          <Space>
+            <Spinner conditionalRender spinning={Loadable.isLoading(loadableUsers)}>
+              <>
+                <Avatar user={user} />
+                {`${getDisplayName(user)} on
+                ${formatDatetime(model.creationTime, { format: 'MMM D, YYYY' })}`}
+              </>
+            </Spinner>
+          </Space>
+        ),
+        label: 'Created by',
+      },
+      { content: <TimeAgo datetime={new Date(model.lastUpdatedTime)} />, label: 'Updated' },
+      {
+        content: (
+          <div>
+            {(model.description ?? '') || (
+              <Typography.Text disabled={model.archived || !canModifyModelFlag}>
+                N/A
+              </Typography.Text>
+            )}
+          </div>
+        ),
+        label: 'Description',
+      },
+      {
+        content: (
+          <Tags
+            disabled={model.archived || !canModifyModelFlag}
+            ghost={false}
+            tags={model.labels ?? []}
+            onAction={tagsActionHelper(model.labels ?? [], onUpdateTags)}
+          />
+        ),
+        label: 'Tags',
+      },
+    ] as InfoRow[];
+  }, [canModifyModelFlag, loadableUsers, model, onUpdateTags, users]);
 
-  const showConfirmDelete = useCallback((model: ModelItem) => {
-    Modal.confirm({
-      closable: true,
-      content: `Are you sure you want to delete this model "${model.name}" and all 
-      of its versions from the model registry?`,
-      icon: null,
-      maskClosable: true,
-      okText: 'Delete Model',
-      okType: 'danger',
-      onOk: () => onDelete(),
-      title: 'Confirm Delete',
-    });
-  }, [ onDelete ]);
+  const menu: DropDownProps['menu'] = useMemo(() => {
+    const MenuKey = {
+      DeleteModel: 'delete-model',
+      EditModelName: 'edit-model-name',
+      MoveModel: 'move-model',
+      SwitchArchived: 'switch-archive',
+    } as const;
+
+    const funcs = {
+      [MenuKey.SwitchArchived]: () => {
+        onSwitchArchive();
+      },
+      [MenuKey.EditModelName]: () => {
+        modelEditModal.open();
+      },
+      [MenuKey.MoveModel]: () => {
+        modelMoveModal.open();
+      },
+      [MenuKey.DeleteModel]: () => {
+        deleteModelModal.open();
+      },
+    };
+
+    const onItemClick: MenuProps['onClick'] = (e) => {
+      funcs[e.key as ValueOf<typeof MenuKey>]();
+    };
+
+    const menuItems: MenuProps['items'] = [
+      {
+        disabled: model.archived || !canModifyModelFlag,
+        key: MenuKey.EditModelName,
+        label: 'Edit',
+      },
+    ];
+
+    if (canModifyModelFlag) {
+      menuItems.push({
+        key: MenuKey.SwitchArchived,
+        label: model.archived ? 'Unarchive' : 'Archive',
+      });
+      if (!model.archived) {
+        menuItems.push({ key: MenuKey.MoveModel, label: 'Move' });
+      }
+    }
+    if (canDeleteModelFlag) {
+      menuItems.push({ danger: true, key: MenuKey.DeleteModel, label: 'Delete' });
+    }
+
+    return { items: menuItems, onClick: onItemClick };
+  }, [
+    model.archived,
+    canModifyModelFlag,
+    canDeleteModelFlag,
+    onSwitchArchive,
+    modelEditModal,
+    modelMoveModal,
+    deleteModelModal,
+  ]);
 
   return (
     <header className={css.base}>
@@ -95,13 +166,33 @@ const ModelHeader: React.FC<Props> = (
               <LeftOutlined className={css.leftIcon} />
             </Link>
           </Breadcrumb.Item>
+          {workspace && (
+            <Breadcrumb.Item>
+              <Link
+                path={
+                  workspace.id === 1
+                    ? paths.projectDetails(1)
+                    : paths.workspaceDetails(workspace.id)
+                }>
+                {workspace.name}
+              </Link>
+            </Breadcrumb.Item>
+          )}
+          <Breadcrumb.Separator />
           <Breadcrumb.Item>
-            <Link path={paths.modelList()}>
+            <Link
+              path={
+                workspace?.id
+                  ? paths.workspaceDetails(workspace.id, WorkspaceDetailsTab.ModelRegistry)
+                  : paths.modelList()
+              }>
               Model Registry
             </Link>
           </Breadcrumb.Item>
           <Breadcrumb.Separator />
-          <Breadcrumb.Item>{model.name} ({model.id})</Breadcrumb.Item>
+          <Breadcrumb.Item>
+            {model.name} ({model.id})
+          </Breadcrumb.Item>
         </Breadcrumb>
       </div>
       {model.archived && (
@@ -116,33 +207,13 @@ const ModelHeader: React.FC<Props> = (
         <div className={css.mainRow}>
           <Space className={css.nameAndIcon}>
             <Icon name="model" size="big" />
-            <h1 className={css.name}>
-              <InlineEditor
-                allowClear={false}
-                disabled={model.archived}
-                placeholder="Add name..."
-                value={model.name}
-                onSave={onSaveName}
-              />
-            </h1>
+            <h1 className={css.name}>{model.name}</h1>
           </Space>
           <Space size="small">
             <Dropdown
-              overlay={(
-                <Menu>
-                  <Menu.Item key="switch-archive" onClick={onSwitchArchive}>
-                    {model.archived ? 'Unarchive' : 'Archive'}
-                  </Menu.Item>
-                  <Menu.Item
-                    danger
-                    disabled={!isDeletable}
-                    key="delete-model"
-                    onClick={() => showConfirmDelete(model)}>
-                    Delete
-                  </Menu.Item>
-                </Menu>
-              )}
-              trigger={[ 'click' ]}>
+              disabled={!canDeleteModelFlag && !canModifyModelFlag}
+              menu={menu}
+              trigger={['click']}>
               <Button type="text">
                 <Icon name="overflow-horizontal" size="tiny" />
               </Button>
@@ -151,6 +222,9 @@ const ModelHeader: React.FC<Props> = (
         </div>
         <InfoBox rows={infoRows} separator={false} />
       </div>
+      <deleteModelModal.Component model={model} />
+      <modelMoveModal.Component model={model} />
+      <modelEditModal.Component fetchModel={fetchModel} model={model} />
     </header>
   );
 };

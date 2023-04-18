@@ -12,7 +12,7 @@ func (d DeviceConfig) ToExpconf() expconf.Device {
 		RawHostPath:      d.HostPath,
 		RawContainerPath: d.ContainerPath,
 		RawMode:          ptrs.Ptr(d.Mode),
-	}).(expconf.Device)
+	})
 }
 
 // ToExpconf translates old model objects into an expconf object.
@@ -21,23 +21,27 @@ func (d DevicesConfig) ToExpconf() expconf.DevicesConfig {
 	for _, d := range d {
 		out = append(out, d.ToExpconf())
 	}
-	return schemas.WithDefaults(out).(expconf.DevicesConfig)
+	return schemas.WithDefaults(out)
 }
 
 // ToExpconf translates old model objects into an expconf object.
 func (r ResourcesConfig) ToExpconf() expconf.ResourcesConfig {
+	var shm *int
+	if r.ShmSize != nil {
+		shm = ptrs.Ptr(int(*r.ShmSize))
+	}
+
 	return schemas.WithDefaults(expconf.ResourcesConfig{
 		RawSlots:          ptrs.Ptr(r.Slots),
 		RawMaxSlots:       r.MaxSlots,
 		RawSlotsPerTrial:  ptrs.Ptr(1),
 		RawWeight:         ptrs.Ptr(r.Weight),
 		RawNativeParallel: ptrs.Ptr(r.NativeParallel),
-		RawShmSize:        r.ShmSize,
-		RawAgentLabel:     ptrs.Ptr(r.AgentLabel),
+		RawShmSize:        shm,
 		RawResourcePool:   ptrs.Ptr(r.ResourcePool),
 		RawPriority:       r.Priority,
 		RawDevices:        r.Devices.ToExpconf(),
-	}).(expconf.ResourcesConfig)
+	})
 }
 
 // ToExpconf translates old model objects into an expconf object.
@@ -47,7 +51,7 @@ func (b BindMount) ToExpconf() expconf.BindMount {
 		RawContainerPath: b.ContainerPath,
 		RawReadOnly:      ptrs.Ptr(b.ReadOnly),
 		RawPropagation:   ptrs.Ptr(b.Propagation),
-	}).(expconf.BindMount)
+	})
 }
 
 // ToExpconf translates old model objects into an expconf object.
@@ -56,7 +60,7 @@ func (b BindMountsConfig) ToExpconf() expconf.BindMountsConfig {
 	for _, m := range b {
 		out = append(out, m.ToExpconf())
 	}
-	return schemas.WithDefaults(out).(expconf.BindMountsConfig)
+	return schemas.WithDefaults(out)
 }
 
 // ToModelBindMount converts new expconf bind mounts into old modl bind mounts.
@@ -75,7 +79,7 @@ func (r RuntimeItems) ToExpconf() expconf.EnvironmentVariablesMap {
 		RawCPU:  r.CPU,
 		RawCUDA: r.CUDA,
 		RawROCM: r.ROCM,
-	}).(expconf.EnvironmentVariablesMap)
+	})
 }
 
 // ToExpconf translates old model objects into an expconf object.
@@ -84,22 +88,43 @@ func (r RuntimeItem) ToExpconf() expconf.EnvironmentImageMap {
 		RawCPU:  ptrs.Ptr(r.CPU),
 		RawCUDA: ptrs.Ptr(r.CUDA),
 		RawROCM: ptrs.Ptr(r.ROCM),
-	}).(expconf.EnvironmentImageMap)
+	})
+}
+
+// ToExpconf translates old model objects into an expconf object.
+func (p ProxyPort) ToExpconf() expconf.ProxyPort {
+	return schemas.WithDefaults(expconf.ProxyPort{
+		RawProxyPort:        p.ProxyPort,
+		RawProxyTCP:         &p.ProxyTCP,
+		RawUnauthenticated:  &p.Unauthenticated,
+		RawDefaultServiceID: &p.DefaultServiceID,
+	})
+}
+
+// ToExpconf translates old model objects into an expconf object.
+func (p ProxyPortsConfig) ToExpconf() expconf.ProxyPortsConfig {
+	var out expconf.ProxyPortsConfig
+	for _, pp := range p {
+		out = append(out, pp.ToExpconf())
+	}
+	return schemas.WithDefaults(out)
 }
 
 // ToExpconf translates old model objects into an expconf object.
 func (e Environment) ToExpconf() expconf.EnvironmentConfig {
 	image := e.Image.ToExpconf()
 	vars := e.EnvironmentVariables.ToExpconf()
+	proxyConf := e.ProxyPorts.ToExpconf()
 
 	return schemas.WithDefaults(expconf.EnvironmentConfig{
 		RawImage:                &image,
 		RawEnvironmentVariables: &vars,
+		RawProxyPorts:           &proxyConf,
 		RawPorts:                e.Ports,
 		RawRegistryAuth:         e.RegistryAuth,
 		RawForcePullImage:       ptrs.Ptr(e.ForcePullImage),
 		RawPodSpec:              (*expconf.PodSpec)(e.PodSpec),
 		RawAddCapabilities:      e.AddCapabilities,
 		RawDropCapabilities:     e.DropCapabilities,
-	}).(expconf.EnvironmentConfig)
+	})
 }

@@ -4,16 +4,14 @@ from typing import Any, Dict, Optional, Sequence
 from urllib.parse import urlencode
 
 import pytest
-import yaml
 
-from determined.common import api
+from determined.common import api, yaml
 from determined.common.api import authentication, bindings, certs
 from tests import config as conf
 from tests import experiment as exp
 
 
 @pytest.mark.e2e_gpu
-# TODO(DET-5803): We need a GPU warm-up job to prevent this excessive time limit.
 @pytest.mark.timeout(30 * 60)
 @pytest.mark.parametrize(
     "framework_base_experiment,framework_timings_enabled",
@@ -28,7 +26,7 @@ def test_streaming_observability_metrics_apis(
 ) -> None:
     # TODO: refactor tests to not use cli singleton auth.
     certs.cli_cert = certs.default_load(conf.make_master_url())
-    authentication.cli_auth = authentication.Authentication(conf.make_master_url(), try_reauth=True)
+    authentication.cli_auth = authentication.Authentication(conf.make_master_url())
 
     config_path = conf.tutorials_path(f"../{framework_base_experiment}/const.yaml")
     model_def_path = conf.tutorials_path(f"../{framework_base_experiment}")
@@ -43,9 +41,7 @@ def test_streaming_observability_metrics_apis(
             model_def_path,
         )
 
-    exp.wait_for_experiment_state(
-        experiment_id, bindings.determinedexperimentv1State.STATE_COMPLETED
-    )
+    exp.wait_for_experiment_state(experiment_id, bindings.experimentv1State.COMPLETED)
     trials = exp.experiment_trials(experiment_id)
     trial_id = trials[0].trial.id
 

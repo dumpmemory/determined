@@ -2,6 +2,7 @@ package searcher
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 
@@ -33,8 +34,8 @@ type (
 	}
 
 	trialMetric struct {
-		RequestID model.RequestID `json:"request_id"`
-		Metric    float64         `json:"metric"`
+		RequestID model.RequestID       `json:"request_id"`
+		Metric    model.ExtendedFloat64 `json:"metric"`
 		// fields below used by asha.go.
 		Promoted bool `json:"promoted"`
 	}
@@ -98,7 +99,7 @@ func (r *rung) promotionsAsync(
 	// Insert the new trial result in the appropriate place in the sorted list.
 	insertIndex := sort.Search(
 		len(r.Metrics),
-		func(i int) bool { return r.Metrics[i].Metric > metric },
+		func(i int) bool { return float64(r.Metrics[i].Metric) > metric },
 	)
 	promoteNow := insertIndex < numPromote
 
@@ -106,7 +107,7 @@ func (r *rung) promotionsAsync(
 	copy(r.Metrics[insertIndex+1:], r.Metrics[insertIndex:])
 	r.Metrics[insertIndex] = trialMetric{
 		RequestID: requestID,
-		Metric:    metric,
+		Metric:    model.ExtendedFloat64(metric),
 		Promoted:  promoteNow,
 	}
 
@@ -174,13 +175,17 @@ func (s *asyncHalvingSearch) trialClosed(
 }
 
 func (s *asyncHalvingSearch) validationCompleted(
-	ctx context, requestID model.RequestID, metric float64,
+	ctx context, requestID model.RequestID, metric interface{}, op ValidateAfter,
 ) ([]Operation, error) {
 	s.PendingTrials--
-	if !s.SmallerIsBetter {
-		metric *= -1
+	value, ok := metric.(float64)
+	if !ok {
+		return nil, fmt.Errorf("unexpected metric type for ASHA built-in search method %v", value)
 	}
-	return s.promoteAsync(ctx, requestID, metric), nil
+	if !s.SmallerIsBetter {
+		value *= -1
+	}
+	return s.promoteAsync(ctx, requestID, value), nil
 }
 
 func (s *asyncHalvingSearch) promoteAsync(
@@ -199,7 +204,7 @@ func (s *asyncHalvingSearch) promoteAsync(
 		rung.Metrics = append(rung.Metrics,
 			trialMetric{
 				RequestID: requestID,
-				Metric:    metric,
+				Metric:    model.ExtendedFloat64(metric),
 			},
 		)
 
@@ -269,7 +274,8 @@ func (s *asyncHalvingSearch) closeOutRungs() []Operation {
 }
 
 func (s *asyncHalvingSearch) progress(
-	map[model.RequestID]PartialUnits, map[model.RequestID]bool) float64 {
+	map[model.RequestID]PartialUnits, map[model.RequestID]bool,
+) float64 {
 	if s.MaxConcurrentTrials() > 0 && s.PendingTrials > s.MaxConcurrentTrials() {
 		panic("pending trials is greater than max_concurrent_trials")
 	}

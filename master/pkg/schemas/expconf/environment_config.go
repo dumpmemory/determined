@@ -15,17 +15,17 @@ import (
 // PodSpec is just a k8sV1.Pod with custom methods, since k8sV1.Pod is not reflect-friendly.
 type PodSpec k8sV1.Pod
 
-// Copy implements the schemas.Copyable interface.
-func (p PodSpec) Copy() interface{} {
+// Copy implements the schemas.Copyable psuedointerface.
+func (p PodSpec) Copy() PodSpec {
 	k8sP := k8sV1.Pod(p)
 	return PodSpec(*k8sP.DeepCopy())
 }
 
-// Merge implements the schemas.Mergable interface.
-func (p PodSpec) Merge(other interface{}) interface{} {
+// Merge implements the schemas.Mergable psuedointerface.
+func (p PodSpec) Merge(other PodSpec) PodSpec {
 	out := k8sV1.Pod{}
 	k8sP := k8sV1.Pod(p)
-	k8sOther := k8sV1.Pod(other.(PodSpec))
+	k8sOther := k8sV1.Pod(other)
 	// Copy the low-priority values first.
 	k8sOther.DeepCopyInto(&out)
 	// Overwrite the object with high-priority values.
@@ -34,17 +34,19 @@ func (p PodSpec) Merge(other interface{}) interface{} {
 	return PodSpec(out)
 }
 
-// WithDefaults implements the schemas.Defaultable interface.
-func (p PodSpec) WithDefaults() interface{} {
+// WithDefaults implements the schemas.Defaultable psuedointerface.
+func (p PodSpec) WithDefaults() PodSpec {
 	pod := k8sV1.Pod(p)
 	return PodSpec(*pod.DeepCopy())
 }
 
-//go:generate ../gen.sh --import github.com/docker/docker/api/types
 // EnvironmentConfigV0 configures the environment of a Determined command or experiment.
+//
+//go:generate ../gen.sh --import github.com/docker/docker/api/types
 type EnvironmentConfigV0 struct {
 	RawImage                *EnvironmentImageMapV0     `json:"image"`
 	RawEnvironmentVariables *EnvironmentVariablesMapV0 `json:"environment_variables"`
+	RawProxyPorts           *ProxyPortsConfigV0        `json:"proxy_ports"`
 
 	RawPorts          map[string]int    `json:"ports"`
 	RawRegistryAuth   *types.AuthConfig `json:"registry_auth"`
@@ -55,16 +57,17 @@ type EnvironmentConfigV0 struct {
 	RawDropCapabilities []string `json:"drop_capabilities"`
 }
 
-//go:generate ../gen.sh
 // EnvironmentImageMapV0 configures the runtime image.
+//
+//go:generate ../gen.sh
 type EnvironmentImageMapV0 struct {
 	RawCPU  *string `json:"cpu"`
 	RawCUDA *string `json:"cuda"`
 	RawROCM *string `json:"rocm"`
 }
 
-// WithDefaults implements the Defaultable interface.
-func (e EnvironmentImageMapV0) WithDefaults() interface{} {
+// WithDefaults implements the Defaultable psuedointerface.
+func (e EnvironmentImageMapV0) WithDefaults() EnvironmentImageMapV0 {
 	cpu := CPUImage
 	cuda := CUDAImage
 	rocm := ROCMImage
@@ -129,12 +132,32 @@ func (e EnvironmentImageMapV0) For(deviceType device.Type) string {
 	}
 }
 
-//go:generate ../gen.sh
 // EnvironmentVariablesMapV0 configures the runtime environment variables.
+//
+//go:generate ../gen.sh
 type EnvironmentVariablesMapV0 struct {
 	RawCPU  []string `json:"cpu"`
 	RawCUDA []string `json:"cuda"`
 	RawROCM []string `json:"rocm"`
+}
+
+// Merge implemenets the mergable interface.
+func (e EnvironmentVariablesMapV0) Merge(
+	other EnvironmentVariablesMapV0,
+) EnvironmentVariablesMapV0 {
+	// Order is relevant here. We want to append items to allow the following
+	// override order, expConf -> templates -> taskContainerDefaults.
+	// Items placed later in the array override items placed earlier.
+	var out EnvironmentVariablesMapV0
+	out.RawCPU = append(out.RawCPU, other.RawCPU...)
+	out.RawCUDA = append(out.RawCUDA, other.RawCUDA...)
+	out.RawROCM = append(out.RawROCM, other.RawROCM...)
+
+	out.RawCPU = append(out.RawCPU, e.RawCPU...)
+	out.RawCUDA = append(out.RawCUDA, e.RawCUDA...)
+	out.RawROCM = append(out.RawROCM, e.RawROCM...)
+
+	return out
 }
 
 // UnmarshalJSON implements the json.Unmarshaler interface.
@@ -196,4 +219,37 @@ func (e EnvironmentVariablesMapV0) For(deviceType device.Type) []string {
 	default:
 		panic(fmt.Sprintf("unexpected device type: %s", deviceType))
 	}
+}
+
+// ProxyPortV0 configures the master-proxied task ports.
+//
+//go:generate ../gen.sh
+type ProxyPortV0 struct {
+	RawProxyPort        int   `json:"proxy_port"`
+	RawProxyTCP         *bool `json:"proxy_tcp"`
+	RawUnauthenticated  *bool `json:"unauthenticated"`
+	RawDefaultServiceID *bool `json:"default_service_id"`
+}
+
+// ProxyPortsConfigV0 is the configuration for proxy ports.
+//
+//go:generate ../gen.sh
+type ProxyPortsConfigV0 []ProxyPortV0
+
+// Merge implemenets the mergable interface.
+func (b ProxyPortsConfigV0) Merge(other ProxyPortsConfigV0) ProxyPortsConfigV0 {
+	out := ProxyPortsConfigV0{}
+	out = append(out, b...)
+
+	// Prevent duplicate container ports as a result of the merge.
+	ports := map[int]bool{}
+	for _, pp := range b {
+		ports[pp.ProxyPort()] = true
+	}
+	for _, pp := range other {
+		if _, ok := ports[pp.ProxyPort()]; !ok {
+			out = append(out, pp)
+		}
+	}
+	return out
 }

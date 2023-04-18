@@ -154,13 +154,14 @@ func (r rendezvous) push() bool {
 	if !r.ready() {
 		return false
 	}
-	caddrs, raddrs, err := r.info()
+	caddrs, raddrs, slotCounts, err := r.info()
 	for _, caddr := range caddrs {
 		w := r.watchers[caddr.id]
 		w <- RendezvousInfoOrError{
 			Info: &trialv1.RendezvousInfo{
 				Addresses: raddrs,
-				Rank:      int32(r.resources[caddr.id].rank),
+				Slots:     slotCounts,
+				Rank:      int32(r.resources[caddr.id].Rank),
 			},
 			Err: err,
 		}
@@ -172,7 +173,7 @@ func (r rendezvous) push() bool {
 
 // checkTimeout checks if the task should timeout waiting for rendezvous.
 func (r *rendezvous) checkTimeout(msg rendezvousTimeout) error {
-	if r == nil {
+	if r == nil || r.allReadySucceeded {
 		return nil
 	}
 
@@ -206,16 +207,19 @@ type cAddress struct {
 	id        sproto.ResourcesID
 	addresses []cproto.Address
 	ordinal   int
+	slots     int
 }
 
-func (r *rendezvous) info() ([]cAddress, []string, error) {
+func (r *rendezvous) info() ([]cAddress, []string, []int32, error) {
 	var caddrs []cAddress
 	for id, r := range r.resources {
 		caddr := cAddress{
 			id:        id,
-			addresses: r.start.Addresses,
-			ordinal:   r.rank,
+			addresses: r.Started.Addresses,
+			ordinal:   r.Rank,
+			slots:     r.Summary().Slots(),
 		}
+
 		caddrs = append(caddrs, caddr)
 
 		sort.Slice(caddr.addresses, func(i, j int) bool {
@@ -240,6 +244,7 @@ func (r *rendezvous) info() ([]cAddress, []string, error) {
 	})
 
 	var raddrs []string
+	var slots []int32
 	var err *multierror.Error
 	for _, caddr := range caddrs {
 		var addrs []cproto.Address
@@ -252,11 +257,12 @@ func (r *rendezvous) info() ([]cAddress, []string, error) {
 
 		if len(addrs) == 1 {
 			raddrs = append(raddrs, addrs[0].HostIP)
+			slots = append(slots, int32(caddr.slots))
 		} else {
 			err = multierror.Append(err, fmt.Errorf(
 				"found %d rendezvous addresses instead of 1 for container %s; dropping rendezvous addresses %v",
 				len(addrs), caddr.id, addrs))
 		}
 	}
-	return caddrs, raddrs, err.ErrorOrNil()
+	return caddrs, raddrs, slots, err.ErrorOrNil()
 }

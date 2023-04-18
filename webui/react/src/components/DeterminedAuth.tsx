@@ -1,14 +1,23 @@
-import { Button, Form, Input } from 'antd';
+import { ConfigProvider } from 'antd';
 import React, { useCallback, useState } from 'react';
 
-import Icon from 'components/Icon';
+import Button from 'components/kit/Button';
+import Form from 'components/kit/Form';
+import Input from 'components/kit/Input';
 import Link from 'components/Link';
-import { StoreAction, useStoreDispatch } from 'contexts/Store';
+import useFeature from 'hooks/useFeature';
 import { paths } from 'routes/utils';
-import { isLoginFailure, login } from 'services/api';
+import { login } from 'services/api';
 import { updateDetApi } from 'services/apiConfig';
-import handleError, { ErrorType } from 'utils/error';
-import { Storage } from 'utils/storage';
+import { isLoginFailure } from 'services/utils';
+import Icon from 'shared/components/Icon/Icon';
+import useUI from 'shared/contexts/stores/UI';
+import { ErrorType } from 'shared/utils/error';
+import { StorageManager } from 'shared/utils/storage';
+import authStore from 'stores/auth';
+import permissionStore from 'stores/permissions';
+import userStore from 'stores/users';
+import handleError from 'utils/error';
 
 import css from './DeterminedAuth.module.scss';
 
@@ -21,48 +30,67 @@ interface FromValues {
   username?: string;
 }
 
-const storage = new Storage({ basePath: '/DeterminedAuth', store: window.localStorage });
+const storage = new StorageManager({ basePath: '/DeterminedAuth', store: window.localStorage });
 const STORAGE_KEY_LAST_USERNAME = 'lastUsername';
 
-const DeterminedAuth: React.FC<Props> = ({ canceler }: Props) => {
-  const storeDispatch = useStoreDispatch();
-  const [ isBadCredentials, setIsBadCredentials ] = useState(false);
-  const [ canSubmit, setCanSubmit ] = useState(!!storage.get(STORAGE_KEY_LAST_USERNAME));
+const buttonTheme = {
+  components: {
+    Button: {
+      colorPrimary: 'var(--theme-brand)',
+      colorPrimaryActive: 'var(--theme-brand-strong)',
+      colorPrimaryHover: 'var(--theme-brand-weak)',
+    },
+  },
+};
 
-  const onFinish = useCallback(async (creds: FromValues): Promise<void> => {
-    storeDispatch({ type: StoreAction.ShowUISpinner });
-    setCanSubmit(false);
-    try {
-      const { token, user } = await login(
-        {
-          password: creds.password || '',
-          username: creds.username || '',
+const DeterminedAuth: React.FC<Props> = ({ canceler }: Props) => {
+  const { actions: uiActions } = useUI();
+  const rbacEnabled = useFeature().isOn('rbac');
+  const [isBadCredentials, setIsBadCredentials] = useState<boolean>(false);
+  const [canSubmit, setCanSubmit] = useState<boolean>(!!storage.get(STORAGE_KEY_LAST_USERNAME));
+  const [isSubmitted, setIsSubmitted] = useState<boolean>(false);
+
+  const onFinish = useCallback(
+    async (creds: FromValues): Promise<void> => {
+      uiActions.showSpinner();
+      setCanSubmit(false);
+      setIsSubmitted(true);
+      try {
+        const { token, user } = await login(
+          {
+            password: creds.password || '',
+            username: creds.username || '',
+          },
+          { signal: canceler.signal },
+        );
+        updateDetApi({ apiKey: `Bearer ${token}` });
+        authStore.setAuth({ isAuthenticated: true, token });
+        userStore.updateCurrentUser(user);
+        if (rbacEnabled) {
+          // Now that we have logged in user, fetch userAssignments and userRoles and place into store.
+          permissionStore.fetch(canceler.signal);
         }
-        , { signal: canceler.signal },
-      );
-      updateDetApi({ apiKey: `Bearer ${token}` });
-      storeDispatch({
-        type: StoreAction.SetAuth,
-        value: { isAuthenticated: true, token, user },
-      });
-      storage.set(STORAGE_KEY_LAST_USERNAME, creds.username);
-    } catch (e) {
-      const isBadCredentialsSync = isLoginFailure(e);
-      setIsBadCredentials(isBadCredentialsSync); // this is not a sync operation
-      storeDispatch({ type: StoreAction.HideUISpinner });
-      const actionMsg = isBadCredentialsSync ? 'check your username and password.' : 'retry.';
-      if (isBadCredentialsSync) storage.remove(STORAGE_KEY_LAST_USERNAME);
-      handleError(e, {
-        isUserTriggered: true,
-        publicMessage: `Failed to login. Please ${actionMsg}`,
-        publicSubject: 'Login failed',
-        silent: false,
-        type: isBadCredentialsSync ? ErrorType.Input : ErrorType.Server,
-      });
-    } finally {
-      setCanSubmit(true);
-    }
-  }, [ canceler, storeDispatch ]);
+        storage.set(STORAGE_KEY_LAST_USERNAME, creds.username);
+      } catch (e) {
+        const isBadCredentialsSync = isLoginFailure(e);
+        setIsBadCredentials(isBadCredentialsSync); // this is not a sync operation
+        uiActions.hideSpinner();
+        const actionMsg = isBadCredentialsSync ? 'check your username and password.' : 'retry.';
+        if (isBadCredentialsSync) storage.remove(STORAGE_KEY_LAST_USERNAME);
+        handleError(e, {
+          isUserTriggered: true,
+          publicMessage: `Failed to login. Please ${actionMsg}`,
+          publicSubject: 'Login failed',
+          silent: false,
+          type: isBadCredentialsSync ? ErrorType.Input : ErrorType.Server,
+        });
+      } finally {
+        setCanSubmit(true);
+        setIsSubmitted(false);
+      }
+    },
+    [canceler, uiActions, rbacEnabled],
+  );
 
   const onValuesChange = useCallback((changes: FromValues, values: FromValues): void => {
     const hasUsername = !!values.username;
@@ -72,7 +100,6 @@ const DeterminedAuth: React.FC<Props> = ({ canceler }: Props) => {
 
   const loginForm = (
     <Form
-      className={css.form}
       initialValues={{ username: storage.getWithDefault(STORAGE_KEY_LAST_USERNAME, '') }}
       name="login"
       onFinish={onFinish}
@@ -91,12 +118,14 @@ const DeterminedAuth: React.FC<Props> = ({ canceler }: Props) => {
         <Input.Password placeholder="password" prefix={<Icon name="lock" size="small" />} />
       </Form.Item>
       {isBadCredentials && (
-        <p className={[ css.errorMessage, css.message ].join(' ')}>
-          Incorrect username or password.
-        </p>
+        <p className={[css.errorMessage, css.message].join(' ')}>Incorrect username or password.</p>
       )}
       <Form.Item>
-        <Button disabled={!canSubmit} htmlType="submit" type="primary">Sign In</Button>
+        <ConfigProvider theme={buttonTheme}>
+          <Button disabled={!canSubmit} htmlType="submit" loading={isSubmitted} type="primary">
+            Sign In
+          </Button>
+        </ConfigProvider>
       </Form.Item>
     </Form>
   );
@@ -106,7 +135,9 @@ const DeterminedAuth: React.FC<Props> = ({ canceler }: Props) => {
       {loginForm}
       <p className={css.message}>
         Forgot your password, or need to manage users? Check out our&nbsp;
-        <Link external path={paths.docs('/sysadmin-basics/users.html')} popout>docs</Link>
+        <Link external path={paths.docs('/sysadmin-basics/users.html')} popout>
+          docs
+        </Link>
       </p>
     </div>
   );

@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="determined",
-    version="0.17.15-dev0",
+    version="0.21.2-dev0",
     author="Determined AI",
     author_email="hello@determined.ai",
     url="https://determined.ai/",
@@ -11,6 +11,8 @@ setup(
     license="Apache License 2.0",
     classifiers=["License :: OSI Approved :: Apache Software License"],
     packages=find_packages(exclude=["*.tests", "*.tests.*", "tests.*", "tests"]),
+    # Technically, we haven't supported 3.6 or tested against it since it went EOL.  But some users
+    # are still using it successfully so there's hardly a point in breaking them.
     python_requires=">=3.6",
     package_data={"determined": ["py.typed"]},
     include_package_data=True,
@@ -29,9 +31,8 @@ setup(
         "hdfs>=2.2.2",
         "lomond>=0.3.3",
         "pathspec>=0.6.0",
+        "azure-core",
         "azure-storage-blob",
-        # azure-core 1.23 requires typing-extensions 4.x which is incompatible with TF2.4
-        "azure-core<1.23",
         "termcolor>=1.1.0",
         "boto3",
         # CLI:
@@ -47,12 +48,8 @@ setup(
         "docker[ssh]>=3.7.3",
         "google-api-python-client>=1.12.1",
         "paramiko>=2.4.2",  # explicitly pull in paramiko to prevent DistributionNotFound error
-        "docker-compose>=1.13.0",
         "tqdm",
         "appdirs",
-        # docker-compose has a requirement not properly propagated with semi-old pip installations;
-        # so we expose that requirement here.
-        "websocket-client<1",
         # Telemetry
         "analytics-python",
     ],
@@ -60,7 +57,6 @@ setup(
     entry_points={
         "console_scripts": [
             "det = determined.cli.__main__:main",
-            "det-deploy = determined.deploy.__main__:main",
         ]
     },
 )

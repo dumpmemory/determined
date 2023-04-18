@@ -1,20 +1,27 @@
-.overflow {
-  padding: var(--theme-sizes-layout-small);
+.tagsRenderer {
+  :global([aria-label='new-tag-trigger']) {
+    display: none !important;
+  }
+  &:hover {
+    :global([aria-label='new-tag-trigger']) {
+      display: inherit !important;
+    }
+  }
 }
-.emptyBase {
-  margin-inline: auto;
-  margin-top: 150px;
-  max-width: 350px;
-  text-align: center;
+.descriptionRenderer {
+  border: 1px solid transparent !important; // TODO: remove !important
 
-  .icon {
-    padding: 16px;
+  &:focus,
+  &:hover {
+    border: 1px solid var(--theme-status-active) !important;
   }
-  h4 {
-    margin-bottom: 8
-  }
-  .description {
-    color: var(--theme-colors-monochrome-9);
-    font-size: var(--theme-sizes-font-medium);
-  }
+}
+.centerVertically {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+}
+.centerHorizontally {
+  display: flex;
+  justify-content: center;
 }

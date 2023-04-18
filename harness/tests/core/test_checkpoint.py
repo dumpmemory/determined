@@ -1,22 +1,29 @@
 import contextlib
 import pathlib
-from typing import Any, Iterator
+from typing import Any, Callable, Dict, Iterator, List, Optional
 from unittest import mock
 
 import pytest
+import requests
 
-from determined import _core
+from determined import core
 from tests import parallel
 
 
-def make_mock_storage_manager() -> Any:
+def make_mock_storage_manager(basedir: pathlib.Path) -> Any:
     @contextlib.contextmanager
     def store_path(dst: str) -> Iterator[pathlib.Path]:
-        yield pathlib.Path("/store-path")
+        path = basedir.joinpath("store-path")
+        path.mkdir(exist_ok=True)
+        yield pathlib.Path(path)
 
     @contextlib.contextmanager
-    def restore_path(storage_id: str) -> Iterator[pathlib.Path]:
-        yield pathlib.Path("/restore-path")
+    def restore_path(
+        storage_id: str, selector: Optional[Callable[[str], bool]] = None
+    ) -> Iterator[pathlib.Path]:
+        path = basedir.joinpath("restore-path")
+        path.mkdir(exist_ok=True)
+        yield pathlib.Path(path)
 
     storage_manager = mock.MagicMock()
     storage_manager.store_path = mock.MagicMock(side_effect=store_path)
@@ -29,31 +36,37 @@ def make_mock_storage_manager() -> Any:
 @pytest.mark.parametrize(
     "mode",
     [
-        _core.DownloadMode.LocalWorkersShareDownload,
-        _core.DownloadMode.NoSharedDownload,
+        core.DownloadMode.LocalWorkersShareDownload,
+        core.DownloadMode.NoSharedDownload,
     ],
     ids=lambda x: f"mode={x.name}",
 )
 @pytest.mark.parametrize("dummy", [False, True], ids=lambda x: f"dummy:{x}")
-def test_checkpoint_context(dummy: bool, mode: _core.DownloadMode) -> None:
+def test_checkpoint_context(dummy: bool, mode: core.DownloadMode, tmp_path: pathlib.Path) -> None:
+    ckpt_dir = tmp_path.joinpath("ckpt-dir")
+    ckpt_dir.mkdir(exist_ok=True)
     with parallel.Execution(2) as pex:
 
         @pex.run
         def do_test() -> None:
-            storage_manager = make_mock_storage_manager()
+            storage_manager = make_mock_storage_manager(tmp_path)
             if not dummy:
                 session = mock.MagicMock()
-                tbd_mgr = mock.MagicMock()
-                checkpoint_context = _core.CheckpointContext(
+                response = requests.Response()
+                response.status_code = 200
+                session._do_request.return_value = response
+                tensorboard_manager = mock.MagicMock()
+                checkpoint_context = core.CheckpointContext(
                     pex.distributed,
                     storage_manager,
                     session=session,
-                    api_path="",
-                    static_metadata=None,
-                    tbd_mgr=tbd_mgr,
+                    task_id="task-id",
+                    allocation_id="allocation-id",
+                    tbd_sync_mode=core.TensorboardMode.AUTO,
+                    tensorboard_manager=tensorboard_manager,
                 )
             else:
-                checkpoint_context = _core.DummyCheckpointContext(pex.distributed, storage_manager)
+                checkpoint_context = core.DummyCheckpointContext(pex.distributed, storage_manager)
 
             # Test upload.
             with parallel.raises_when(
@@ -61,21 +74,21 @@ def test_checkpoint_context(dummy: bool, mode: _core.DownloadMode) -> None:
                 RuntimeError,
                 match="upload.*non-chief",
             ):
-                checkpoint_context.upload("ckpt-dir", metadata={"latest_batch": 1})
+                checkpoint_context.upload(ckpt_dir, metadata={"steps_completed": 1})
             if pex.rank == 0:
                 storage_manager.upload.assert_called_once()
                 storage_manager.upload.reset_mock()
                 storage_manager._list_directory.assert_called_once()
                 storage_manager._list_directory.reset_mock()
                 if not dummy:
-                    session.post.assert_called_once()
-                    session.post.reset_mock()
+                    session._do_request.assert_called_once()
+                    session._do_request.reset_mock()
             else:
                 storage_manager.upload.assert_not_called()
                 storage_manager._list_directory.assert_not_called()
                 if not dummy:
-                    session.post.assert_not_called()
-                    tbd_mgr.sync.assert_not_called()
+                    session._do_request.assert_not_called()
+                    tensorboard_manager.sync.assert_not_called()
 
             # Test store_path.
             with parallel.raises_when(
@@ -83,7 +96,7 @@ def test_checkpoint_context(dummy: bool, mode: _core.DownloadMode) -> None:
                 RuntimeError,
                 match=r"\.store_path.*non-chief",
             ):
-                with checkpoint_context.store_path(metadata={"latest_batch": 1}) as _:
+                with checkpoint_context.store_path(metadata={"steps_completed": 1}) as _:
                     pass
             if pex.rank == 0:
                 storage_manager.store_path.assert_called_once()
@@ -91,28 +104,28 @@ def test_checkpoint_context(dummy: bool, mode: _core.DownloadMode) -> None:
                 storage_manager._list_directory.assert_called_once()
                 storage_manager._list_directory.reset_mock()
                 if not dummy:
-                    session.post.assert_called_once()
-                    session.post.reset_mock()
+                    session._do_request.assert_called_once()
+                    session._do_request.reset_mock()
             else:
                 storage_manager.store_path.assert_not_called()
                 storage_manager._list_directory.assert_not_called()
                 if not dummy:
-                    session.post.assert_not_called()
-                    tbd_mgr.sync.assert_not_called()
+                    session._do_request.assert_not_called()
+                    tensorboard_manager.sync.assert_not_called()
 
             # Test download.
             unique_string = "arbitrary-string"
             if pex.distributed.rank == 0:
-                checkpoint_context.download("ckpt-uuid", "ckpt-dir", mode)
-                if mode == _core.DownloadMode.NoSharedDownload:
+                checkpoint_context.download("ckpt-uuid", ckpt_dir, mode)
+                if mode == core.DownloadMode.NoSharedDownload:
                     # Send broadcast after download.
                     _ = pex.distributed.broadcast_local(unique_string)
             else:
-                if mode == _core.DownloadMode.NoSharedDownload:
+                if mode == core.DownloadMode.NoSharedDownload:
                     # Receive broadcast before download, to ensure the download is not synchronized.
                     recvd = pex.distributed.broadcast_local(unique_string)
                     assert recvd == unique_string, recvd
-                checkpoint_context.download("ckpt-uuid", "ckpt-dir", mode)
+                checkpoint_context.download("ckpt-uuid", ckpt_dir, mode)
             storage_manager.download.assert_called_once()
             storage_manager.download.reset_mock()
 
@@ -120,13 +133,91 @@ def test_checkpoint_context(dummy: bool, mode: _core.DownloadMode) -> None:
             if pex.distributed.rank == 0:
                 with checkpoint_context.restore_path("ckpt-uuid", mode) as _:
                     pass
-                if mode == _core.DownloadMode.NoSharedDownload:
+                if mode == core.DownloadMode.NoSharedDownload:
                     _ = pex.distributed.broadcast_local(unique_string)
             else:
-                if mode == _core.DownloadMode.NoSharedDownload:
+                if mode == core.DownloadMode.NoSharedDownload:
                     recvd = pex.distributed.broadcast_local(unique_string)
                     assert recvd == unique_string, recvd
                 with checkpoint_context.restore_path("ckpt-uuid", mode) as _:
                     pass
             storage_manager.restore_path.assert_called_once()
             storage_manager.restore_path.reset_mock()
+
+
+@pytest.mark.parametrize(
+    "resources,expected_merged,expected_conflicts",
+    [
+        ([{"file0": 0}, {"file1": 0}], {"file0": 0, "file1": 0}, {}),
+        ([{"file0": 0}, {"file0": 0}], {"file0": 0}, {"file0": [0, 1]}),
+        ([{"dir1/": 0}, {"dir1/": 0}], {"dir1/": 0}, {}),
+        ([{"file1/": 0}, {"file1": 0}], {"file1/": 0, "file1": 0}, {"file1": [0, 1]}),
+        ([{"dir1/file1": 0}, {"file1": 0}], {"dir1/file1": 0, "file1": 0}, {}),
+        (
+            [{"dir1/file1": 0}, {"dir1/file1/": 0}],
+            {"dir1/file1": 0, "dir1/file1/": 0},
+            {"dir1/file1": [0, 1]},
+        ),
+    ],
+)
+def test_merge_files(
+    resources: List[Dict[str, int]],
+    expected_merged: Dict[str, int],
+    expected_conflicts: Dict[str, List[int]],
+) -> None:
+    merged, conflicts = core._checkpoint.merge_resources(resources)
+    assert conflicts == expected_conflicts
+    assert merged == expected_merged
+
+
+@pytest.mark.parametrize(
+    "metadata,expected_merged,expected_conflicts",
+    [
+        ([{"a": 0}, {"b": 0}], {"a": 0, "b": 0}, {}),
+        ([{"a": 0}, {"a": 0}], {"a": 0}, {}),
+        ([{"a": 1, "b": 0}, {"a": 0}], {"a": 1, "b": 0}, {"/a": [0, 1]}),
+        (
+            [{"a": {"c": 1}}, {"a": {"d": 2}}],
+            {"a": {"c": 1, "d": 2}},
+            {},
+        ),
+        ([{"a": {"c": 1}}, {"a": 2}], {"a": {"c": 1}}, {"/a": [0, 1]}),
+        ([{"a": {"c": 1}}, {"a": [2]}], {"a": {"c": 1}}, {"/a": [0, 1]}),
+        (
+            [{"a": {"c": 1}}, {"a": {"c": 2}}],
+            {"a": {"c": 1}},
+            {"/a/c": [0, 1]},
+        ),
+        (
+            [{"a": {"c": {"d": 1}}}, {"a": {"d": 2}}],
+            {"a": {"c": {"d": 1}, "d": 2}},
+            {},
+        ),
+        (
+            [
+                {"a": 1, "d": {"a": 1, "d": {"a": 1}}},
+                {"b": 2, "d": {"b": 2, "d": {"a": 1}}},
+                {"c": 3, "d": {"c": 3, "d": {"a": 1}}},
+            ],
+            {"c": 3, "d": {"c": 3, "d": {"a": 1}, "b": 2, "a": 1}, "b": 2, "a": 1},
+            {},
+        ),
+        (
+            [
+                {"a": 1, "d": {"a": 1, "d": {"a": 1}}},
+                {"b": 2, "d": {"b": 2, "d": {"b": 1, "c": 1}}},
+                {"c": 3, "d": {"b": 3, "d": {"c": 2, "a": 2}}},
+            ],
+            {"a": 1, "d": {"a": 1, "d": {"a": 1, "b": 1, "c": 1}, "b": 2}, "b": 2, "c": 3},
+            {"/d/b": [1, 2], "/d/d/c": [1, 2], "/d/d/a": [0, 2]},
+        ),
+    ],
+)
+def test_merge_metadata(
+    metadata: List[Dict[str, Any]],
+    expected_merged: Dict[str, Any],
+    expected_conflicts: Dict[str, List],
+) -> None:
+    merged, conflicts = core._checkpoint.merge_metadata(metadata)
+    assert conflicts == expected_conflicts
+    assert merged == expected_merged

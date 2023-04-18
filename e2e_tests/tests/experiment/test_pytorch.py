@@ -1,22 +1,31 @@
-import sys
+import warnings
 from typing import Callable, List
 
 import pytest
 
-from determined.common.api.bindings import determinedexperimentv1State
-from determined.experimental import Determined
 from tests import config as conf
 from tests import experiment as exp
 
 
 @pytest.mark.e2e_gpu
 @pytest.mark.parametrize("aggregation_frequency", [1, 4])
+@pytest.mark.parametrize("image_type", ["PT", "TF2"])
 def test_pytorch_11_const(
-    aggregation_frequency: int, using_k8s: bool, collect_trial_profiles: Callable[[int], None]
+    aggregation_frequency: int,
+    image_type: str,
+    using_k8s: bool,
+    collect_trial_profiles: Callable[[int], None],
 ) -> None:
     config = conf.load_config(conf.fixtures_path("mnist_pytorch/const-pytorch11.yaml"))
     config = conf.set_aggregation_frequency(config, aggregation_frequency)
     config = conf.set_profiling_enabled(config)
+
+    if image_type == "PT":
+        config = conf.set_pt_image(config)
+    elif image_type == "TF2":
+        config = conf.set_tf2_image(config)
+    else:
+        warnings.warn("Using default images", stacklevel=2)
 
     if using_k8s:
         pod_spec = {
@@ -41,32 +50,21 @@ def test_pytorch_11_const(
 
 
 @pytest.mark.e2e_cpu
-def test_pytorch_load(collect_trial_profiles: Callable[[int], None]) -> None:
-    config = conf.load_config(conf.fixtures_path("mnist_pytorch/const-pytorch11.yaml"))
-    config = conf.set_profiling_enabled(config)
-
-    experiment_id = exp.run_basic_test_with_temp_config(
-        config, conf.tutorials_path("mnist_pytorch"), 1
-    )
-
-    (
-        Determined(conf.make_master_url())
-        .get_experiment(experiment_id)
-        .top_checkpoint()
-        .load(map_location="cpu")
-    )
-    trial_id = exp.experiment_trials(experiment_id)[0].trial.id
-    collect_trial_profiles(trial_id)
-
-
-@pytest.mark.e2e_cpu
-def test_pytorch_const_warm_start() -> None:
+@pytest.mark.parametrize("image_type", ["PT", "TF2"])
+def test_pytorch_const_warm_start(image_type: str) -> None:
     """
     Test that specifying an earlier trial checkpoint to warm-start from
     correctly populates the later trials' `warm_start_checkpoint_id` fields.
     """
     config = conf.load_config(conf.tutorials_path("mnist_pytorch/const.yaml"))
     config = conf.set_max_length(config, {"batches": 200})
+
+    if image_type == "PT":
+        config = conf.set_pt_image(config)
+    elif image_type == "TF2":
+        config = conf.set_tf2_image(config)
+    else:
+        warnings.warn("Using default images", stacklevel=2)
 
     experiment_id1 = exp.run_basic_test_with_temp_config(
         config, conf.tutorials_path("mnist_pytorch"), 1
@@ -120,52 +118,51 @@ def test_pytorch_const_with_amp(
 
 
 @pytest.mark.parallel
-def test_pytorch_cifar10_parallel(collect_trial_profiles: Callable[[int], None]) -> None:
+@pytest.mark.parametrize("image_type", ["PT", "TF2"])
+def test_pytorch_cifar10_parallel(
+    image_type: str, collect_trial_profiles: Callable[[int], None]
+) -> None:
     config = conf.load_config(conf.cv_examples_path("cifar10_pytorch/const.yaml"))
     config = conf.set_max_length(config, {"batches": 200})
     config = conf.set_slots_per_trial(config, 8)
     config = conf.set_profiling_enabled(config)
 
+    if image_type == "PT":
+        config = conf.set_pt_image(config)
+    elif image_type == "TF2":
+        config = conf.set_tf2_image(config)
+    else:
+        warnings.warn("Using default images", stacklevel=2)
+
     experiment_id = exp.run_basic_test_with_temp_config(
         config, conf.cv_examples_path("cifar10_pytorch"), 1
     )
-    trials = exp.experiment_trials(experiment_id)
-    (
-        Determined(conf.make_master_url())
-        .get_trial(trials[0].trial.id)
-        .select_checkpoint(latest=True)
-        .load(map_location="cpu")
-    )
-
-    collect_trial_profiles(trials[0].trial.id)
+    trial_id = exp.experiment_trials(experiment_id)[0].trial.id
+    collect_trial_profiles(trial_id)
 
 
 @pytest.mark.parallel
-def test_pytorch_gan_parallel(collect_trial_profiles: Callable[[int], None]) -> None:
+@pytest.mark.parametrize("image_type", ["PT", "TF2"])
+def test_pytorch_gan_parallel(
+    image_type: str, collect_trial_profiles: Callable[[int], None]
+) -> None:
     config = conf.load_config(conf.gan_examples_path("gan_mnist_pytorch/const.yaml"))
     config = conf.set_max_length(config, {"batches": 200})
     config = conf.set_slots_per_trial(config, 8)
     config = conf.set_profiling_enabled(config)
 
+    if image_type == "PT":
+        config = conf.set_pt_image(config)
+    elif image_type == "TF2":
+        config = conf.set_tf2_image(config)
+    else:
+        warnings.warn("Using default images", stacklevel=2)
+
     experiment_id = exp.run_basic_test_with_temp_config(
         config, conf.gan_examples_path("gan_mnist_pytorch"), 1
     )
-    trials = exp.experiment_trials(experiment_id)
-    (
-        Determined(conf.make_master_url())
-        .get_trial(trials[0].trial.id)
-        .select_checkpoint(latest=True)
-        .load(map_location="cpu")
-    )
-    collect_trial_profiles(trials[0].trial.id)
-
-
-@pytest.mark.e2e_cpu
-def test_pytorch_native_api() -> None:
-    exp_id = exp.create_native_experiment(
-        conf.fixtures_path("pytorch_no_op"), [sys.executable, "model_def.py"]
-    )
-    exp.wait_for_experiment_state(exp_id, determinedexperimentv1State.STATE_COMPLETED)
+    trial_id = exp.experiment_trials(experiment_id)[0].trial.id
+    collect_trial_profiles(trial_id)
 
 
 @pytest.mark.parallel
@@ -179,7 +176,7 @@ def test_pytorch_gradient_aggregation() -> None:
     actual_weights = []
     for wl in workloads:
         if wl.metrics:
-            actual_weights.append(wl.metrics["weight"])
+            actual_weights.append(wl.metrics.avgMetrics["weight"])
 
     # independently compute expected metrics
     batch_size = 4
@@ -234,16 +231,15 @@ def test_pytorch_parallel() -> None:
 
     # Check on record/batch counts we emitted in logs.
     validation_size = 10000
-    global_batch_size = config["hyperparameters"]["global_batch_size"]
     num_workers = config.get("resources", {}).get("slots_per_trial", 1)
     global_batch_size = config["hyperparameters"]["global_batch_size"]
     scheduling_unit = config.get("scheduling_unit", 100)
     per_slot_batch_size = global_batch_size // num_workers
     exp_val_batches = (validation_size + (per_slot_batch_size - 1)) // per_slot_batch_size
     patterns = [
-        # Expect two copies of matching training reports.
-        f"trained: {scheduling_unit * global_batch_size} records.*in {scheduling_unit} batches",
-        f"trained: {scheduling_unit * global_batch_size} records.*in {scheduling_unit} batches",
+        # Expect two training reports.
+        f"report_training_metrics.*steps_completed={scheduling_unit * 1}",
+        f"report_training_metrics.*steps_completed={scheduling_unit * 2}",
         f"validated: {validation_size} records.*in {exp_val_batches} batches",
     ]
     trial_id = exp.experiment_trials(exp_id)[0].trial.id
@@ -266,9 +262,27 @@ def test_distributed_logging() -> None:
 
 
 @pytest.mark.parallel
-def test_pytorch_native_api_parallel() -> None:
-    exp_id = exp.create_native_experiment(
-        conf.fixtures_path("pytorch_no_op"),
-        [sys.executable, "model_def.py", "--slots-per-trial", "8"],
-    )
-    exp.wait_for_experiment_state(exp_id, determinedexperimentv1State.STATE_COMPLETED)
+@pytest.mark.parametrize("num_workers,global_batch_size,dataset_len", [(2, 2, 2), (2, 2, 3)])
+def test_epoch_sync(num_workers: int, global_batch_size: int, dataset_len: int) -> None:
+    """
+    Test that epoch_idx is synchronized across all workers regardless of whether the
+    number of batches is evenly divisible by the number of workers.
+    """
+    config = conf.load_config(conf.fixtures_path("pytorch_no_op/const.yaml"))
+    config = conf.set_slots_per_trial(config, num_workers)
+    max_len_batches = 10
+    config = conf.set_max_length(config, {"batches": max_len_batches})
+    config = conf.set_hparam(config, "dataset_len", dataset_len)
+    config = conf.set_global_batch_size(config, global_batch_size)
+
+    e_id = exp.run_basic_test_with_temp_config(config, conf.fixtures_path("pytorch_no_op"), 1)
+    t_id = exp.experiment_trials(e_id)[0].trial.id
+
+    batches_per_epoch = (dataset_len + global_batch_size - 1) // global_batch_size  # ceil
+
+    for batch_idx in range(max_len_batches):
+        epoch_idx = batch_idx // batches_per_epoch
+        for rank in range(config["resources"]["slots_per_trial"]):
+            assert exp.check_if_string_present_in_trial_logs(
+                t_id, f"rank {rank} finished batch {batch_idx} in epoch {epoch_idx}"
+            )

@@ -2,19 +2,21 @@ import dayjs from 'dayjs';
 import React, { useMemo } from 'react';
 import uPlot, { AlignedData, Series } from 'uplot';
 
-import Message, { MessageType } from 'components/Message';
 import UPlotChart, { Options } from 'components/UPlot/UPlotChart';
-import { glasbeyColor } from 'utils/color';
+import Message, { MessageType } from 'shared/components/Message';
+import { glasbeyColor } from 'shared/utils/color';
 
 import { GroupBy } from './ClusterHistoricalUsage.settings';
 import css from './ClusterHistoricalUsageChart.module.scss';
 
 interface ClusterHistoricalUsageChartProps {
-  groupBy: GroupBy,
+  chartKey?: number;
+  groupBy?: GroupBy;
   height?: number;
-  hoursByLabel: Record<string, number[]>,
-  hoursTotal?: number[],
-  time: string[],
+  hoursByLabel: Record<string, number[]>;
+  hoursTotal?: number[];
+  label?: string;
+  time: string[];
 }
 
 const CHART_HEIGHT = 350;
@@ -22,24 +24,26 @@ const CHART_HEIGHT = 350;
 const ClusterHistoricalUsageChart: React.FC<ClusterHistoricalUsageChartProps> = ({
   groupBy,
   height = CHART_HEIGHT,
+  label,
   hoursByLabel,
   hoursTotal,
   time,
+  chartKey,
 }: ClusterHistoricalUsageChartProps) => {
   const chartData: AlignedData = useMemo(() => {
-    const timeUnix: number[] = time.map(item => Date.parse(item) / 1000);
+    const timeUnix: number[] = time.map((item) => Date.parse(item) / 1000);
 
-    const data: AlignedData = [ timeUnix ];
+    const data: AlignedData = [timeUnix];
     if (hoursTotal) {
       data.push(hoursTotal);
     }
 
-    Object.keys(hoursByLabel).forEach(label => {
+    Object.keys(hoursByLabel).forEach((label) => {
       data.push(hoursByLabel[label]);
     });
 
     return data;
-  }, [ hoursByLabel, hoursTotal, time ]);
+  }, [hoursByLabel, hoursTotal, time]);
   const chartOptions: Options = useMemo(() => {
     let dateFormat = 'MM-DD';
     let timeSeries: Series = { label: 'Day', value: '{YYYY}-{MM}-{DD}' };
@@ -48,7 +52,7 @@ const ClusterHistoricalUsageChart: React.FC<ClusterHistoricalUsageChartProps> = 
       timeSeries = { label: 'Month', value: '{YYYY}-{MM}' };
     }
 
-    const series: Series[] = [ timeSeries ];
+    const series: Series[] = [timeSeries];
     if (hoursTotal) {
       series.push({
         label: 'total',
@@ -57,7 +61,7 @@ const ClusterHistoricalUsageChart: React.FC<ClusterHistoricalUsageChartProps> = 
         width: 2,
       });
     }
-    Object.keys(hoursByLabel).forEach(label => {
+    Object.keys(hoursByLabel).forEach((label) => {
       series.push({
         label,
         stroke: glasbeyColor(series.length - 1),
@@ -73,29 +77,29 @@ const ClusterHistoricalUsageChart: React.FC<ClusterHistoricalUsageChartProps> = 
             const rangeSecs = scaleMax - scaleMin;
             const rangeDays = rangeSecs / (24 * 60 * 60);
             const pxPerDay = plotDim / rangeDays;
-            return Math.max(
-              60,
-              pxPerDay * (groupBy === GroupBy.Month ? 28 : 1),
-            );
+            return Math.max(60, pxPerDay * (groupBy === GroupBy.Month ? 28 : 1));
           },
           values: (self, splits) => {
-            return splits.map(i => {
+            return splits.map((i) => {
               const date = dayjs.utc(i * 1000);
               return date.hour() === 0 ? date.format(dateFormat) : '';
             });
           },
         },
-        { label: 'GPU Hours' },
+        { label: label ? label : 'GPU Hours' },
       ],
       height,
+      key: chartKey,
       series,
-      tzDate: ts => uPlot.tzDate(new Date(ts * 1e3), 'Etc/UTC'),
+      tzDate: (ts) => uPlot.tzDate(new Date(ts * 1e3), 'Etc/UTC'),
     };
-  }, [ groupBy, height, hoursByLabel, hoursTotal ]);
+  }, [groupBy, height, hoursByLabel, hoursTotal, label, chartKey]);
   const hasData = useMemo(() => {
-    return Object.keys(hoursByLabel)
-      .reduce((agg, label) => agg || hoursByLabel[label].length > 0, false);
-  }, [ hoursByLabel ]);
+    return Object.keys(hoursByLabel).reduce(
+      (agg, label) => agg || hoursByLabel[label].length > 0,
+      false,
+    );
+  }, [hoursByLabel]);
 
   if (!hasData) {
     return <Message title="No data to plot." type={MessageType.Empty} />;

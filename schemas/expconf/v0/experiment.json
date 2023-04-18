@@ -6,6 +6,7 @@
     "additionalProperties": false,
     "eventuallyRequired": [
         "checkpoint_storage",
+        "entrypoint",
         "name",
         "hyperparameters",
         "reproducibility",
@@ -45,14 +46,12 @@
             "default": {}
         },
         "data_layer": {
+            "$comment": "the data_layer feature was removed in 0.19.10, and the config is ignored",
             "type": [
                 "object",
                 "null"
             ],
-            "default": {
-                "type": "shared_fs"
-            },
-            "optionalRef": "http://determined.ai/schemas/expconf/v0/data-layer.json"
+            "default": null
         },
         "debug": {
             "type": [
@@ -96,12 +95,9 @@
             "optionalRef": "http://determined.ai/schemas/expconf/v0/hyperparameters.json"
         },
         "internal": {
-            "type": [
-                "object",
-                "null"
-            ],
-            "default": null,
-            "optionalRef": "http://determined.ai/schemas/expconf/v0/internal.json"
+            "$comment": "allow forking pre-0.15.6 non-Native-API experiments",
+            "type": "null",
+            "default": null
         },
         "labels": {
             "type": [
@@ -156,6 +152,14 @@
             "default": {},
             "optionalRef": "http://determined.ai/schemas/expconf/v0/optimizations.json"
         },
+        "pbs": {
+            "type": [
+                "object",
+                "null"
+            ],
+            "default": {},
+            "optionalRef": "http://determined.ai/schemas/expconf/v0/hpc-cluster-pbs.json"
+        },
         "perform_initial_validation": {
             "type": [
                 "boolean",
@@ -170,6 +174,13 @@
             ],
             "default": {},
             "optionalRef": "http://determined.ai/schemas/expconf/v0/profiling.json"
+        },
+        "project": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "default": ""
         },
         "records_per_epoch": {
             "type": [
@@ -218,6 +229,14 @@
             "default": null,
             "optionalRef": "http://determined.ai/schemas/expconf/v0/security.json"
         },
+        "slurm": {
+            "type": [
+                "object",
+                "null"
+            ],
+            "default": {},
+            "optionalRef": "http://determined.ai/schemas/expconf/v0/hpc-cluster-slurm.json"
+        },
         "tensorboard_storage": {
             "type": [
                 "object",
@@ -225,85 +244,38 @@
             ],
             "default": null,
             "optionalRef": "http://determined.ai/schemas/expconf/v0/tensorboard-storage.json"
+        },
+        "workspace": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "default": ""
         }
     },
     "allOf": [
         {
-            "conditional": {
+            "if": {
                 "$comment": "when grid search is in use, expect hp counts",
-                "when": {
-                    "properties": {
-                        "searcher": {
-                            "properties": {
-                                "name": {
-                                    "const": "grid"
-                                }
-                            }
-                        }
-                    }
-                },
-                "enforce": {
-                    "properties": {
-                        "hyperparameters": {
-                            "additionalProperties": {
-                                "$ref": "http://determined.ai/schemas/expconf/v0/check-grid-hyperparameter.json"
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        {
-            "conditional": {
-                "$comment": "when records per epoch not set, forbid epoch lengths",
-                "when": {
-                    "properties": {
-                        "records_per_epoch": {
-                            "maximum": 0
-                        }
-                    }
-                },
-                "enforce": {
-                    "properties": {
-                        "min_validation_period": {
-                            "$ref": "http://determined.ai/schemas/expconf/v0/check-epoch-not-used.json"
-                        },
-                        "min_checkpoint_period": {
-                            "$ref": "http://determined.ai/schemas/expconf/v0/check-epoch-not-used.json"
-                        },
-                        "searcher": {
-                            "$ref": "http://determined.ai/schemas/expconf/v0/check-epoch-not-used.json"
-                        }
-                    }
-                }
-            }
-        }
-    ],
-    "checks": {
-        "must specify an entrypoint that references the trial class": {
-            "conditional": {
-                "$comment": "when internal.native is null, expect an entrypoint",
-                "when": {
-                    "properties": {
-                        "internal": {
-                            "properties": {
-                                "native": {
-                                    "type": "null"
-                                }
-                            }
-                        }
-                    }
-                },
-                "enforce": {
-                    "not": {
+                "properties": {
+                    "searcher": {
                         "properties": {
-                            "entrypoint": {
-                                "type": "null"
+                            "name": {
+                                "const": "grid"
                             }
+                        }
+                    }
+                }
+            },
+            "then": {
+                "properties": {
+                    "hyperparameters": {
+                        "additionalProperties": {
+                            "$ref": "http://determined.ai/schemas/expconf/v0/check-grid-hyperparameter.json"
                         }
                     }
                 }
             }
         }
-    }
+    ]
 }

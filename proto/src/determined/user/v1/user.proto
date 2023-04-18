@@ -1,5 +1,6 @@
 syntax = "proto3";
-
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
 import "protoc-gen-swagger/options/annotations.proto";
 
 package determined.user.v1;
@@ -8,7 +9,7 @@ option go_package = "github.com/determined-ai/determined/proto/pkg/userv1";
 // User is an account in the determined cluster.
 message User {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "username", "admin", "active", "id" ] }
+    json_schema: { required: [ "username", "admin", "active" ] }
   };
   // The user ID.
   int32 id = 1;
@@ -22,19 +23,74 @@ message User {
   AgentUserGroup agent_user_group = 5;
   // Name to display in the web UI.
   string display_name = 6;
+  // The version of the user object for caching purposes.
+  google.protobuf.Timestamp modified_at = 7;
+  // Bool denoting whether the user should be able to login with or change a
+  // password.
+  bool remote = 8;
 }
 
 // Request to edit fields for a user.
 message PatchUser {
+  // String denoting the username of the user.
+  optional string username = 1;
+  // String denoting the password of the user.
+  optional string password = 2;
+  // Bool denoting whether the account is an admin account.
+  google.protobuf.BoolValue admin = 3;
+  // Bool denoting whether the account is active.
+  google.protobuf.BoolValue active = 4;
   // Name to display in the web UI.
-  string display_name = 2;
+  optional string display_name = 5;
+  // The user and group on the agent host machine.
+  AgentUserGroup agent_user_group = 6;
+  // Indicate whether the provided password is pre-salted & hashed or not.
+  bool is_hashed = 7;
+  // Bool denoting whether the user should be able to login with or change a
+  // password.
+  optional bool remote = 8;
 }
 
 // AgentUserGroup represents a username and primary group for a user on an
 // agent host machine.
 message AgentUserGroup {
   // The user id on the agent.
-  int32 agent_uid = 1;
+  optional int32 agent_uid = 1;
   // The group id on the agent.
-  int32 agent_gid = 2;
+  optional int32 agent_gid = 2;
+  // User name.
+  optional string agent_user = 3;
+  // Group name.
+  optional string agent_group = 4;
+}
+
+// UserWebSetting represents user web setting.
+message UserWebSetting {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "key" ] }
+  };
+  // The key of setting.
+  string key = 1;
+  // The storage path of setting.
+  string storage_path = 2;
+  // The value of setting.
+  string value = 3;
+}
+
+// ActivityType represents a user activity
+enum ActivityType {
+  // Default activity type.
+  ACTIVITY_TYPE_UNSPECIFIED = 0;
+
+  // Represents a get request.
+  ACTIVITY_TYPE_GET = 1;
+}
+
+// EntityType represents an entity
+enum EntityType {
+  // Default entity type.
+  ENTITY_TYPE_UNSPECIFIED = 0;
+
+  // Represents a project.
+  ENTITY_TYPE_PROJECT = 1;
 }

@@ -2,10 +2,12 @@ package model
 
 import (
 	"encoding/json"
-	"regexp"
-	"strconv"
+	"fmt"
+	"strings"
 
 	"github.com/docker/docker/api/types"
+	"github.com/jinzhu/copier"
+	"golang.org/x/exp/slices"
 
 	k8sV1 "k8s.io/api/core/v1"
 
@@ -16,9 +18,11 @@ import (
 	"github.com/determined-ai/determined/master/pkg/ptrs"
 	"github.com/determined-ai/determined/master/pkg/schemas"
 	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
+	"github.com/determined-ai/determined/master/pkg/set"
 )
 
 // TaskContainerDefaultsConfig configures docker defaults for all containers.
+// If you add a field to this, you must update the merge impl.
 type TaskContainerDefaultsConfig struct {
 	DtrainNetworkInterface string                `json:"dtrain_network_interface,omitempty"`
 	NCCLPortRange          string                `json:"nccl_port_range,omitempty"`
@@ -30,13 +34,16 @@ type TaskContainerDefaultsConfig struct {
 	Image                  *RuntimeItem          `json:"image,omitempty"`
 	RegistryAuth           *types.AuthConfig     `json:"registry_auth,omitempty"`
 	ForcePullImage         bool                  `json:"force_pull_image,omitempty"`
+	EnvironmentVariables   *RuntimeItems         `json:"environment_variables,omitempty"`
 
 	AddCapabilities  []string      `json:"add_capabilities"`
 	DropCapabilities []string      `json:"drop_capabilities"`
 	Devices          DevicesConfig `json:"devices"`
 
-	BindMounts BindMountsConfig `json:"bind_mounts"`
-	WorkDir    *string          `json:"work_dir"`
+	BindMounts BindMountsConfig      `json:"bind_mounts"`
+	WorkDir    *string               `json:"work_dir"`
+	Slurm      expconf.SlurmConfigV0 `json:"slurm"`
+	Pbs        expconf.PbsConfigV0   `json:"pbs"`
 }
 
 // DefaultTaskContainerDefaults returns the default for TaskContainerDefaultsConfig.
@@ -45,38 +52,6 @@ func DefaultTaskContainerDefaults() *TaskContainerDefaultsConfig {
 		ShmSizeBytes: 4294967296,
 		NetworkMode:  "bridge",
 	}
-}
-
-func validatePortRange(portRange string) []error {
-	var errs []error
-
-	if portRange == "" {
-		return errs
-	}
-
-	re := regexp.MustCompile("^([0-9]+):([0-9]+)$")
-	submatches := re.FindStringSubmatch(portRange)
-	if submatches == nil {
-		errs = append(
-			errs, errors.Errorf("expected port range of format \"MIN:MAX\" but got %q", portRange),
-		)
-		return errs
-	}
-
-	var min, max uint64
-	var err error
-	if min, err = strconv.ParseUint(submatches[1], 10, 16); err != nil {
-		errs = append(errs, errors.Wrap(err, "invalid minimum port value"))
-	}
-	if max, err = strconv.ParseUint(submatches[2], 10, 16); err != nil {
-		errs = append(errs, errors.Wrap(err, "invalid maximum port value"))
-	}
-
-	if min > max {
-		errs = append(errs, errors.Errorf("port range minimum exceeds maximum (%v > %v)", min, max))
-	}
-
-	return errs
 }
 
 // UnmarshalJSON implements the json.Unmarshaler interface.
@@ -106,14 +81,6 @@ func (c *TaskContainerDefaultsConfig) Validate() []error {
 		check.NotEmpty(string(c.NetworkMode), "network_mode must be set"),
 	}
 
-	if err := validatePortRange(c.NCCLPortRange); err != nil {
-		errs = append(errs, err...)
-	}
-
-	if err := validatePortRange(c.GLOOPortRange); err != nil {
-		errs = append(errs, err...)
-	}
-
 	errs = append(errs, validatePodSpec(c.CPUPodSpec)...)
 	errs = append(errs, validatePodSpec(c.GPUPodSpec)...)
 
@@ -131,7 +98,7 @@ func (c *TaskContainerDefaultsConfig) MergeIntoExpConfig(config *expconf.Experim
 	resources := expconf.ResourcesConfig{
 		RawDevices: c.Devices.ToExpconf(),
 	}
-	config.RawResources = schemas.Merge(config.RawResources, &resources).(*expconf.ResourcesConfig)
+	config.RawResources = schemas.Merge(config.RawResources, &resources)
 
 	// Merge Environment-related settings into the config.
 	var image *expconf.EnvironmentImageMapV0
@@ -140,24 +107,201 @@ func (c *TaskContainerDefaultsConfig) MergeIntoExpConfig(config *expconf.Experim
 		image = &i
 	}
 
+	var envVars *expconf.EnvironmentVariablesMapV0
+	if c.EnvironmentVariables != nil {
+		envVars = ptrs.Ptr(c.EnvironmentVariables.ToExpconf())
+	}
+
 	// We just update config.RawResources so we know it can't be nil.
-	defaultedResources := schemas.WithDefaults(*config.RawResources).(expconf.ResourcesConfig)
+	defaultedResources := schemas.WithDefaults(*config.RawResources)
 	podSpec := c.CPUPodSpec
 	if defaultedResources.SlotsPerTrial() > 0 {
 		podSpec = c.GPUPodSpec
 	}
 
-	//nolint:exhaustivestruct // RawEnvironmentVariables, RawPorts are not in TaskContainerDefaults.
+	//nolint:exhaustivestruct // RawPorts is not in TaskContainerDefaults.
 	env := expconf.EnvironmentConfig{
-		RawAddCapabilities:  c.AddCapabilities,
-		RawDropCapabilities: c.DropCapabilities,
-		RawForcePullImage:   ptrs.Ptr(c.ForcePullImage),
-		RawImage:            image,
-		RawPodSpec:          (*expconf.PodSpec)(podSpec),
-		RawRegistryAuth:     c.RegistryAuth,
+		RawAddCapabilities:      c.AddCapabilities,
+		RawDropCapabilities:     c.DropCapabilities,
+		RawForcePullImage:       ptrs.Ptr(c.ForcePullImage),
+		RawImage:                image,
+		RawPodSpec:              (*expconf.PodSpec)(podSpec),
+		RawRegistryAuth:         c.RegistryAuth,
+		RawEnvironmentVariables: envVars,
 	}
-	config.RawEnvironment = schemas.Merge(config.RawEnvironment, &env).(*expconf.EnvironmentConfig)
+	config.RawEnvironment = schemas.Merge(config.RawEnvironment, &env)
 
 	bindMounts := c.BindMounts.ToExpconf()
-	config.RawBindMounts = schemas.Merge(config.RawBindMounts, bindMounts).(expconf.BindMountsConfig)
+	config.RawBindMounts = schemas.Merge(config.RawBindMounts, bindMounts)
+
+	configRawSlurmConfig := config.RawSlurmConfig
+	config.RawSlurmConfig = schemas.Merge(config.RawSlurmConfig, &c.Slurm)
+	if configRawSlurmConfig != nil {
+		config.RawSlurmConfig.RawSbatchArgs = append(
+			c.Slurm.SbatchArgs(), configRawSlurmConfig.SbatchArgs()...)
+	}
+
+	configRawPbsConfig := config.RawPbsConfig
+	config.RawPbsConfig = schemas.Merge(config.RawPbsConfig, &c.Pbs)
+	if configRawPbsConfig != nil {
+		config.RawPbsConfig.RawSbatchArgs = append(
+			c.Pbs.SbatchArgs(), configRawPbsConfig.SbatchArgs()...)
+	}
+}
+
+var mergeCopier = copier.Option{IgnoreEmpty: true, DeepCopy: true}
+
+// Merge merges other into self, preferring other. The result is a deepcopy of self, with deep
+// copies of values taken from other.
+func (c TaskContainerDefaultsConfig) Merge(
+	other TaskContainerDefaultsConfig,
+) (TaskContainerDefaultsConfig, error) {
+	var res TaskContainerDefaultsConfig
+	err := copier.CopyWithOption(&res, c, mergeCopier)
+	if err != nil {
+		return TaskContainerDefaultsConfig{}, fmt.Errorf("cloning task container defaults: %w", err)
+	}
+
+	if other.DtrainNetworkInterface != "" {
+		res.DtrainNetworkInterface = other.DtrainNetworkInterface
+	}
+
+	if other.NCCLPortRange != "" {
+		res.NCCLPortRange = other.NCCLPortRange
+	}
+
+	if other.GLOOPortRange != "" {
+		res.GLOOPortRange = other.GLOOPortRange
+	}
+
+	if other.ShmSizeBytes != 0 {
+		res.ShmSizeBytes = other.ShmSizeBytes
+	}
+
+	if other.NetworkMode != "" {
+		res.NetworkMode = other.NetworkMode
+	}
+
+	if other.CPUPodSpec != nil {
+		res.CPUPodSpec = other.CPUPodSpec.DeepCopy()
+	}
+
+	if other.GPUPodSpec != nil {
+		res.GPUPodSpec = other.GPUPodSpec.DeepCopy()
+	}
+
+	if other.Image != nil {
+		err := copier.CopyWithOption(&res.Image, other.Image, mergeCopier)
+		if err != nil {
+			return TaskContainerDefaultsConfig{}, fmt.Errorf("merge copying image: %w", err)
+		}
+	}
+
+	if other.RegistryAuth != nil {
+		// Total overwrite, since merging auth doesn't make a lot of sense.
+		res.RegistryAuth = other.RegistryAuth
+	}
+
+	if other.ForcePullImage {
+		res.ForcePullImage = other.ForcePullImage
+	}
+
+	if otherEnvVars := other.EnvironmentVariables; otherEnvVars != nil {
+		otherEnvs := other.EnvironmentVariables
+		res.EnvironmentVariables.CPU = mergeEnvVars(res.EnvironmentVariables.CPU, otherEnvs.CPU)
+		res.EnvironmentVariables.CUDA = mergeEnvVars(res.EnvironmentVariables.CUDA, otherEnvs.CUDA)
+		res.EnvironmentVariables.ROCM = mergeEnvVars(res.EnvironmentVariables.ROCM, otherEnvs.ROCM)
+	}
+
+	if other.AddCapabilities != nil {
+		caps := set.FromSlice(append(other.AddCapabilities, res.AddCapabilities...))
+		res.AddCapabilities = caps.ToSlice()
+		slices.Sort(res.AddCapabilities) // Convenience for testing equality.
+	}
+
+	if other.DropCapabilities != nil {
+		caps := set.FromSlice(append(other.DropCapabilities, res.DropCapabilities...))
+		res.DropCapabilities = caps.ToSlice()
+		slices.Sort(res.DropCapabilities) // Convenience for testing equality.
+	}
+
+	if other.Devices != nil {
+		tmp := res.Devices
+		res.Devices = other.Devices
+
+		containerPaths := set.New[string]()
+		for _, d := range res.Devices {
+			containerPaths.Insert(d.ContainerPath)
+		}
+		for _, d := range tmp {
+			if containerPaths.Contains(d.ContainerPath) {
+				continue
+			}
+			res.Devices = append(res.Devices, d)
+		}
+	}
+
+	if other.BindMounts != nil {
+		tmp := res.BindMounts
+		res.BindMounts = other.BindMounts
+
+		containerPaths := set.New[string]()
+		for _, b := range res.BindMounts {
+			containerPaths.Insert(b.ContainerPath)
+		}
+		for _, b := range tmp {
+			if containerPaths.Contains(b.ContainerPath) {
+				continue
+			}
+			res.BindMounts = append(res.BindMounts, b)
+		}
+	}
+
+	if other.WorkDir != nil {
+		tmp := *other.WorkDir
+		res.WorkDir = &tmp
+	}
+
+	if other.Slurm.GpuType() != nil {
+		res.Slurm.SetGpuType(other.Slurm.GpuType())
+	}
+	if other.Slurm.SlotsPerNode() != nil {
+		res.Slurm.SetSlotsPerNode(other.Slurm.SlotsPerNode())
+	}
+	if len(other.Slurm.SbatchArgs()) > 0 {
+		tmp := slices.Clone(append(other.Slurm.SbatchArgs(), res.Slurm.SbatchArgs()...))
+		res.Slurm.SetSbatchArgs(tmp)
+	}
+
+	if other.Pbs.SlotsPerNode() != nil {
+		res.Pbs.SetSlotsPerNode(other.Pbs.SlotsPerNode())
+	}
+	if len(other.Pbs.SbatchArgs()) > 0 {
+		tmp := slices.Clone(append(other.Pbs.SbatchArgs(), res.Pbs.SbatchArgs()...))
+		res.Pbs.SetSbatchArgs(tmp)
+	}
+
+	return res, nil
+}
+
+func mergeEnvVars(self, other []string) []string {
+	var result []string
+	uniques := set.New[string]()
+	for _, v := range other {
+		uniques.Insert(envVarName(v))
+		result = append(result, v)
+	}
+
+	for _, v := range self {
+		if uniques.Contains(envVarName(v)) {
+			continue
+		}
+		result = append(result, v)
+	}
+	return result
+}
+
+func envVarName(v string) string {
+	parts := strings.Split(v, "=")
+	return parts[0]
 }

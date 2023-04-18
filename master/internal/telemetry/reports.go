@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"reflect"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/segmentio/analytics-go.v3"
 
@@ -13,33 +12,26 @@ import (
 	"github.com/determined-ai/determined/master/pkg/actor"
 	"github.com/determined-ai/determined/master/pkg/device"
 	"github.com/determined-ai/determined/master/pkg/model"
+	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 	"github.com/determined-ai/determined/master/version"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
 	"github.com/determined-ai/determined/proto/pkg/devicev1"
 )
 
 // ReportMasterTick reports the master snapshot on a periodic tick.
-func ReportMasterTick(system *actor.System, db db.DB) {
+func ReportMasterTick(system *actor.System, db db.DB, rm telemetryRPFetcher) {
 	resourceManagerType := ""
+
 	req := &apiv1.GetResourcePoolsRequest{}
-	var resp *apiv1.GetResourcePoolsResponse
-	switch {
-	case sproto.UseAgentRM(system):
-		resourceManagerType = "agent"
-		resp = system.AskAt(sproto.AgentRMAddr, req).Get().(*apiv1.GetResourcePoolsResponse)
-
-	case sproto.UseK8sRM(system):
-		resourceManagerType = "kubernetes"
-		resp = system.AskAt(sproto.K8sRMAddr, req).Get().(*apiv1.GetResourcePoolsResponse)
-
-	default:
-		logrus.WithError(errors.New("cannot find appropriate resource manager")).
-			Error("failed to retrieve telemetry information")
+	resp, err := rm.GetResourcePools(system, req)
+	if err != nil {
+		// TODO(Brad): Make this routine more accepting of failures.
+		logrus.WithError(err).Error("failed to receive resource pool telemetry information")
 		return
 	}
 
 	gpuTotalNum, gpuUsedNum := 0, 0
-	poolTypes := make(map[string]int)
+	poolTypes := make(map[string]int, len(resp.ResourcePools))
 	for _, pool := range resp.ResourcePools {
 		poolTypes[sproto.StringFromResourcePoolTypeProto(pool.Type)]++
 		if pool.SlotType == devicev1.Type_TYPE_CUDA || pool.SlotType == devicev1.Type_TYPE_ROCM {
@@ -76,18 +68,34 @@ func ReportMasterTick(system *actor.System, db db.DB) {
 	)
 }
 
+// ReportProvisionerTick reports the state of all provision requests by a provisioner.
+func ReportProvisionerTick(
+	system *actor.System, instances []*model.Instance, instanceType string,
+) {
+	system.TellAt(
+		actor.Addr("telemetry"),
+		analytics.Track{
+			Event: "provisioner_tick",
+			Properties: map[string]interface{}{
+				"instance_type": instanceType,
+				"instances":     instances,
+			},
+		})
+}
+
 // ReportExperimentCreated reports that an experiment has been created.
-func ReportExperimentCreated(system *actor.System, e *model.Experiment) {
+func ReportExperimentCreated(system *actor.System, id int, config expconf.ExperimentConfig) {
 	system.TellAt(
 		actor.Addr("telemetry"),
 		analytics.Track{
 			Event: "experiment_created",
 			Properties: map[string]interface{}{
-				"id":                        e.ID,
-				"searcher_name":             reflect.TypeOf(e.Config.Searcher().GetUnionMember()),
-				"num_hparams":               len(e.Config.Hyperparameters()),
-				"resources_slots_per_trial": e.Config.Resources().SlotsPerTrial(),
-				"image":                     e.Config.Environment().Image(),
+				"id":                        id,
+				"num_hparams":               len(config.Hyperparameters()),
+				"resources_slots_per_trial": config.Resources().SlotsPerTrial(),
+				"image":                     config.Environment().Image(),
+
+				"searcher_name": reflect.TypeOf(config.Searcher().GetUnionMember()),
 			},
 		},
 	)

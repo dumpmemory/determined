@@ -1,10 +1,14 @@
 import { isLeft } from 'fp-ts/lib/Either';
 import * as io from 'io-ts';
 
+import { DetError, ErrorLevel, ErrorType } from 'shared/utils/error';
 import {
-  CheckpointStorageType, ExperimentSearcherName, HyperparameterType, LogLevel, RunState,
+  CheckpointStorageType,
+  ExperimentSearcherName,
+  HyperparameterType,
+  LogLevel,
+  RunState,
 } from 'types';
-import { DetError, ErrorLevel, ErrorType } from 'utils/error';
 
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
 export const decode = <T>(type: io.Mixed, data: any): T => {
@@ -21,25 +25,9 @@ export const decode = <T>(type: io.Mixed, data: any): T => {
   }
 };
 
-const optional = (x: io.Mixed) => io.union([ x, io.null, io.undefined ]);
-
-/* Info */
-
-const ioSsoProvider = io.type({
-  name: io.string,
-  sso_url: io.string,
-});
-
-export const ioDeterminedInfo = io.type({
-  cluster_id: io.string,
-  cluster_name: io.string,
-  isTelemetryEnabled: io.boolean,
-  master_id: io.string,
-  sso_providers: optional(io.array(ioSsoProvider)),
-  version: io.string,
-});
-
-export type ioTypeDeterminedInfo = io.TypeOf<typeof ioDeterminedInfo>;
+export const optional = (x: io.Mixed): io.Mixed | io.NullC | io.UndefinedC => {
+  return io.union([x, io.null, io.undefined]);
+};
 
 /* Slot */
 
@@ -80,8 +68,10 @@ export type ioTypeAgents = io.TypeOf<typeof ioAgents>;
 
 /* Generic Command */
 
-const runStates: Record<string, null> = Object.values(RunState)
-  .reduce((acc, val) => ({ ...acc, [val]: null }), {});
+const runStates: Record<string, null> = Object.values(RunState).reduce(
+  (acc, val) => ({ ...acc, [val]: null }),
+  {},
+);
 const runStatesIoType = io.keyof(runStates);
 
 /* Trials */
@@ -92,9 +82,10 @@ export type ioTypeMetric = io.TypeOf<typeof ioMetric>;
 
 /* Experiments */
 
-const checkpointStorageTypes: Record<string, null> = Object
-  .values(CheckpointStorageType)
-  .reduce((acc, val) => ({ ...acc, [val]: null }), {});
+const checkpointStorageTypes: Record<string, null> = Object.values(CheckpointStorageType).reduce(
+  (acc, val) => ({ ...acc, [val]: null }),
+  {},
+);
 const ioCheckpointStorageType = io.keyof(checkpointStorageTypes);
 
 export const ioCheckpointStorage = io.type({
@@ -107,16 +98,12 @@ export const ioCheckpointStorage = io.type({
   type: optional(ioCheckpointStorageType),
 });
 
-const ioDataLayer = io.type({
-  container_storage_path: optional(io.string),
-  type: io.string,
-});
-
 const ioExpResources = io.type({ max_slots: optional(io.number) });
 
-const hParamTypes: Record<string, null> = Object
-  .values(HyperparameterType)
-  .reduce((acc, val) => ({ ...acc, [val]: null }), {});
+const hParamTypes: Record<string, null> = Object.values(HyperparameterType).reduce(
+  (acc, val) => ({ ...acc, [val]: null }),
+  {},
+);
 const ioHParamTypes = io.keyof(hParamTypes);
 const ioExpHParamVal = optional(io.unknown);
 const ioExpHParam = io.type({
@@ -140,15 +127,17 @@ export type ioTypeHyperparameter = io.TypeOf<typeof ioExpHParam>;
 export const ioHyperparameters = io.UnknownRecord;
 export type ioTypeHyperparameters = io.TypeOf<typeof ioHyperparameters>;
 
-const experimentSearcherName: Record<string, null> = Object.values(ExperimentSearcherName)
-  .reduce((acc, val) => ({ ...acc, [val]: null }), {});
+const experimentSearcherName: Record<string, null> = Object.values(ExperimentSearcherName).reduce(
+  (acc, val) => ({ ...acc, [val]: null }),
+  {},
+);
 export const ioExperimentConfig = io.type({
   checkpoint_policy: io.string,
   checkpoint_storage: optional(ioCheckpointStorage),
-  data_layer: optional(ioDataLayer),
   description: optional(io.string),
   hyperparameters: ioHyperparameters,
   labels: optional(io.array(io.string)),
+  max_restarts: io.number,
   name: io.string,
   profiling: optional(io.type({ enabled: io.boolean })),
   resources: ioExpResources,
@@ -156,6 +145,7 @@ export const ioExperimentConfig = io.type({
     metric: io.string,
     name: io.keyof(experimentSearcherName),
     smaller_is_better: io.boolean,
+    source_trial_id: io.union([io.null, io.number]),
   }),
 });
 export type ioTypeExperimentConfig = io.TypeOf<typeof ioExperimentConfig>;
@@ -179,8 +169,10 @@ export type ioTypeExperiments = io.TypeOf<typeof ioExperiments>;
 
 /* Logs */
 
-const ioLogLevels: Record<string, null> = Object.values(LogLevel)
-  .reduce((acc, val) => ({ ...acc, [val]: null }), {});
+const ioLogLevels: Record<string, null> = Object.values(LogLevel).reduce(
+  (acc, val) => ({ ...acc, [val]: null }),
+  {},
+);
 const ioLogLevelType = io.keyof(ioLogLevels);
 export const ioLog = io.type({
   id: io.number,
@@ -196,12 +188,12 @@ export type ioTypeLogs = io.TypeOf<typeof ioLogs>;
 
 const ioTaskLog = io.type({
   assigned_event: io.unknown,
-  container_started_event: io.unknown,
   description: io.string,
   exited_event: optional(io.string),
   id: io.string,
   log_event: optional(io.string),
   parent_id: io.string,
+  resources_started_event: io.unknown,
   scheduled_event: optional(io.string),
   seq: io.number,
   service_ready_event: optional(io.type({})),

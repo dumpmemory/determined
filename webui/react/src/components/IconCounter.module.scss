@@ -2,18 +2,22 @@
   align-items: center;
   cursor: pointer;
   display: grid;
-  grid-gap: var(--theme-sizes-layout-small);
+  grid-gap: 6px;
   grid-template-columns: 1fr auto;
   user-select: none;
 
   .count {
-    font-size: var(--theme-sizes-font-medium);
+    font-size: 14px;
     font-weight: bold;
   }
 }
-.active { color: var(--theme-colors-active); }
+.active {
+  color: var(--theme-colors-active);
+}
 .disabled {
   color: var(--theme-colors-monochrome-9);
 
-  &:hover { color: var(--theme-colors-monochrome-9); }
+  &:hover {
+    color: var(--theme-colors-monochrome-9);
+  }
 }

@@ -11,8 +11,14 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/exp/slices"
+
+	"github.com/uptrace/bun"
+
 	"github.com/determined-ai/determined/master/internal/prom"
 	"github.com/determined-ai/determined/master/internal/sproto"
+	"github.com/determined-ai/determined/master/internal/trials"
+	"github.com/determined-ai/determined/master/internal/user"
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
@@ -20,93 +26,264 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/pkg/errors"
 
 	"github.com/determined-ai/determined/master/internal/db"
+	exputil "github.com/determined-ai/determined/master/internal/experiment"
 	"github.com/determined-ai/determined/master/internal/grpcutil"
-	"github.com/determined-ai/determined/master/internal/hpimportance"
-	"github.com/determined-ai/determined/master/internal/job"
-	"github.com/determined-ai/determined/master/internal/lttb"
 	"github.com/determined-ai/determined/master/pkg/actor"
-	"github.com/determined-ai/determined/master/pkg/logger"
+	command "github.com/determined-ai/determined/master/pkg/command"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/master/pkg/protoutils"
+	"github.com/determined-ai/determined/master/pkg/protoutils/protoless"
+	"github.com/determined-ai/determined/master/pkg/ptrs"
 	"github.com/determined-ai/determined/master/pkg/schemas"
 	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 	"github.com/determined-ai/determined/master/pkg/searcher"
-	"github.com/determined-ai/determined/master/pkg/tasks"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
 	"github.com/determined-ai/determined/proto/pkg/checkpointv1"
 	"github.com/determined-ai/determined/proto/pkg/experimentv1"
 	"github.com/determined-ai/determined/proto/pkg/jobv1"
+	"github.com/determined-ai/determined/proto/pkg/projectv1"
+	"github.com/determined-ai/determined/proto/pkg/rbacv1"
+	"github.com/determined-ai/determined/proto/pkg/trialv1"
 
 	structpb "github.com/golang/protobuf/ptypes/struct"
 )
 
-var experimentsAddr = actor.Addr("experiments")
-
-func (a *apiServer) checkExperimentExists(id int) error {
-	ok, err := a.m.db.CheckExperimentExists(id)
-	switch {
-	case err != nil:
-		return status.Errorf(codes.Internal, "failed to check if experiment exists: %s", err)
-	case !ok:
-		return status.Errorf(codes.NotFound, "experiment %d not found", id)
-	default:
-		return nil
-	}
+// Catches information on active running experiments.
+type experimentAllocation struct {
+	Job      model.JobID
+	Pulling  bool
+	Running  bool
+	Starting bool
 }
 
-func (a *apiServer) getExperiment(experimentID int) (*experimentv1.Experiment, error) {
+// Enrich one or more experiments by converting Active state to Queued/Pulling/Starting/Running.
+func (a *apiServer) enrichExperimentState(experiments ...*experimentv1.Experiment) error {
+	// filter allocations by JobIDs on this page of experiments
+	jobFilter := make([]string, 0, len(experiments))
+	for _, exp := range experiments {
+		jobFilter = append(jobFilter, exp.JobId)
+	}
+
+	// get active experiments by JobID
+	tasks := []experimentAllocation{}
+	err := a.m.db.Query(
+		"aggregate_allocation_state_by_job",
+		&tasks,
+		strings.Join(jobFilter, ","),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Collect state information by JobID
+	byJobID := make(map[model.JobID]experimentv1.State, len(tasks))
+	for _, task := range tasks {
+		switch {
+		case task.Running:
+			byJobID[task.Job] = experimentv1.State_STATE_RUNNING
+		case task.Starting:
+			byJobID[task.Job] = model.MostProgressedExperimentState(byJobID[task.Job],
+				experimentv1.State_STATE_STARTING)
+		case task.Pulling:
+			byJobID[task.Job] = model.MostProgressedExperimentState(byJobID[task.Job],
+				experimentv1.State_STATE_PULLING)
+		default:
+			byJobID[task.Job] = model.MostProgressedExperimentState(byJobID[task.Job],
+				experimentv1.State_STATE_QUEUED)
+		}
+	}
+
+	// Active experiments converted to Queued, Pulling, Starting, or Running
+	for _, exp := range experiments {
+		if exp.State == experimentv1.State_STATE_ACTIVE {
+			if setState, ok := byJobID[model.JobID(exp.JobId)]; ok {
+				exp.State = setState
+			} else {
+				exp.State = experimentv1.State_STATE_QUEUED
+			}
+		}
+	}
+	return nil
+}
+
+// Return if experiment state is Active or any of its sub-states.
+func isActiveExperimentState(state experimentv1.State) bool {
+	return slices.Contains([]experimentv1.State{
+		experimentv1.State_STATE_ACTIVE,
+		experimentv1.State_STATE_PULLING, experimentv1.State_STATE_QUEUED,
+		experimentv1.State_STATE_RUNNING, experimentv1.State_STATE_STARTING,
+	}, state)
+}
+
+// Return a single experiment with enriched state, if the user can access it.
+func (a *apiServer) getExperiment(
+	ctx context.Context, curUser model.User, experimentID int,
+) (*experimentv1.Experiment, error) {
+	expNotFound := status.Errorf(codes.NotFound, "experiment not found: %d", experimentID)
 	exp := &experimentv1.Experiment{}
-	switch err := a.m.db.QueryProto("get_experiment", exp, experimentID); {
-	case err == db.ErrNotFound:
-		return nil, status.Errorf(codes.NotFound, "experiment not found: %d", experimentID)
-	case err != nil:
-		return nil, errors.Wrapf(err,
-			"error fetching experiment from database: %d", experimentID)
+	if err := a.m.db.QueryProto("get_experiment", exp, experimentID); errors.Is(err, db.ErrNotFound) {
+		return nil, expNotFound
+	} else if err != nil {
+		return nil, errors.Wrapf(err, "error fetching experiment from database: %d", experimentID)
+	}
+
+	modelExp, err := model.ExperimentFromProto(exp)
+	if err != nil {
+		return nil, err
+	}
+	if ok, authErr := exputil.AuthZProvider.Get().
+		CanGetExperiment(ctx, curUser, modelExp); authErr != nil {
+		return nil, authErr
+	} else if !ok {
+		return nil, expNotFound
 	}
 
 	sort.Slice(exp.TrialIds, func(i, j int) bool {
 		return exp.TrialIds[i] < exp.TrialIds[j]
 	})
+
+	if err = a.enrichExperimentState(exp); err != nil {
+		return nil, err
+	}
+
 	return exp, nil
 }
 
-func (a *apiServer) GetExperiment(
-	_ context.Context, req *apiv1.GetExperimentRequest,
-) (*apiv1.GetExperimentResponse, error) {
-	exp, err := a.getExperiment(int(req.ExperimentId))
+func (a *apiServer) getExperimentAndCheckCanDoActions(
+	ctx context.Context,
+	expID int,
+	actions ...func(context.Context, model.User, *model.Experiment) error,
+) (*model.Experiment, model.User, error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "fetching experiment from db")
+		return nil, model.User{}, err
 	}
 
-	confBytes, err := a.m.db.ExperimentConfigRaw(int(req.ExperimentId))
-	if err != nil {
-		return nil, errors.Wrapf(err,
-			"error fetching experiment config from database: %d", req.ExperimentId)
+	e, err := a.m.db.ExperimentByID(expID)
+
+	expNotFound := status.Errorf(codes.NotFound, "experiment not found: %d", expID)
+	if errors.Is(err, db.ErrNotFound) {
+		return nil, model.User{}, expNotFound
+	} else if err != nil {
+		return nil, model.User{}, err
 	}
-	var conf map[string]interface{}
-	err = json.Unmarshal(confBytes, &conf)
+
+	var ok bool
+	if ok, err = exputil.AuthZProvider.Get().CanGetExperiment(ctx, *curUser, e); err != nil {
+		return nil, model.User{}, err
+	} else if !ok {
+		return nil, model.User{}, expNotFound
+	}
+
+	for _, action := range actions {
+		if err = action(ctx, *curUser, e); err != nil {
+			return nil, model.User{}, status.Errorf(codes.PermissionDenied, err.Error())
+		}
+	}
+	return e, *curUser, nil
+}
+
+func (a *apiServer) GetSearcherEvents(
+	ctx context.Context, req *apiv1.GetSearcherEventsRequest,
+) (*apiv1.GetSearcherEventsResponse, error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
 	if err != nil {
-		return nil, errors.Wrapf(err,
-			"error unmarshalling experiment config: %d", req.ExperimentId)
+		return nil, err
+	}
+	exp, err := a.getExperiment(ctx, *curUser, int(req.ExperimentId))
+	if err != nil {
+		return nil, err
+	}
+	if !isActiveExperimentState(exp.State) {
+		return &apiv1.GetSearcherEventsResponse{
+			SearcherEvents: []*experimentv1.SearcherEvent{{
+				Id: -1,
+				Event: &experimentv1.SearcherEvent_ExperimentInactive{
+					ExperimentInactive: &experimentv1.ExperimentInactive{
+						ExperimentState: exp.State,
+					},
+				},
+			}},
+		}, nil
+	}
+
+	addr := exputil.ExperimentsAddr.Child(req.ExperimentId)
+	var w searcher.EventsWatcher
+	if err = a.ask(addr, req, &w); err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"failed to get events from actor: long polling %v", err)
+	}
+
+	defer a.m.system.TellAt(addr, UnwatchEvents{w.ID})
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(60)*time.Second)
+	defer cancel()
+
+	select {
+	case events := <-w.C:
+		return &apiv1.GetSearcherEventsResponse{
+			SearcherEvents: events,
+		}, nil
+	case <-ctx.Done():
+		return &apiv1.GetSearcherEventsResponse{
+			SearcherEvents: nil,
+		}, nil
+	}
+}
+
+func (a *apiServer) PostSearcherOperations(
+	ctx context.Context,
+	req *apiv1.PostSearcherOperationsRequest,
+) (
+	resp *apiv1.PostSearcherOperationsResponse, err error,
+) {
+	_, _, err = a.getExperimentAndCheckCanDoActions(
+		ctx, int(req.ExperimentId), exputil.AuthZProvider.Get().CanRunCustomSearch,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetching experiment from database")
+	}
+
+	addr := exputil.ExperimentsAddr.Child(req.ExperimentId)
+	switch err = a.ask(addr, req, &resp); {
+	case err != nil:
+		return nil, status.Errorf(codes.Internal, "failed to post operations: %v", err)
+	default:
+		logrus.Infof("posted operations %v", req.SearcherOperations)
+		return resp, nil
+	}
+}
+
+func (a *apiServer) GetExperiment(
+	ctx context.Context, req *apiv1.GetExperimentRequest,
+) (*apiv1.GetExperimentResponse, error) {
+	user, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get the user: %s", err)
+	}
+	exp, err := a.getExperiment(ctx, *user, int(req.ExperimentId))
+	if err != nil {
+		return nil, err
 	}
 
 	resp := apiv1.GetExperimentResponse{
 		Experiment: exp,
-		Config:     protoutils.ToStruct(conf),
 	}
 
-	if model.StateFromProto(exp.State) != model.ActiveState {
+	// Only continue to add a job summary if it's an active experiment.
+	if !isActiveExperimentState(exp.State) {
 		return &resp, nil
 	}
 
 	jobID := model.JobID(exp.JobId)
 
 	jobSummary := &jobv1.JobSummary{}
-	err = a.ask(job.JobsActorAddr, job.GetJobSummary{
+	err = a.ask(sproto.JobsActorAddr, sproto.GetJobSummary{
 		JobID:        jobID,
 		ResourcePool: exp.ResourcePool,
 	}, &jobSummary)
@@ -120,7 +297,7 @@ func (a *apiServer) GetExperiment(
 		// easy deducible how long that would block. So the best we can really do is return without
 		// an error if we're in this case and log. This is a debug log because of how often the
 		// happens when polling for an experiment to end.
-		if !strings.Contains(err.Error(), job.ErrJobNotFound(jobID).Error()) {
+		if !strings.Contains(err.Error(), sproto.ErrJobNotFound(jobID).Error()) {
 			return nil, err
 		}
 		logrus.WithError(err).Debugf("asking for job summary")
@@ -134,31 +311,18 @@ func (a *apiServer) GetExperiment(
 func (a *apiServer) DeleteExperiment(
 	ctx context.Context, req *apiv1.DeleteExperimentRequest,
 ) (*apiv1.DeleteExperimentResponse, error) {
-	curUser, _, err := grpcutil.GetUser(ctx, a.m.db, &a.m.config.InternalConfig.ExternalSessions)
+	e, curUser, err := a.getExperimentAndCheckCanDoActions(ctx, int(req.ExperimentId),
+		exputil.AuthZProvider.Get().CanDeleteExperiment)
 	if err != nil {
 		return nil, err
-	}
-
-	// Avoid loading the experiment config for what may be a very old experiment.
-	e, err := a.m.db.ExperimentWithoutConfigByID(int(req.ExperimentId))
-	switch {
-	case errors.Cause(err) == db.ErrNotFound:
-		return nil, status.Errorf(codes.NotFound, "experiment not found")
-	case err != nil:
-		return nil, errors.Wrap(err, "failed to retrieve experiment")
-	}
-
-	// AuthZ the request.
-	curUserIsOwner := e.OwnerID == nil || *e.OwnerID == curUser.ID
-	if !curUser.Admin && !curUserIsOwner {
-		return nil, grpcutil.ErrPermissionDenied
 	}
 
 	switch exists, eErr := a.m.db.ExperimentHasCheckpointsInRegistry(int(req.ExperimentId)); {
 	case eErr != nil:
 		return nil, errors.New("failed to check model registry for references")
 	case exists:
-		return nil, status.Errorf(codes.InvalidArgument, "checkpoints are registered as model versions")
+		return nil, status.Errorf(
+			codes.InvalidArgument, "checkpoints are registered as model versions")
 	}
 
 	if !model.ExperimentTransitions[e.State][model.DeletingState] {
@@ -170,7 +334,7 @@ func (a *apiServer) DeleteExperiment(
 		return nil, errors.Wrapf(err, "transitioning to %s", e.State)
 	}
 	go func() {
-		if err := a.deleteExperiment(e, curUser); err != nil {
+		if err := a.deleteExperiment(e, &curUser); err != nil {
 			logrus.WithError(err).Errorf("deleting experiment %d", e.ID)
 			e.State = model.DeleteFailedState
 			if err := a.m.db.SaveExperimentState(e); err != nil {
@@ -184,59 +348,50 @@ func (a *apiServer) DeleteExperiment(
 	return &apiv1.DeleteExperimentResponse{}, nil
 }
 
-func (a *apiServer) deleteExperiment(exp *model.Experiment, user *model.User) error {
-	conf, err := a.m.db.LegacyExperimentConfigByID(exp.ID)
+func (a *apiServer) DeleteExperiments(
+	ctx context.Context, req *apiv1.DeleteExperimentsRequest,
+) (*apiv1.DeleteExperimentsResponse, error) {
+	_, _, err := grpcutil.GetUser(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to read config for experiment: %w", err)
+		return nil, err
 	}
 
-	agentUserGroup, err := a.m.db.AgentUserGroup(*exp.OwnerID)
-	switch {
-	case err != nil:
-		return errors.Errorf("cannot find user and group for experiment")
-	case agentUserGroup == nil:
-		agentUserGroup = &a.m.config.Security.DefaultTask
+	return &apiv1.DeleteExperimentsResponse{}, err
+}
+
+func (a *apiServer) deleteExperiment(exp *model.Experiment, userModel *model.User) error {
+	agentUserGroup, err := user.GetAgentUserGroup(*exp.OwnerID, exp)
+	if err != nil {
+		return err
 	}
 
 	taskSpec := *a.m.taskSpec
-	taskSpec.AgentUserGroup = agentUserGroup
-	taskSpec.Owner = user
 	checkpoints, err := a.m.db.ExperimentCheckpointsToGCRaw(
 		exp.ID,
 		0,
 		0,
 		0,
-		true,
 	)
 	if err != nil {
 		return err
 	}
-
-	addr := actor.Addr(fmt.Sprintf("delete-checkpoint-gc-%s", uuid.New().String()))
-	if gcErr := a.m.system.MustActorOf(addr, &checkpointGCTask{
-		taskID:            model.NewTaskID(),
-		jobID:             exp.JobID,
-		jobSubmissionTime: exp.StartTime,
-		GCCkptSpec: tasks.GCCkptSpec{
-			Base:               taskSpec,
-			ExperimentID:       exp.ID,
-			LegacyConfig:       conf,
-			ToDelete:           checkpoints,
-			DeleteTensorboards: true,
-		},
-		rm: a.m.rm,
-		db: a.m.db,
-
-		taskLogger: a.m.taskLogger,
-		logCtx:     logger.Context{"experiment-id": exp.ID},
-	}).AwaitTermination(); gcErr != nil {
-		return errors.Wrapf(gcErr, "failed to gc checkpoints for experiment")
+	if len(checkpoints) > 0 {
+		addr := actor.Addr(fmt.Sprintf("delete-checkpoint-gc-%s", uuid.New().String()))
+		jobSubmissionTime := exp.StartTime
+		taskID := model.NewTaskID()
+		ckptGCTask := newCheckpointGCTask(
+			a.m.rm, a.m.db, a.m.taskLogger, taskID, exp.JobID, jobSubmissionTime, taskSpec, exp.ID,
+			exp.Config, checkpoints, true, agentUserGroup, userModel, nil,
+		)
+		if gcErr := a.m.system.MustActorOf(addr, ckptGCTask).AwaitTermination(); gcErr != nil {
+			return errors.Wrapf(gcErr, "failed to gc checkpoints for experiment")
+		}
 	}
 
-	var resp job.DeleteJobResponse
-	if err = a.ask(sproto.GetCurrentRM(a.m.system).Address(), job.DeleteJob{
+	resp, err := a.m.rm.DeleteJob(a.m.system, sproto.DeleteJob{
 		JobID: exp.JobID,
-	}, &resp); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("requesting cleanup of resource mananger resources: %w", err)
 	}
 	if err = <-resp.Err; err != nil {
@@ -262,40 +417,99 @@ func (a *apiServer) deleteExperiment(exp *model.Experiment, user *model.User) er
 	return nil
 }
 
+func getExperimentColumns(q *bun.SelectQuery) *bun.SelectQuery {
+	return q.
+		Column("e.id").
+		ColumnExpr("e.config->>'description' AS description").
+		ColumnExpr("e.config->>'labels' AS labels").
+		ColumnExpr("proto_time(e.start_time) AS start_time").
+		ColumnExpr("proto_time(e.end_time) AS end_time").
+		ColumnExpr(exputil.ProtoStateDBCaseString(experimentv1.State_value, "e.state", "state",
+			"STATE_")).
+		Column("e.archived").
+		ColumnExpr(
+			"(SELECT COUNT(*) FROM trials t WHERE e.id = t.experiment_id) AS num_trials").
+		// Intentionally not sending trial_ids due to performance.
+		ColumnExpr("COALESCE(u.display_name, u.username) as display_name").
+		ColumnExpr("e.owner_id as user_id").
+		Column("u.username").
+		ColumnExpr("e.config->'resources'->>'resource_pool' AS resource_pool").
+		ColumnExpr("e.config->'searcher'->>'name' AS searcher_type").
+		ColumnExpr("e.config->>'name' as NAME").
+		ColumnExpr(
+			"CASE WHEN NULLIF(e.notes, '') IS NULL THEN NULL ELSE 'omitted' END AS notes").
+		Column("e.job_id").
+		ColumnExpr("CASE WHEN e.parent_id IS NULL THEN NULL ELSE " +
+			"json_build_object('value', e.parent_id) END AS forked_from").
+		ColumnExpr("CASE WHEN e.progress IS NULL THEN NULL ELSE " +
+			"json_build_object('value', e.progress) END AS progress").
+		ColumnExpr("p.name AS project_name").
+		Column("e.project_id").
+		ColumnExpr("w.id AS workspace_id").
+		ColumnExpr("w.name AS workspace_name").
+		ColumnExpr("(w.archived OR p.archived) AS parent_archived").
+		ColumnExpr("p.user_id AS project_owner_id").
+		Column("e.config").
+		Column("e.checkpoint_size").
+		Column("e.checkpoint_count").
+		Join("JOIN users u ON e.owner_id = u.id").
+		Join("JOIN projects p ON e.project_id = p.id").
+		Join("JOIN workspaces w ON p.workspace_id = w.id")
+}
+
 func (a *apiServer) GetExperiments(
-	_ context.Context, req *apiv1.GetExperimentsRequest) (*apiv1.GetExperimentsResponse, error) {
-	// Construct the experiment filtering expression.
-	var allStates []string
-	for _, state := range req.States {
-		allStates = append(allStates, strings.TrimPrefix(state.String(), "STATE_"))
-	}
-	stateFilterExpr := strings.Join(allStates, ",")
-	userFilterExpr := strings.Join(req.Users, ",")
-	userIds := make([]string, 0)
-	for _, userID := range req.UserIds {
-		userIds = append(userIds, strconv.Itoa(int(userID)))
-	}
-	userIDFilterExpr := strings.Join(userIds, ",")
-	labelFilterExpr := strings.Join(req.Labels, ",")
-	archivedExpr := ""
-	if req.Archived != nil {
-		archivedExpr = strconv.FormatBool(req.Archived.Value)
+	ctx context.Context, req *apiv1.GetExperimentsRequest,
+) (*apiv1.GetExperimentsResponse, error) {
+	resp := &apiv1.GetExperimentsResponse{Experiments: []*experimentv1.Experiment{}}
+	query := db.Bun().NewSelect().
+		Model(&resp.Experiments).
+		ModelTableExpr("experiments as e").
+		Apply(getExperimentColumns)
+
+	if req.ShowTrialData {
+		query.ColumnExpr(`
+		(
+			SELECT searcher_metric_value
+			FROM trials t
+			WHERE t.experiment_id = e.id
+			ORDER BY (CASE
+				WHEN coalesce((config->'searcher'->>'smaller_is_better')::boolean, true)
+					THEN searcher_metric_value
+					ELSE -1.0 * searcher_metric_value
+			END) ASC
+			LIMIT 1
+		 ) AS best_trial_searcher_metric`)
 	}
 
 	// Construct the ordering expression.
 	orderColMap := map[apiv1.GetExperimentsRequest_SortBy]string{
-		apiv1.GetExperimentsRequest_SORT_BY_UNSPECIFIED:   "id",
-		apiv1.GetExperimentsRequest_SORT_BY_ID:            "id",
-		apiv1.GetExperimentsRequest_SORT_BY_DESCRIPTION:   "description",
-		apiv1.GetExperimentsRequest_SORT_BY_NAME:          "name",
-		apiv1.GetExperimentsRequest_SORT_BY_START_TIME:    "start_time",
-		apiv1.GetExperimentsRequest_SORT_BY_END_TIME:      "end_time",
-		apiv1.GetExperimentsRequest_SORT_BY_STATE:         "state",
-		apiv1.GetExperimentsRequest_SORT_BY_NUM_TRIALS:    "num_trials",
-		apiv1.GetExperimentsRequest_SORT_BY_PROGRESS:      "COALESCE(progress, 0)",
-		apiv1.GetExperimentsRequest_SORT_BY_USER:          "display_name",
-		apiv1.GetExperimentsRequest_SORT_BY_FORKED_FROM:   "forked_from",
-		apiv1.GetExperimentsRequest_SORT_BY_RESOURCE_POOL: "resource_pool",
+		apiv1.GetExperimentsRequest_SORT_BY_UNSPECIFIED:      "id",
+		apiv1.GetExperimentsRequest_SORT_BY_ID:               "id",
+		apiv1.GetExperimentsRequest_SORT_BY_DESCRIPTION:      "description",
+		apiv1.GetExperimentsRequest_SORT_BY_NAME:             "name",
+		apiv1.GetExperimentsRequest_SORT_BY_START_TIME:       "e.start_time",
+		apiv1.GetExperimentsRequest_SORT_BY_END_TIME:         "e.end_time",
+		apiv1.GetExperimentsRequest_SORT_BY_STATE:            "e.state",
+		apiv1.GetExperimentsRequest_SORT_BY_NUM_TRIALS:       "num_trials",
+		apiv1.GetExperimentsRequest_SORT_BY_PROGRESS:         "COALESCE(progress, 0)",
+		apiv1.GetExperimentsRequest_SORT_BY_USER:             "display_name",
+		apiv1.GetExperimentsRequest_SORT_BY_FORKED_FROM:      "e.parent_id",
+		apiv1.GetExperimentsRequest_SORT_BY_RESOURCE_POOL:    "resource_pool",
+		apiv1.GetExperimentsRequest_SORT_BY_PROJECT_ID:       "project_id",
+		apiv1.GetExperimentsRequest_SORT_BY_CHECKPOINT_SIZE:  "checkpoint_size",
+		apiv1.GetExperimentsRequest_SORT_BY_CHECKPOINT_COUNT: "checkpoint_count",
+		apiv1.GetExperimentsRequest_SORT_BY_SEARCHER_METRIC_VAL: `(
+			SELECT
+				searcher_metric_value
+			FROM trials t
+			WHERE t.experiment_id = e.id
+			ORDER BY (CASE
+				WHEN coalesce((config->'searcher'->>'smaller_is_better')::boolean, true)
+					THEN searcher_metric_value
+					ELSE -1.0 * searcher_metric_value
+			END) ASC
+			LIMIT 1
+		 ) `,
 	}
 	sortByMap := map[apiv1.OrderBy]string{
 		apiv1.OrderBy_ORDER_BY_UNSPECIFIED: "ASC",
@@ -314,53 +528,197 @@ func (a *apiServer) GetExperiments(
 	default:
 		orderExpr = fmt.Sprintf("id %s", sortByMap[req.OrderBy])
 	}
+	query = query.OrderExpr(orderExpr)
 
-	resp := &apiv1.GetExperimentsResponse{}
-	return resp, a.m.db.QueryProtof(
-		"get_experiments",
-		[]interface{}{orderExpr},
-		resp,
-		stateFilterExpr,
-		archivedExpr,
-		userFilterExpr,
-		userIDFilterExpr,
-		labelFilterExpr,
-		req.Description,
-		req.Name,
-		req.Offset,
-		req.Limit,
-	)
-}
+	// Filtering
+	if req.Description != "" {
+		query = query.Where("e.config->>'description' ILIKE ('%%' || ? || '%%')", req.Description)
+	}
+	if req.Name != "" {
+		query = query.Where("e.config->>'name' ILIKE ('%%' || ? || '%%')", req.Name)
+	}
+	if len(req.Labels) > 0 {
+		// In the event labels were removed, if all were removed we insert null,
+		// which previously broke this query.
+		query = query.Where(`string_to_array(?, ',') <@ ARRAY(SELECT jsonb_array_elements_text(
+				CASE WHEN e.config->'labels'::text = 'null'
+				THEN NULL
+				ELSE e.config->'labels' END
+			))`, strings.Join(req.Labels, ",")) // Trying bun.In doesn't work.
+	}
+	if req.Archived != nil {
+		query = query.Where("e.archived = ?", req.Archived.Value)
+	}
+	if len(req.States) > 0 {
+		var allStates []string
+		for _, state := range req.States {
+			allStates = append(allStates, strings.TrimPrefix(state.String(), "STATE_"))
+		}
+		query = query.Where("e.state IN (?)", bun.In(allStates))
+	}
+	if len(req.Users) > 0 {
+		query = query.Where("u.username IN (?)", bun.In(req.Users))
+	}
+	if len(req.UserIds) > 0 {
+		query = query.Where("e.owner_id IN (?)", bun.In(req.UserIds))
+	}
 
-func (a *apiServer) GetExperimentLabels(_ context.Context,
-	req *apiv1.GetExperimentLabelsRequest) (*apiv1.GetExperimentLabelsResponse, error) {
-	resp := &apiv1.GetExperimentLabelsResponse{}
+	if req.ExperimentIdFilter != nil {
+		var err error
+		query, err = db.ApplyInt32FieldFilter(query, bun.Ident("e.id"), req.ExperimentIdFilter)
+		if err != nil {
+			return nil, err
+		}
+	}
 
-	var err error
-	labelUsage, err := a.m.db.ExperimentLabelUsage()
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get the user: %s", err)
+	}
+	var proj *projectv1.Project
+	if req.ProjectId != 0 {
+		proj, err = a.GetProjectByID(ctx, req.ProjectId, *curUser)
+		if err != nil {
+			return nil, err
+		}
+
+		query = query.Where("project_id = ?", req.ProjectId)
+	}
+	if query, err = exputil.AuthZProvider.Get().
+		FilterExperimentsQuery(ctx, *curUser, proj, query,
+			[]rbacv1.PermissionType{rbacv1.PermissionType_PERMISSION_TYPE_VIEW_EXPERIMENT_METADATA},
+		); err != nil {
+		return nil, err
+	}
+
+	resp.Pagination, err = runPagedBunExperimentsQuery(ctx, query, int(req.Offset), int(req.Limit))
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert the label usage map into a sorted list of labels
-	// May add other sorting / pagination options later if needed
-	labels := make([]string, len(labelUsage))
-	i := 0
-	for label := range labelUsage {
-		labels[i] = label
-		i++
+	if err = a.enrichExperimentState(resp.Experiments...); err != nil {
+		return nil, err
 	}
-	sort.Slice(labels, func(i, j int) bool {
-		return labelUsage[labels[i]] > labelUsage[labels[j]]
-	})
-	resp.Labels = labels
 
 	return resp, nil
 }
 
+func runPagedBunExperimentsQuery(
+	ctx context.Context, query *bun.SelectQuery, offset, limit int,
+) (*apiv1.Pagination, error) {
+	// Count number of items without any limits or offsets.
+	total, err := query.Count(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Calculate end and start indexes.
+	startIndex := offset
+	if offset > total || offset < -total {
+		startIndex = total
+	} else if offset < 0 {
+		startIndex = total + offset
+	}
+
+	endIndex := startIndex + limit
+	switch {
+	case limit == -2:
+		endIndex = startIndex
+	case limit == -1:
+		endIndex = total
+	case limit == 0:
+		endIndex = 100 + startIndex
+		if total < endIndex {
+			endIndex = total
+		}
+	case startIndex+limit > total:
+		endIndex = total
+	}
+
+	// Add start and end index to query.
+	query.Offset(startIndex)
+	query.Limit(endIndex - startIndex)
+
+	// Bun bug treating limit=0 as no limit when it
+	// should be the exact opposite of no records returned.
+	if endIndex-startIndex != 0 {
+		if err = query.Scan(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	return &apiv1.Pagination{
+		Offset:     int32(offset),
+		Limit:      int32(limit),
+		Total:      int32(total),
+		StartIndex: int32(startIndex),
+		EndIndex:   int32(endIndex),
+	}, nil
+}
+
+func (a *apiServer) GetExperimentLabels(ctx context.Context,
+	req *apiv1.GetExperimentLabelsRequest,
+) (*apiv1.GetExperimentLabelsResponse, error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get the user: %s", err)
+	}
+
+	resp := &apiv1.GetExperimentLabelsResponse{}
+	var labels [][]string
+	query := db.Bun().NewSelect().
+		Table("experiments").
+		Model(&labels).
+		ColumnExpr("config->'labels' AS labels").
+		Distinct()
+
+	var proj *projectv1.Project
+	if req.ProjectId != 0 {
+		proj, err = a.GetProjectByID(ctx, req.ProjectId, *curUser)
+		if err != nil {
+			return nil, err
+		}
+
+		query = query.Where("project_id = ?", req.ProjectId)
+	}
+
+	if query, err = exputil.AuthZProvider.Get().
+		FilterExperimentLabelsQuery(ctx, *curUser, proj, query); err != nil {
+		return nil, err
+	}
+
+	if err = query.Scan(ctx); err != nil {
+		return nil, err
+	}
+
+	// Sort labels by usage.
+	labelUsage := make(map[string]int)
+	for _, labelArr := range labels {
+		for _, l := range labelArr {
+			labelUsage[l]++
+		}
+	}
+
+	resp.Labels = make([]string, len(labelUsage))
+	i := 0
+	for label := range labelUsage {
+		resp.Labels[i] = label
+		i++
+	}
+	sort.Slice(resp.Labels, func(i, j int) bool {
+		return labelUsage[resp.Labels[i]] > labelUsage[resp.Labels[j]]
+	})
+	return resp, nil
+}
+
 func (a *apiServer) GetExperimentValidationHistory(
-	_ context.Context, req *apiv1.GetExperimentValidationHistoryRequest,
+	ctx context.Context, req *apiv1.GetExperimentValidationHistoryRequest,
 ) (*apiv1.GetExperimentValidationHistoryResponse, error) {
+	if _, _, err := a.getExperimentAndCheckCanDoActions(ctx, int(req.ExperimentId),
+		exputil.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+		return nil, err
+	}
+
 	var resp apiv1.GetExperimentValidationHistoryResponse
 	switch err := a.m.db.QueryProto("proto_experiment_validation_history", &resp, req.ExperimentId); {
 	case err == db.ErrNotFound:
@@ -373,7 +731,16 @@ func (a *apiServer) GetExperimentValidationHistory(
 }
 
 func (a *apiServer) PreviewHPSearch(
-	_ context.Context, req *apiv1.PreviewHPSearchRequest) (*apiv1.PreviewHPSearchResponse, error) {
+	ctx context.Context, req *apiv1.PreviewHPSearchRequest,
+) (*apiv1.PreviewHPSearchResponse, error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = exputil.AuthZProvider.Get().CanPreviewHPSearch(ctx, *curUser); err != nil {
+		return nil, status.Errorf(codes.PermissionDenied, err.Error())
+	}
+
 	bytes, err := protojson.Marshal(req.Config)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "error parsing experiment config: %s", err)
@@ -397,8 +764,8 @@ func (a *apiServer) PreviewHPSearch(
 	hc := config.RawHyperparameters
 
 	// Apply any json-schema-defined defaults.
-	sc = schemas.WithDefaults(sc).(expconf.SearcherConfig)
-	hc = schemas.WithDefaults(hc).(expconf.Hyperparameters)
+	sc = schemas.WithDefaults(sc)
+	hc = schemas.WithDefaults(hc)
 
 	// Make sure the searcher config has all eventuallyRequired fields.
 	if err = schemas.IsComplete(sc); err != nil {
@@ -422,7 +789,7 @@ func (a *apiServer) PreviewHPSearch(
 		return nil, err
 	}
 	protoSim := &experimentv1.ExperimentSimulation{Seed: req.Seed}
-	indexes := make(map[string]int)
+	indexes := make(map[string]int, len(sim.Results))
 	toProto := func(op searcher.ValidateAfter) ([]*experimentv1.RunnableOperation, error) {
 		return []*experimentv1.RunnableOperation{
 			{
@@ -458,11 +825,12 @@ func (a *apiServer) PreviewHPSearch(
 func (a *apiServer) ActivateExperiment(
 	ctx context.Context, req *apiv1.ActivateExperimentRequest,
 ) (resp *apiv1.ActivateExperimentResponse, err error) {
-	if err = a.checkExperimentExists(int(req.Id)); err != nil {
+	if _, _, err = a.getExperimentAndCheckCanDoActions(ctx, int(req.Id),
+		exputil.AuthZProvider.Get().CanEditExperiment); err != nil {
 		return nil, err
 	}
 
-	addr := experimentsAddr.Child(req.Id)
+	addr := exputil.ExperimentsAddr.Child(req.Id)
 	switch err = a.ask(addr, req, &resp); {
 	case status.Code(err) == codes.NotFound:
 		return nil, status.Error(codes.FailedPrecondition, "experiment in terminal state")
@@ -471,122 +839,149 @@ func (a *apiServer) ActivateExperiment(
 	default:
 		return resp, nil
 	}
+}
+
+func (a *apiServer) ActivateExperiments(
+	ctx context.Context, req *apiv1.ActivateExperimentsRequest,
+) (*apiv1.ActivateExperimentsResponse, error) {
+	results, err := exputil.ActivateExperiments(ctx, a.m.system, req.ExperimentIds, req.Filters)
+	return &apiv1.ActivateExperimentsResponse{Results: exputil.ToAPIResults(results)}, err
 }
 
 func (a *apiServer) PauseExperiment(
 	ctx context.Context, req *apiv1.PauseExperimentRequest,
 ) (resp *apiv1.PauseExperimentResponse, err error) {
-	if err = a.checkExperimentExists(int(req.Id)); err != nil {
-		return nil, err
+	results, err := exputil.PauseExperiments(ctx, a.m.system, []int32{req.Id}, nil)
+
+	if err == nil {
+		if len(results) == 0 {
+			return nil, errors.Errorf("unknown error during pause query.")
+		} else if results[0].Error != nil {
+			return nil, results[0].Error
+		}
 	}
 
-	addr := experimentsAddr.Child(req.Id)
-	switch err = a.ask(addr, req, &resp); {
-	case status.Code(err) == codes.NotFound:
-		return nil, status.Error(codes.FailedPrecondition, "experiment in terminal state")
-	case err != nil:
-		return nil, status.Errorf(codes.Internal, "failed passing request to experiment actor: %s", err)
-	default:
-		return resp, nil
-	}
+	return &apiv1.PauseExperimentResponse{}, err
+}
+
+func (a *apiServer) PauseExperiments(
+	ctx context.Context, req *apiv1.PauseExperimentsRequest,
+) (*apiv1.PauseExperimentsResponse, error) {
+	results, err := exputil.PauseExperiments(ctx, a.m.system, req.ExperimentIds, req.Filters)
+	return &apiv1.PauseExperimentsResponse{Results: exputil.ToAPIResults(results)}, err
 }
 
 func (a *apiServer) CancelExperiment(
 	ctx context.Context, req *apiv1.CancelExperimentRequest,
 ) (resp *apiv1.CancelExperimentResponse, err error) {
-	if err = a.checkExperimentExists(int(req.Id)); err != nil {
-		return nil, err
+	results, err := exputil.CancelExperiments(ctx, a.m.system, []int32{req.Id}, nil)
+
+	if err == nil {
+		if len(results) == 0 {
+			return nil, errors.Errorf("unknown error during cancel query.")
+		} else if results[0].Error != nil {
+			return nil, results[0].Error
+		}
 	}
 
-	addr := experimentsAddr.Child(req.Id)
-	err = a.ask(addr, req, &resp)
-	if status.Code(err) == codes.NotFound {
-		return &apiv1.CancelExperimentResponse{}, nil
-	}
-	return resp, err
+	return &apiv1.CancelExperimentResponse{}, err
+}
+
+func (a *apiServer) CancelExperiments(
+	ctx context.Context, req *apiv1.CancelExperimentsRequest,
+) (*apiv1.CancelExperimentsResponse, error) {
+	results, err := exputil.CancelExperiments(ctx, a.m.system, req.ExperimentIds, req.Filters)
+	return &apiv1.CancelExperimentsResponse{Results: exputil.ToAPIResults(results)}, err
 }
 
 func (a *apiServer) KillExperiment(
 	ctx context.Context, req *apiv1.KillExperimentRequest,
-) (
-	resp *apiv1.KillExperimentResponse, err error) {
-	if err = a.checkExperimentExists(int(req.Id)); err != nil {
-		return nil, err
+) (resp *apiv1.KillExperimentResponse, err error) {
+	results, err := exputil.KillExperiments(ctx, a.m.system, []int32{req.Id}, nil)
+
+	if err == nil {
+		if len(results) == 0 {
+			return nil, errors.Errorf("unknown error during kill query.")
+		} else if results[0].Error != nil {
+			return nil, results[0].Error
+		}
 	}
 
-	addr := experimentsAddr.Child(req.Id)
-	err = a.ask(addr, req, &resp)
-	if status.Code(err) == codes.NotFound {
-		return &apiv1.KillExperimentResponse{}, nil
-	}
-	return resp, err
+	return &apiv1.KillExperimentResponse{}, err
+}
+
+func (a *apiServer) KillExperiments(
+	ctx context.Context, req *apiv1.KillExperimentsRequest,
+) (*apiv1.KillExperimentsResponse, error) {
+	results, err := exputil.KillExperiments(ctx, a.m.system, req.ExperimentIds, req.Filters)
+	return &apiv1.KillExperimentsResponse{Results: exputil.ToAPIResults(results)}, err
 }
 
 func (a *apiServer) ArchiveExperiment(
 	ctx context.Context, req *apiv1.ArchiveExperimentRequest,
 ) (*apiv1.ArchiveExperimentResponse, error) {
-	id := int(req.Id)
+	results, err := exputil.ArchiveExperiments(ctx, a.m.system, []int32{req.Id}, nil)
 
-	dbExp, err := a.m.db.ExperimentWithoutConfigByID(id)
-	if err != nil {
-		return nil, errors.Wrapf(err, "loading experiment %v", id)
-	}
-	if _, ok := model.TerminalStates[dbExp.State]; !ok {
-		return nil, errors.Errorf("cannot archive experiment %v in non terminate state %v",
-			id, dbExp.State)
+	if err == nil {
+		if len(results) == 0 {
+			return nil, errors.Errorf("unknown error during archive query.")
+		} else if results[0].Error != nil {
+			return nil, results[0].Error
+		}
 	}
 
-	if dbExp.Archived {
-		return &apiv1.ArchiveExperimentResponse{}, nil
-	}
-	dbExp.Archived = true
-	err = a.m.db.SaveExperimentArchiveStatus(dbExp)
-	switch err {
-	case nil:
-		return &apiv1.ArchiveExperimentResponse{}, nil
-	default:
-		return nil, errors.Wrapf(err, "failed to archive experiment %d",
-			req.Id)
-	}
+	return &apiv1.ArchiveExperimentResponse{}, err
+}
+
+func (a *apiServer) ArchiveExperiments(
+	ctx context.Context, req *apiv1.ArchiveExperimentsRequest,
+) (*apiv1.ArchiveExperimentsResponse, error) {
+	results, err := exputil.ArchiveExperiments(ctx, a.m.system, req.ExperimentIds, req.Filters)
+	return &apiv1.ArchiveExperimentsResponse{Results: exputil.ToAPIResults(results)}, err
 }
 
 func (a *apiServer) UnarchiveExperiment(
 	ctx context.Context, req *apiv1.UnarchiveExperimentRequest,
 ) (*apiv1.UnarchiveExperimentResponse, error) {
-	id := int(req.Id)
+	results, err := exputil.UnarchiveExperiments(ctx, a.m.system, []int32{req.Id}, nil)
 
-	dbExp, err := a.m.db.ExperimentWithoutConfigByID(id)
-	if err != nil {
-		return nil, errors.Wrapf(err, "loading experiment %v", id)
-	}
-	if _, ok := model.TerminalStates[dbExp.State]; !ok {
-		return nil, errors.Errorf("cannot unarchive experiment %v in non terminate state %v",
-			id, dbExp.State)
+	if err == nil {
+		if len(results) == 0 {
+			return nil, errors.Errorf("unknown error during unarchive query.")
+		} else if results[0].Error != nil {
+			return nil, results[0].Error
+		}
 	}
 
-	if !dbExp.Archived {
-		return &apiv1.UnarchiveExperimentResponse{}, nil
-	}
-	dbExp.Archived = false
-	err = a.m.db.SaveExperimentArchiveStatus(dbExp)
-	switch err {
-	case nil:
-		return &apiv1.UnarchiveExperimentResponse{}, nil
-	default:
-		return nil, errors.Wrapf(err, "failed to archive experiment %d",
-			req.Id)
-	}
+	return &apiv1.UnarchiveExperimentResponse{}, err
+}
+
+func (a *apiServer) UnarchiveExperiments(
+	ctx context.Context, req *apiv1.UnarchiveExperimentsRequest,
+) (*apiv1.UnarchiveExperimentsResponse, error) {
+	results, err := exputil.UnarchiveExperiments(ctx, a.m.system, req.ExperimentIds, req.Filters)
+	return &apiv1.UnarchiveExperimentsResponse{Results: exputil.ToAPIResults(results)}, err
 }
 
 func (a *apiServer) PatchExperiment(
 	ctx context.Context, req *apiv1.PatchExperimentRequest,
 ) (*apiv1.PatchExperimentResponse, error) {
-	var exp experimentv1.Experiment
-	switch err := a.m.db.QueryProto("get_experiment", &exp, req.Experiment.Id); {
-	case err == db.ErrNotFound:
-		return nil, status.Errorf(codes.NotFound, "experiment not found: %d", req.Experiment.Id)
-	case err != nil:
-		return nil, errors.Wrapf(err, "error fetching experiment from database: %d", req.Experiment.Id)
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	exp, err := a.getExperiment(ctx, *curUser, int(req.Experiment.Id))
+	if err != nil {
+		return nil, err
+	}
+	modelExp, err := model.ExperimentFromProto(exp)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = exputil.AuthZProvider.Get().CanEditExperimentsMetadata(
+		ctx, *curUser, modelExp); err != nil {
+		return nil, status.Errorf(codes.PermissionDenied, err.Error())
 	}
 
 	madeChanges := false
@@ -610,11 +1005,18 @@ func (a *apiServer) PatchExperiment(
 	}
 
 	if req.Experiment.Labels != nil {
-		var reqLabelList []string
+		// avoid duplicate keys
+		reqLabelSet := make(map[string]struct{}, len(req.Experiment.Labels.Values))
 		for _, el := range req.Experiment.Labels.Values {
 			if _, ok := el.GetKind().(*structpb.Value_StringValue); ok {
-				reqLabelList = append(reqLabelList, el.GetStringValue())
+				reqLabelSet[el.GetStringValue()] = struct{}{}
 			}
+		}
+		reqLabelList := make([]string, len(reqLabelSet))
+		i := 0
+		for key := range reqLabelSet {
+			reqLabelList[i] = key
+			i++
 		}
 		reqLabels := strings.Join(reqLabelList, ",")
 		if strings.Join(exp.Labels, ",") != reqLabels {
@@ -636,8 +1038,8 @@ func (a *apiServer) PatchExperiment(
 			Description: exp.Description,
 			Name:        exp.Name,
 		}
-		marshalledPatches, err := json.Marshal(patches)
-		if err != nil {
+		marshalledPatches, patchErr := json.Marshal(patches)
+		if patchErr != nil {
 			return nil, status.Errorf(codes.Internal, "failed to marshal experiment patch")
 		}
 
@@ -648,23 +1050,38 @@ func (a *apiServer) PatchExperiment(
 		}
 	}
 
-	return &apiv1.PatchExperimentResponse{Experiment: &exp}, nil
+	// include queued / pulling / starting / running state
+	if err = a.enrichExperimentState(exp); err != nil {
+		return nil, err
+	}
+
+	return &apiv1.PatchExperimentResponse{Experiment: exp}, nil
 }
 
 func (a *apiServer) GetExperimentCheckpoints(
 	ctx context.Context, req *apiv1.GetExperimentCheckpointsRequest,
 ) (*apiv1.GetExperimentCheckpointsResponse, error) {
-	ok, err := a.m.db.CheckExperimentExists(int(req.Id))
-	switch {
-	case err != nil:
-		return nil, status.Errorf(codes.Internal, "failed to check if experiment exists: %s", err)
-	case !ok:
-		return nil, status.Errorf(codes.NotFound, "experiment %d not found", req.Id)
+	experimentID := int(req.Id)
+	useSearcherSortBy := req.SortBy == apiv1.GetExperimentCheckpointsRequest_SORT_BY_SEARCHER_METRIC
+	exp, _, err := a.getExperimentAndCheckCanDoActions(ctx, experimentID,
+		exputil.AuthZProvider.Get().CanGetExperimentArtifacts)
+	if err != nil {
+		return nil, err
+	}
+
+	// If SORT_BY_SEARCHER_METRIC is specified without an OrderBy
+	// default to ordering by "better" checkpoints.
+	if useSearcherSortBy && req.OrderBy == apiv1.OrderBy_ORDER_BY_UNSPECIFIED {
+		if exp.Config.Searcher.SmallerIsBetter {
+			req.OrderBy = apiv1.OrderBy_ORDER_BY_ASC
+		} else {
+			req.OrderBy = apiv1.OrderBy_ORDER_BY_DESC
+		}
 	}
 
 	resp := &apiv1.GetExperimentCheckpointsResponse{}
 	resp.Checkpoints = []*checkpointv1.Checkpoint{}
-	switch err := a.m.db.QueryProto("get_checkpoints_for_experiment", &resp.Checkpoints, req.Id); {
+	switch err = a.m.db.QueryProto("get_checkpoints_for_experiment", &resp.Checkpoints, req.Id); {
 	case err == db.ErrNotFound:
 		return nil, status.Errorf(
 			codes.NotFound, "no checkpoints found for experiment %d", req.Id)
@@ -688,59 +1105,126 @@ func (a *apiServer) GetExperimentCheckpoints(
 			return false
 		}
 
-		found = false
-		for _, state := range req.ValidationStates {
-			if state == v.ValidationState {
-				found = true
-				break
-			}
-		}
-
-		if len(req.ValidationStates) != 0 && !found {
-			return false
-		}
-
 		return true
 	})
 
-	a.sort(
-		resp.Checkpoints, req.OrderBy, req.SortBy, apiv1.GetExperimentCheckpointsRequest_SORT_BY_TRIAL_ID)
+	sort.Slice(resp.Checkpoints, func(i, j int) bool {
+		ai, aj := resp.Checkpoints[i], resp.Checkpoints[j]
+		if useSearcherSortBy {
+			if order, done := protoless.CheckpointSearcherMetricNullsLast(ai, aj); done {
+				return order
+			}
+		}
+
+		if req.OrderBy == apiv1.OrderBy_ORDER_BY_DESC {
+			aj, ai = ai, aj
+		}
+
+		switch req.SortBy {
+		case apiv1.GetExperimentCheckpointsRequest_SORT_BY_BATCH_NUMBER:
+			return protoless.CheckpointStepsCompletedLess(ai, aj)
+		case apiv1.GetExperimentCheckpointsRequest_SORT_BY_UUID:
+			return ai.Uuid < aj.Uuid
+		case apiv1.GetExperimentCheckpointsRequest_SORT_BY_TRIAL_ID:
+			return protoless.CheckpointTrialIDLess(ai, aj)
+		case apiv1.GetExperimentCheckpointsRequest_SORT_BY_END_TIME:
+			return protoless.CheckpointReportTimeLess(ai, aj)
+		case apiv1.GetExperimentCheckpointsRequest_SORT_BY_STATE:
+			return ai.State.Number() < aj.State.Number()
+		case apiv1.GetExperimentCheckpointsRequest_SORT_BY_SEARCHER_METRIC:
+			return protoless.CheckpointSearcherMetricLess(ai, aj)
+		case apiv1.GetExperimentCheckpointsRequest_SORT_BY_UNSPECIFIED:
+			fallthrough
+		default:
+			return protoless.CheckpointTrialIDLess(ai, aj)
+		}
+	})
 	return resp, a.paginate(&resp.Pagination, &resp.Checkpoints, req.Offset, req.Limit)
 }
 
 func (a *apiServer) CreateExperiment(
 	ctx context.Context, req *apiv1.CreateExperimentRequest,
 ) (*apiv1.CreateExperimentResponse, error) {
-	detParams := CreateExperimentParams{
-		ConfigBytes:  req.Config,
-		ModelDef:     filesToArchive(req.ModelDefinition),
-		ValidateOnly: req.ValidateOnly,
-	}
-	if req.ParentId != 0 {
-		parentID := int(req.ParentId)
-		detParams.ParentID = &parentID
-	}
-
-	user, _, err := grpcutil.GetUser(ctx, a.m.db, &a.m.config.InternalConfig.ExternalSessions)
+	user, _, err := grpcutil.GetUser(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get the user: %s", err)
 	}
 
-	dbExp, validateOnly, taskSpec, err := a.m.parseCreateExperiment(&detParams, user)
+	var commitDate *time.Time
+	pt, err := protoutils.ToTime(req.GitCommitDate)
+	if err == nil {
+		commitDate = &pt
+	}
 
+	detParams := CreateExperimentParams{
+		ConfigBytes:   req.Config,
+		ModelDef:      filesToArchive(req.ModelDefinition),
+		ValidateOnly:  req.ValidateOnly,
+		Template:      req.Template,
+		GitRemote:     req.GitRemote,
+		GitCommit:     req.GitCommit,
+		GitCommitter:  req.GitCommitter,
+		GitCommitDate: commitDate,
+	}
+	if req.ParentId != 0 {
+		detParams.ParentID = ptrs.Ptr(int(req.ParentId))
+		// Can't use getExperimentAndCheckDoActions since model.Experiment doesn't have ParentArchived.
+		var parentExp *experimentv1.Experiment
+		parentExp, err = a.getExperiment(ctx, *user, *detParams.ParentID)
+		if err != nil {
+			return nil, err
+		}
+		var modelExp *model.Experiment
+		modelExp, err = model.ExperimentFromProto(parentExp)
+		if err != nil {
+			return nil, err
+		}
+
+		if err = exputil.AuthZProvider.Get().
+			CanForkFromExperiment(ctx, *user, modelExp); err != nil {
+			return nil, status.Errorf(codes.PermissionDenied, err.Error())
+		}
+		if parentExp.ParentArchived {
+			return nil, status.Errorf(codes.Internal,
+				"forking an experiment in an archived workspace/project")
+		}
+	}
+	if req.ProjectId > 1 {
+		projectID := int(req.ProjectId)
+		detParams.ProjectID = &projectID
+	}
+
+	dbExp, activeConfig, p, validateOnly, taskSpec, err := a.m.parseCreateExperiment(
+		&detParams, user,
+	)
 	if err != nil {
+		if _, ok := err.(ErrProjectNotFound); ok {
+			return nil, status.Errorf(codes.NotFound, err.Error())
+		}
 		return nil, status.Errorf(codes.InvalidArgument, "invalid experiment: %s", err)
+	}
+	if err = exputil.AuthZProvider.Get().CanCreateExperiment(ctx, *user, p, dbExp); err != nil {
+		return nil, status.Errorf(codes.PermissionDenied, err.Error())
 	}
 
 	if validateOnly {
-		return &apiv1.CreateExperimentResponse{}, nil
+		return &apiv1.CreateExperimentResponse{
+			Experiment: &experimentv1.Experiment{},
+		}, nil
+	}
+	// Check user has permission for what they are trying to do
+	// before actually saving the experiment.
+	if req.Activate {
+		if err = exputil.AuthZProvider.Get().CanEditExperiment(ctx, *user, dbExp); err != nil {
+			return nil, status.Errorf(codes.PermissionDenied, err.Error())
+		}
 	}
 
-	e, err := newExperiment(a.m, dbExp, taskSpec)
+	e, launchWarnings, err := newExperiment(a.m, dbExp, activeConfig, taskSpec)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create experiment: %s", err)
 	}
-	a.m.system.ActorOf(experimentsAddr.Child(e.ID), e)
+	a.m.system.ActorOf(exputil.ExperimentsAddr.Child(e.ID), e)
 
 	if req.Activate {
 		_, err = a.ActivateExperiment(ctx, &apiv1.ActivateExperimentRequest{Id: int32(e.ID)})
@@ -749,40 +1233,52 @@ func (a *apiServer) CreateExperiment(
 		}
 	}
 
-	protoExp, err := a.getExperiment(e.ID)
+	protoExp, err := a.getExperiment(ctx, *user, e.ID)
 	if err != nil {
 		return nil, err
 	}
 	return &apiv1.CreateExperimentResponse{
-		Experiment: protoExp, Config: protoutils.ToStruct(e.Config),
+		Experiment: protoExp,
+		Config:     protoutils.ToStruct(activeConfig),
+		Warnings:   command.LaunchWarningToProto(launchWarnings),
 	}, nil
 }
 
-var defaultMetricsStreamPeriod = 30 * time.Second
+var (
+	defaultMetricsStreamPeriod = 30 * time.Second
+	recheckAuthPeriod          = 5 * time.Minute
+)
 
 func (a *apiServer) MetricNames(req *apiv1.MetricNamesRequest,
-	resp apiv1.Determined_MetricNamesServer) error {
+	resp apiv1.Determined_MetricNamesServer,
+) error {
 	experimentID := int(req.ExperimentId)
-	if err := a.checkExperimentExists(experimentID); err != nil {
-		return err
-	}
 	period := time.Duration(req.PeriodSeconds) * time.Second
 	if period == 0 {
 		period = defaultMetricsStreamPeriod
 	}
 
-	config, err := a.m.db.ExperimentConfig(experimentID)
-	if err != nil {
-		return errors.Wrapf(err,
-			"error fetching experiment config from database: %d", experimentID)
-	}
-	searcherMetric := config.Searcher().Metric()
-
 	seenTrain := make(map[string]bool)
 	seenValid := make(map[string]bool)
 	var tStartTime time.Time
 	var vStartTime time.Time
+
+	var timeSinceLastAuth time.Time
+	var searcherMetric string
 	for {
+		if time.Now().Sub(timeSinceLastAuth) >= recheckAuthPeriod {
+			exp, _, err := a.getExperimentAndCheckCanDoActions(resp.Context(), experimentID,
+				exputil.AuthZProvider.Get().CanGetExperimentArtifacts)
+			if err != nil {
+				return err
+			}
+
+			if timeSinceLastAuth == (time.Time{}) { // Initialzation.
+				searcherMetric = exp.Config.Searcher.Metric
+			}
+			timeSinceLastAuth = time.Now()
+		}
+
 		var response apiv1.MetricNamesResponse
 		response.SearcherMetric = searcherMetric
 
@@ -831,11 +1327,9 @@ func (a *apiServer) MetricNames(req *apiv1.MetricNamesRequest,
 }
 
 func (a *apiServer) MetricBatches(req *apiv1.MetricBatchesRequest,
-	resp apiv1.Determined_MetricBatchesServer) error {
+	resp apiv1.Determined_MetricBatchesServer,
+) error {
 	experimentID := int(req.ExperimentId)
-	if err := a.checkExperimentExists(experimentID); err != nil {
-		return err
-	}
 	metricName := req.MetricName
 	if metricName == "" {
 		return status.Error(codes.InvalidArgument, "must specify a metric name")
@@ -849,9 +1343,18 @@ func (a *apiServer) MetricBatches(req *apiv1.MetricBatchesRequest,
 		period = defaultMetricsStreamPeriod
 	}
 
+	var timeSinceLastAuth time.Time
 	seenBatches := make(map[int32]bool)
 	var startTime time.Time
 	for {
+		if time.Now().Sub(timeSinceLastAuth) >= recheckAuthPeriod {
+			if _, _, err := a.getExperimentAndCheckCanDoActions(resp.Context(), experimentID,
+				exputil.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+				return err
+			}
+			timeSinceLastAuth = time.Now()
+		}
+
 		var response apiv1.MetricBatchesResponse
 
 		var newBatches []int32
@@ -902,11 +1405,9 @@ func (a *apiServer) MetricBatches(req *apiv1.MetricBatchesRequest,
 }
 
 func (a *apiServer) TrialsSnapshot(req *apiv1.TrialsSnapshotRequest,
-	resp apiv1.Determined_TrialsSnapshotServer) error {
+	resp apiv1.Determined_TrialsSnapshotServer,
+) error {
 	experimentID := int(req.ExperimentId)
-	if err := a.checkExperimentExists(experimentID); err != nil {
-		return err
-	}
 	metricName := req.MetricName
 	if metricName == "" {
 		return status.Error(codes.InvalidArgument, "must specify a metric name")
@@ -934,10 +1435,18 @@ func (a *apiServer) TrialsSnapshot(req *apiv1.TrialsSnapshotRequest,
 		maxBatches = math.MaxInt32
 	}
 
+	var timeSinceLastAuth time.Time
 	var startTime time.Time
 	for {
-		var response apiv1.TrialsSnapshotResponse
+		if time.Now().Sub(timeSinceLastAuth) >= recheckAuthPeriod {
+			if _, _, err := a.getExperimentAndCheckCanDoActions(resp.Context(), experimentID,
+				exputil.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+				return err
+			}
+			timeSinceLastAuth = time.Now()
+		}
 
+		var response apiv1.TrialsSnapshotResponse
 		var newTrials []*apiv1.TrialsSnapshotResponse_Trial
 		var endTime time.Time
 		var err error
@@ -982,8 +1491,9 @@ func (a *apiServer) TrialsSnapshot(req *apiv1.TrialsSnapshotRequest,
 	}
 }
 
-func (a *apiServer) topTrials(experimentID int, maxTrials int, s expconf.SearcherConfig) (
-	trials []int32, err error) {
+func (a *apiServer) topTrials(experimentID int, maxTrials int, s expconf.LegacySearcher) (
+	trials []int32, err error,
+) {
 	type Ranking int
 	const (
 		ByMetricOfInterest Ranking = 1
@@ -991,34 +1501,34 @@ func (a *apiServer) topTrials(experimentID int, maxTrials int, s expconf.Searche
 	)
 	var ranking Ranking
 
-	switch s.GetUnionMember().(type) {
-	case expconf.RandomConfig:
+	switch s.Name {
+	case "random":
 		ranking = ByMetricOfInterest
-	case expconf.GridConfig:
+	case "grid":
 		ranking = ByMetricOfInterest
-	case expconf.AsyncHalvingConfig:
+	case "custom":
+		ranking = ByMetricOfInterest
+	case "async_halving":
 		ranking = ByTrainingLength
-	case expconf.AdaptiveASHAConfig:
+	case "adaptive_asha":
 		ranking = ByTrainingLength
-	case expconf.SingleConfig:
+	case "single":
 		return nil, errors.New("single-trial experiments are not supported for trial sampling")
-	case expconf.PBTConfig:
-		return nil, errors.New("population-based training not supported for trial sampling")
 	// EOL searcher configs:
-	case expconf.AdaptiveConfig:
+	case "adaptive":
 		ranking = ByTrainingLength
-	case expconf.AdaptiveSimpleConfig:
+	case "adaptive_simple":
 		ranking = ByTrainingLength
-	case expconf.SyncHalvingConfig:
+	case "sync_halving":
 		ranking = ByTrainingLength
 	default:
-		return nil, errors.New("unable to detect a searcher algorithm for trial sampling")
+		return nil, errors.Errorf("unable to detect a searcher algorithm for trial sampling")
 	}
 	switch ranking {
 	case ByMetricOfInterest:
-		return a.m.db.TopTrialsByMetric(experimentID, maxTrials, s.Metric(), s.SmallerIsBetter())
+		return a.m.db.TopTrialsByMetric(experimentID, maxTrials, s.Metric, s.SmallerIsBetter)
 	case ByTrainingLength:
-		return a.m.db.TopTrialsByTrainingLength(experimentID, maxTrials, s.Metric(), s.SmallerIsBetter())
+		return a.m.db.TopTrialsByTrainingLength(experimentID, maxTrials, s.Metric, s.SmallerIsBetter)
 	default:
 		panic("Invalid state in trial sampling")
 	}
@@ -1026,12 +1536,16 @@ func (a *apiServer) topTrials(experimentID int, maxTrials int, s expconf.Searche
 
 func (a *apiServer) fetchTrialSample(trialID int32, metricName string, metricType apiv1.MetricType,
 	maxDatapoints int, startBatches int, endBatches int, currentTrials map[int32]bool,
-	trialCursors map[int32]time.Time) (*apiv1.TrialsSampleResponse_Trial, error) {
-	var metricSeries []lttb.Point
+	trialCursors map[int32]time.Time,
+) (*apiv1.TrialsSampleResponse_Trial, error) {
 	var endTime time.Time
 	var zeroTime time.Time
 	var err error
 	var trial apiv1.TrialsSampleResponse_Trial
+	var metricID string
+	var metricMeasurements []db.MetricMeasurements
+	xAxisLabelMetrics := []string{"epoch"}
+
 	trial.TrialId = trialID
 
 	if _, current := currentTrials[trialID]; !current {
@@ -1049,41 +1563,42 @@ func (a *apiServer) fetchTrialSample(trialID int32, metricName string, metricTyp
 	}
 	switch metricType {
 	case apiv1.MetricType_METRIC_TYPE_TRAINING:
-		metricSeries, endTime, err = a.m.db.TrainingMetricsSeries(trialID, startTime,
-			metricName, startBatches, endBatches)
+		metricID = "training"
 	case apiv1.MetricType_METRIC_TYPE_VALIDATION:
-		metricSeries, endTime, err = a.m.db.ValidationMetricsSeries(trialID, startTime,
-			metricName, startBatches, endBatches)
+		metricID = "validation"
 	default:
 		panic("Invalid metric type")
 	}
+	metricMeasurements, err = trials.MetricsTimeSeries(trialID, startTime,
+		metricName, startBatches, endBatches, xAxisLabelMetrics, maxDatapoints,
+		"batches", nil, metricID)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error fetching time series of metrics")
 	}
-	if len(metricSeries) > 0 {
+	if len(metricMeasurements) > 0 {
 		// if we get empty results, the endTime is incorrectly zero
 		trialCursors[trialID] = endTime
 	}
+
 	if !seenBefore {
-		metricSeries = lttb.Downsample(metricSeries, maxDatapoints)
+		for _, in := range metricMeasurements {
+			out := apiv1.DataPoint{
+				Batches: int32(in.Batches),
+				Value:   in.Value,
+				Time:    timestamppb.New(in.Time),
+				Epoch:   in.Epoch,
+			}
+			trial.Data = append(trial.Data, &out)
+		}
 	}
 
-	for _, in := range metricSeries {
-		out := apiv1.TrialsSampleResponse_DataPoint{
-			Batches: int32(in.X),
-			Value:   in.Y,
-		}
-		trial.Data = append(trial.Data, &out)
-	}
 	return &trial, nil
 }
 
 func (a *apiServer) TrialsSample(req *apiv1.TrialsSampleRequest,
-	resp apiv1.Determined_TrialsSampleServer) error {
+	resp apiv1.Determined_TrialsSampleServer,
+) error {
 	experimentID := int(req.ExperimentId)
-	if err := a.checkExperimentExists(experimentID); err != nil {
-		return err
-	}
 	maxTrials := int(req.MaxTrials)
 	if maxTrials == 0 {
 		maxTrials = 25
@@ -1111,15 +1626,24 @@ func (a *apiServer) TrialsSample(req *apiv1.TrialsSampleRequest,
 		return status.Error(codes.InvalidArgument, "must specify a metric name")
 	}
 
-	config, err := a.m.db.ExperimentConfig(experimentID)
-	if err != nil {
-		return errors.Wrapf(err, "error fetching experiment config from database")
-	}
-	searcherConfig := config.Searcher()
-
+	var timeSinceLastAuth time.Time
+	var searcherConfig expconf.LegacySearcher
 	trialCursors := make(map[int32]time.Time)
 	currentTrials := make(map[int32]bool)
 	for {
+		if time.Now().Sub(timeSinceLastAuth) >= recheckAuthPeriod {
+			exp, _, err := a.getExperimentAndCheckCanDoActions(resp.Context(), experimentID,
+				exputil.AuthZProvider.Get().CanGetExperimentArtifacts)
+			if err != nil {
+				return err
+			}
+
+			if timeSinceLastAuth == (time.Time{}) { // Initialzation.
+				searcherConfig = exp.Config.Searcher
+			}
+			timeSinceLastAuth = time.Now()
+		}
+
 		var response apiv1.TrialsSampleResponse
 		var promotedTrials []int32
 		var demotedTrials []int32
@@ -1184,120 +1708,11 @@ func (a *apiServer) TrialsSample(req *apiv1.TrialsSampleRequest,
 	}
 }
 
-func (a *apiServer) ComputeHPImportance(ctx context.Context,
-	req *apiv1.ComputeHPImportanceRequest) (*apiv1.ComputeHPImportanceResponse, error) {
-	experimentID := int(req.ExperimentId)
-	if err := a.checkExperimentExists(experimentID); err != nil {
-		return nil, err
-	}
-	metricName := req.MetricName
-	if metricName == "" {
-		return nil, status.Error(codes.InvalidArgument, "must specify a metric name")
-	}
-	var metricType model.MetricType
-	switch req.MetricType {
-	case apiv1.MetricType_METRIC_TYPE_UNSPECIFIED:
-		return nil, status.Error(codes.InvalidArgument, "must specify a metric type")
-	case apiv1.MetricType_METRIC_TYPE_TRAINING:
-		metricType = model.TrainingMetric
-	case apiv1.MetricType_METRIC_TYPE_VALIDATION:
-		metricType = model.ValidationMetric
-	default:
-		panic("Invalid metric type")
-	}
-
-	a.m.system.Ask(a.m.hpImportance, hpimportance.WorkRequest{
-		ExperimentID: experimentID,
-		MetricName:   metricName,
-		MetricType:   metricType,
-	})
-
-	var resp apiv1.ComputeHPImportanceResponse
-	return &resp, nil
-}
-
-// Translates MetricHPImportance to the protobuf form.
-func protoMetricHPI(metricHpi model.MetricHPImportance,
-) *apiv1.GetHPImportanceResponse_MetricHPImportance {
-	return &apiv1.GetHPImportanceResponse_MetricHPImportance{
-		Error:              metricHpi.Error,
-		Pending:            metricHpi.Pending,
-		InProgress:         metricHpi.InProgress,
-		ExperimentProgress: metricHpi.ExperimentProgress,
-		HpImportance:       metricHpi.HpImportance,
-	}
-}
-
-func (a *apiServer) GetHPImportance(req *apiv1.GetHPImportanceRequest,
-	resp apiv1.Determined_GetHPImportanceServer) error {
-	experimentID := int(req.ExperimentId)
-	if err := a.checkExperimentExists(experimentID); err != nil {
-		return err
-	}
-
-	period := time.Duration(req.PeriodSeconds) * time.Second
-	if period == 0 {
-		period = defaultMetricsStreamPeriod
-	}
-
-	for {
-		var response apiv1.GetHPImportanceResponse
-
-		result, err := a.m.db.GetHPImportance(experimentID)
-		if err != nil {
-			return errors.Wrap(err, "error looking up hyperparameter importance")
-		}
-		response.TrainingMetrics = make(map[string]*apiv1.GetHPImportanceResponse_MetricHPImportance)
-		response.ValidationMetrics = make(map[string]*apiv1.GetHPImportanceResponse_MetricHPImportance)
-		for metric, metricHpi := range result.TrainingMetrics {
-			response.TrainingMetrics[metric] = protoMetricHPI(metricHpi)
-		}
-		for metric, metricHpi := range result.ValidationMetrics {
-			response.ValidationMetrics[metric] = protoMetricHPI(metricHpi)
-		}
-
-		if grpcutil.ConnectionIsClosed(resp) {
-			return nil
-		}
-		if err := resp.Send(&response); err != nil {
-			return errors.Wrap(err, "error sending hyperparameter importance response")
-		}
-
-		allComplete := true
-		if len(result.TrainingMetrics)+len(result.ValidationMetrics) == 0 {
-			allComplete = false
-		}
-		for _, metricHpi := range result.TrainingMetrics {
-			if metricHpi.Pending || metricHpi.InProgress {
-				allComplete = false
-			}
-		}
-		for _, metricHpi := range result.ValidationMetrics {
-			if metricHpi.Pending || metricHpi.InProgress {
-				allComplete = false
-			}
-		}
-		if allComplete {
-			state, _, err := a.m.db.GetExperimentStatus(experimentID)
-			if err != nil {
-				return errors.Wrap(err, "error looking up experiment state")
-			}
-			if model.TerminalStates[state] {
-				return nil
-			}
-		}
-
-		time.Sleep(period)
-		if grpcutil.ConnectionIsClosed(resp) {
-			return nil
-		}
-	}
-}
-
 func (a *apiServer) GetBestSearcherValidationMetric(
-	_ context.Context, req *apiv1.GetBestSearcherValidationMetricRequest,
+	ctx context.Context, req *apiv1.GetBestSearcherValidationMetricRequest,
 ) (*apiv1.GetBestSearcherValidationMetricResponse, error) {
-	if err := a.checkExperimentExists(int(req.ExperimentId)); err != nil {
+	if _, _, err := a.getExperimentAndCheckCanDoActions(ctx, int(req.ExperimentId),
+		exputil.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
 		return nil, err
 	}
 
@@ -1315,8 +1730,13 @@ func (a *apiServer) GetBestSearcherValidationMetric(
 }
 
 func (a *apiServer) GetModelDef(
-	_ context.Context, req *apiv1.GetModelDefRequest,
+	ctx context.Context, req *apiv1.GetModelDefRequest,
 ) (*apiv1.GetModelDefResponse, error) {
+	if _, _, err := a.getExperimentAndCheckCanDoActions(ctx, int(req.ExperimentId),
+		exputil.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+		return nil, err
+	}
+
 	tgz, err := a.m.db.ExperimentModelDefinitionRaw(int(req.ExperimentId))
 	if err != nil {
 		return nil, errors.Wrapf(err,
@@ -1326,4 +1746,318 @@ func (a *apiServer) GetModelDef(
 	b64Tgz := base64.StdEncoding.EncodeToString(tgz)
 
 	return &apiv1.GetModelDefResponse{B64Tgz: b64Tgz}, nil
+}
+
+func (a *apiServer) MoveExperiment(
+	ctx context.Context, req *apiv1.MoveExperimentRequest,
+) (*apiv1.MoveExperimentResponse, error) {
+	// get experiment info
+	exp, curUser, err := a.getExperimentAndCheckCanDoActions(ctx, int(req.ExperimentId))
+	if err != nil {
+		return nil, err
+	}
+	if exp.Archived {
+		return nil, errors.Errorf("experiment (%v) is archived and cannot be moved.", exp.ID)
+	}
+
+	// check that user can view source project
+	srcProject, err := a.GetProjectByID(ctx, int32(exp.ProjectID), curUser)
+	if err != nil {
+		return nil, err
+	}
+	if srcProject.Archived {
+		return nil, errors.Errorf("project (%v) is archived and cannot have experiments moved from it.",
+			srcProject.Id)
+	}
+
+	// check suitable destination project
+	destProject, err := a.GetProjectByID(ctx, req.DestinationProjectId, curUser)
+	if err != nil {
+		return nil, err
+	}
+	if destProject.Archived {
+		return nil, errors.Errorf("project (%v) is archived and cannot add new experiments.",
+			req.DestinationProjectId)
+	}
+	// need to update CanCreateExperiment to check project when experiment is nil
+	if err = exputil.AuthZProvider.Get().CanCreateExperiment(ctx, curUser, destProject,
+		nil); err != nil {
+		return nil, status.Error(codes.PermissionDenied, err.Error())
+	}
+
+	results, err := exputil.MoveExperiments(ctx, a.m.system, []int32{req.ExperimentId}, nil,
+		req.DestinationProjectId)
+
+	if err == nil {
+		if len(results) == 0 {
+			return nil, errors.Errorf("unknown error during move query.")
+		} else if results[0].Error != nil {
+			return nil, results[0].Error
+		}
+	}
+
+	return &apiv1.MoveExperimentResponse{}, err
+}
+
+func (a *apiServer) MoveExperiments(
+	ctx context.Context, req *apiv1.MoveExperimentsRequest,
+) (*apiv1.MoveExperimentsResponse, error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// check suitable destination project
+	destProject, err := a.GetProjectByID(ctx, req.DestinationProjectId, *curUser)
+	if err != nil {
+		return nil, err
+	}
+	if destProject.Archived {
+		return nil, errors.Errorf("project (%v) is archived and cannot add new experiments.",
+			req.DestinationProjectId)
+	}
+	// need to update CanCreateExperiment to check project when experiment is nil
+	if err = exputil.AuthZProvider.Get().CanCreateExperiment(ctx, *curUser, destProject,
+		nil); err != nil {
+		return nil, status.Error(codes.PermissionDenied, err.Error())
+	}
+
+	results, err := exputil.MoveExperiments(ctx, a.m.system, req.ExperimentIds,
+		req.Filters, req.DestinationProjectId)
+	return &apiv1.MoveExperimentsResponse{Results: exputil.ToAPIResults(results)}, err
+}
+
+func (a *apiServer) GetModelDefTree(
+	ctx context.Context, req *apiv1.GetModelDefTreeRequest,
+) (*apiv1.GetModelDefTreeResponse, error) {
+	if _, _, err := a.getExperimentAndCheckCanDoActions(ctx, int(req.ExperimentId),
+		exputil.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+		return nil, err
+	}
+
+	modelDefCache := GetModelDefCache()
+	fileTree, err := modelDefCache.FileTreeNested(int(req.ExperimentId))
+	if err != nil {
+		return nil, err
+	}
+	return &apiv1.GetModelDefTreeResponse{Files: fileTree}, nil
+}
+
+func (a *apiServer) GetModelDefFile(
+	ctx context.Context, req *apiv1.GetModelDefFileRequest,
+) (*apiv1.GetModelDefFileResponse, error) {
+	if _, _, err := a.getExperimentAndCheckCanDoActions(ctx, int(req.ExperimentId),
+		exputil.AuthZProvider.Get().CanGetExperimentArtifacts); err != nil {
+		return nil, err
+	}
+
+	modelDefCache := GetModelDefCache()
+	file, err := modelDefCache.FileContent(int(req.ExperimentId), req.Path)
+	if err != nil {
+		return nil, err
+	}
+	return &apiv1.GetModelDefFileResponse{File: file}, nil
+}
+
+func sortExperiments(sortString *string, experimentQuery *bun.SelectQuery) error {
+	if sortString == nil {
+		return nil
+	}
+	orderColMap := map[string]string{
+		"id":              "id",
+		"description":     "description",
+		"name":            "name",
+		"startTime":       "e.start_time",
+		"endTime":         "e.end_time",
+		"state":           "e.state",
+		"numTrials":       "num_trials",
+		"progress":        "COALESCE(progress, 0)",
+		"user":            "display_name",
+		"forkedFrom":      "e.parent_id",
+		"resourcePool":    "resource_pool",
+		"projectId":       "project_id",
+		"checkpointSize":  "checkpoint_size",
+		"checkpointCount": "checkpoint_count",
+		"searcherMetricsVal": `(
+			SELECT
+				searcher_metric_value
+			FROM trials t
+			WHERE t.experiment_id = e.id
+			ORDER BY searcher_metric_value_signed ASC
+			LIMIT 1
+		 ) `,
+	}
+	sortByMap := map[string]string{
+		"asc":  "ASC",
+		"desc": "DESC NULLS LAST",
+	}
+	sortParams := strings.Split(*sortString, ",")
+	for _, sortParam := range sortParams {
+		paramDetail := strings.Split(sortParam, "=")
+		if len(paramDetail) != 2 {
+			return status.Errorf(codes.InvalidArgument, "invalid sort parameter: %s", sortParam)
+		}
+		if _, ok := sortByMap[paramDetail[1]]; !ok {
+			return status.Errorf(codes.InvalidArgument, "invalid sort direction: %s", paramDetail[1])
+		}
+		sortDirection := sortByMap[paramDetail[1]]
+		switch {
+		case strings.HasPrefix(paramDetail[0], "hp."):
+			hps := strings.ReplaceAll(strings.TrimPrefix(paramDetail[0], "hp."), ".", "'->'")
+			experimentQuery.OrderExpr(
+				fmt.Sprintf("e.config->'hyperparameters'->'%s' %s", hps, sortDirection))
+		case strings.HasPrefix(paramDetail[0], "validation."):
+			metricName := strings.TrimPrefix(paramDetail[0], "validation.")
+			experimentQuery.OrderExpr(
+				fmt.Sprintf("e.validation_metrics->'%s' %s",
+					metricName, sortDirection))
+		default:
+			if _, ok := orderColMap[paramDetail[0]]; !ok {
+				return status.Errorf(codes.InvalidArgument, "invalid sort col: %s", paramDetail[0])
+			}
+			experimentQuery.OrderExpr(
+				fmt.Sprintf("%s %s", orderColMap[paramDetail[0]], sortDirection))
+		}
+	}
+	return nil
+}
+
+func (a *apiServer) SearchExperiments(
+	ctx context.Context,
+	req *apiv1.SearchExperimentsRequest,
+) (*apiv1.SearchExperimentsResponse, error) {
+	resp := &apiv1.SearchExperimentsResponse{}
+	var experiments []*experimentv1.Experiment
+	var trials []*trialv1.Trial
+	experimentQuery := db.Bun().NewSelect().
+		Model(&experiments).
+		ModelTableExpr("experiments as e").
+		Column("e.best_trial_id").
+		Apply(getExperimentColumns)
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get the user: %s", err)
+	}
+	var proj *projectv1.Project
+	if req.ProjectId != nil {
+		proj, err = a.GetProjectByID(ctx, *req.ProjectId, *curUser)
+		if err != nil {
+			return nil, err
+		}
+
+		experimentQuery = experimentQuery.Where("project_id = ?", req.ProjectId)
+	}
+	if experimentQuery, err = exputil.AuthZProvider.Get().
+		FilterExperimentsQuery(ctx, *curUser, proj, experimentQuery,
+			[]rbacv1.PermissionType{rbacv1.PermissionType_PERMISSION_TYPE_VIEW_EXPERIMENT_METADATA},
+		); err != nil {
+		return nil, err
+	}
+
+	if req.Sort != nil {
+		err = sortExperiments(req.Sort, experimentQuery)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	resp.Pagination, err = runPagedBunExperimentsQuery(
+		ctx,
+		experimentQuery,
+		int(req.Offset),
+		int(req.Limit),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(experiments) == 0 {
+		return resp, nil
+	}
+
+	if err = a.enrichExperimentState(experiments...); err != nil {
+		return nil, err
+	}
+
+	// get the best trial associated with the experiment.
+
+	// don't query for experiments twice
+	experimentValues := db.Bun().NewValues(&experiments)
+
+	// get info for best/latest validation for best trial
+	validationsQuery := db.Bun().NewSelect().
+		Table("validations").
+		Column("id").
+		ColumnExpr("validations.trial_id as trial_id").
+		Column("total_batches").
+		ColumnExpr("proto_time(end_time) AS end_time").
+		ColumnExpr("json_build_object('avg_metrics', metrics->'validation_metrics') AS metrics").
+		ColumnExpr("metrics->'num_inputs' AS num_inputs").
+		//nolint:lll
+		ColumnExpr("row_number() OVER(PARTITION BY validations.trial_id ORDER BY total_batches DESC NULLS LAST) AS latest_rank")
+
+	stepsQuery := db.Bun().NewSelect().
+		TableExpr("steps AS s").
+		Column("s.total_batches").
+		Where("s.trial_id = trials.id").
+		Order("s.total_batches DESC").
+		Limit(1)
+
+	allocationsQuery := db.Bun().NewSelect().
+		TableExpr("allocations AS a").
+		ColumnExpr("extract(EPOCH FROM sum(coalesce(a.end_time, now()) - a.start_time))").
+		Where("a.task_id = trials.task_id")
+
+	trialsInnerQuery := db.Bun().NewSelect().
+		Table("trials").
+		Column("trials.id").
+		Column("trials.experiment_id").
+		Column("trials.runner_state").
+		Column("trials.checkpoint_count").
+		Column("trials.task_id").
+		ColumnExpr("proto_time(trials.start_time) AS start_time").
+		ColumnExpr("proto_time(trials.end_time) AS end_time").
+		ColumnExpr("least(trials.restarts, (ex.config->>'max_restarts')::int) AS restarts").
+		ColumnExpr("coalesce(new_ckpt.uuid, old_ckpt.uuid) AS warm_start_checkpoint_uuid").
+		ColumnExpr("trials.checkpoint_size AS total_checkpoint_size").
+		ColumnExpr(exputil.ProtoStateDBCaseString(trialv1.State_value, "trials.state", "state",
+			"STATE_")).
+		//nolint:lll
+		ColumnExpr("(CASE WHEN trials.hparams = 'null'::jsonb THEN null ELSE trials.hparams END) AS hparams").
+		ColumnExpr("(?) AS total_batches_processed", stepsQuery).
+		ColumnExpr("(?) AS wall_clock_time", allocationsQuery).
+		ColumnExpr("row_to_json(lv)::jsonb AS latest_validation").
+		ColumnExpr("row_to_json(bv)::jsonb AS best_validation").
+		ColumnExpr("null::jsonb AS best_checkpoint").
+		//nolint:lll
+		Join("JOIN ex ON ex.best_trial_id = trials.id").
+		Join("LEFT JOIN v bv ON trials.best_validation_id = bv.id").
+		Join("LEFT JOIN v lv ON trials.id = lv.trial_id AND lv.latest_rank = 1").
+		Join("LEFT JOIN raw_checkpoints old_ckpt ON old_ckpt.id = trials.warm_start_checkpoint_id").
+		Join("LEFT JOIN checkpoints_v2 new_ckpt ON new_ckpt.id = trials.warm_start_checkpoint_id")
+
+	err = db.Bun().NewSelect().
+		With("ex", experimentValues).
+		With("v", validationsQuery).
+		Model(&trials).
+		ModelTableExpr("(?) AS trial", trialsInnerQuery).Scan(ctx)
+
+	if err != nil {
+		return nil, err
+	}
+
+	trialsByExperimentID := make(map[int32]*trialv1.Trial, len(trials))
+	for _, trial := range trials {
+		trialsByExperimentID[trial.ExperimentId] = trial
+	}
+	for _, experiment := range experiments {
+		trial := trialsByExperimentID[experiment.Id]
+		resp.Experiments = append(
+			resp.Experiments,
+			&apiv1.SearchExperimentExperiment{Experiment: experiment, BestTrial: trial},
+		)
+	}
+
+	return resp, nil
 }

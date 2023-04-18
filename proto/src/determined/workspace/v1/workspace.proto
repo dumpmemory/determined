@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package determined.workspace.v1;
+option go_package = "github.com/determined-ai/determined/proto/pkg/workspacev1";
+
+import "determined/user/v1/user.proto";
+import "protoc-gen-swagger/options/annotations.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+// WorkspaceState is used to track progress during a deletion.
+enum WorkspaceState {
+  // Object deletion is not in progress.
+  WORKSPACE_STATE_UNSPECIFIED = 0;
+  // The object is being deleted.
+  WORKSPACE_STATE_DELETING = 1;
+  // The object failed to delete.
+  WORKSPACE_STATE_DELETE_FAILED = 2;
+  // The object finished deleting.
+  WORKSPACE_STATE_DELETED = 3;
+}
+
+// Workspace is a named collection of projects.
+message Workspace {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: {
+      required: [
+        "archived",
+        "error_message",
+        "id",
+        "immutable",
+        "name",
+        "num_experiments",
+        "num_projects",
+        "pinned",
+        "state",
+        "username",
+        "user_id"
+      ]
+    }
+  };
+  // The unique id of the workspace.
+  int32 id = 1;
+  // The unique name of the workspace.
+  string name = 2 [(grpc.gateway.protoc_gen_swagger.options.openapiv2_field) = {
+    min_length: 1
+  }];
+  // Whether this workspace is archived or not.
+  bool archived = 3;
+  // User who created this workspace.
+  string username = 4;
+  // Whether this workspace is immutable (default uncategorized workspace).
+  bool immutable = 5;
+  // Number of projects associated with this workspace.
+  int32 num_projects = 6;
+  // Pin status of this workspace for the current user.
+  bool pinned = 7;
+  // ID of the user who created this project.
+  int32 user_id = 8;
+  // Number of experiments associated with this workspace.
+  int32 num_experiments = 9;
+  // State of workspace during deletion.
+  WorkspaceState state = 10;
+  // Message stored from errors on async-deleting a workspace.
+  string error_message = 11;
+  // Optional agent host uid and gid override.
+  optional determined.user.v1.AgentUserGroup agent_user_group = 12;
+  // Optional checkpoint storage config.
+  // Expects same format as experiment config's checkpoint storage.
+  optional google.protobuf.Struct checkpoint_storage_config = 13;
+  // Optional date when workspace was pinned.
+  optional google.protobuf.Timestamp pinned_at = 14;
+}
+
+// PatchWorkspace is a partial update to a workspace with all optional fields.
+message PatchWorkspace {
+  // The new name for the workspace.
+  google.protobuf.StringValue name = 1;
+  // Optional agent host uid and gid override.
+  optional determined.user.v1.AgentUserGroup agent_user_group = 12;
+
+  // Optional checkpoint storage config.
+  // Expects same format as experiment config's checkpoint storage.
+  optional google.protobuf.Struct checkpoint_storage_config = 13;
+}

@@ -1,9 +1,13 @@
+import logging
 import os
 import pathlib
 import shutil
-from typing import Any
+from typing import Any, List
 
+from determined import util
 from determined.tensorboard import base
+
+logger = logging.getLogger("determined.tensorboard")
 
 
 class SharedFSTensorboardManager(base.TensorboardManager):
@@ -25,11 +29,18 @@ class SharedFSTensorboardManager(base.TensorboardManager):
         # Restore the original umask.
         os.umask(old_umask)
 
-    def sync(self) -> None:
-        for path in self.to_sync():
-            shared_fs_path = self.shared_fs_base.joinpath(path.relative_to(self.base_path))
-            pathlib.Path.mkdir(shared_fs_path.parent, parents=True, exist_ok=True)
-            shutil.copy(path, shared_fs_path)
+    def _sync_impl(
+        self,
+        path_info_list: List[base.PathUploadInfo],
+    ) -> None:
+        for path_info in path_info_list:
+            path = path_info.path
+            mangled_relative_path = path_info.mangled_relative_path
+            mangled_path = self.shared_fs_base.joinpath(mangled_relative_path)
+            pathlib.Path.mkdir(mangled_path.parent, parents=True, exist_ok=True)
+            logger.debug(f"SharedFSTensorboardManager saving {path} to {mangled_path}")
+
+            shutil.copy(path, mangled_path)
 
     def delete(self) -> None:
-        shutil.rmtree(self.shared_fs_base, False)
+        util.rmtree_nfs_safe(self.shared_fs_base, False)

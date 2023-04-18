@@ -1,14 +1,10 @@
 ## Configure the task container defaults. Tasks include trials, commands, tensorboards and more.
 ## For all task containers, shm_size_bytes and network_mode are configurable. For trials, the
-## network interface used by distributed (multi-machine) training and ports used by the NCCL and
-## GLOO libraries during distributed training are configurable. These default to auto-discovery and
-## random non-privileged ports, respectively.
+## network interface used by distributed (multi-machine) training is configurable.
 #task_container_defaults:
 #  shm_size_bytes: 4294967296
 #  network_mode: bridge
 #  dtrain_network_interface: <network interface name>
-#  nccl_port_range: <MIN:MAX>
-#  gloo_port_range: <MIN:MAX>
 
 ## Resource manager configuration. Defaults to using the agent resource manager.
 #resource_manager:
@@ -71,7 +67,7 @@
 #        public_ip: true
 #        security_group_id: <security group id>
 #        subnet_id: <subnet id>
-#      instance_type: p3.8xlarge
+#      instance_type: g4dn.metal
 #      max_instances: 5
 
 ## Configure GCP dynamic agents. The `provider`, `boot_disk_source_image`,
@@ -82,6 +78,7 @@
 #      zone: <zone>
 #      boot_disk_size: 200
 #      boot_disk_source_image: projects/<project-id>/global/images/<image-name>
+#      labels: {<key1>: <val1>, <key2>: <val2>, ...}
 #      label_key: <label key for agent discovery>
 #      label_value: <label value for agent discovery>
 #      name_prefix: <name prefix>
@@ -95,7 +92,7 @@
 #        scopes: ["https://www.googleapis.com/auth/cloud-platform"]
 #      instance_type:
 #        machine_type: n1-standard-32
-#        gpu_type: nvidia-tesla-v100
+#        gpu_type: nvidia-tesla-t4
 #        gpu_num: 4
 #      max_instances: 5
 #      operation_timeout_period: 5m

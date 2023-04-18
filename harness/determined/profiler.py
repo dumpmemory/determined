@@ -252,7 +252,7 @@ class ProfilerAgent:
     are collected and the record_timing function is a no-op.
 
     Profiling is automatically disabled if profiling metrics already exist in the API. This would
-    indicates that the harness restarted due to job failure or being descheduled. Picking up
+    indicate that the harness restarted due to job failure or being descheduled. Picking up
     profiling in that case introduces issues around multiple data points for the same batch_idx,
     difficult-to-render graphs due to large time gaps, and misleading data due to GPU warmup.
 
@@ -1053,3 +1053,32 @@ class GpuMemoryCollector:
         except Exception as e:
             logging.warning(f"{LOG_NAMESPACE}: error while measuring GPU memory: {e}")
             return {}
+
+
+class DummyProfilerAgent(ProfilerAgent):
+    def __init__(self) -> None:
+        pass
+
+    def __enter__(self) -> "DummyProfilerAgent":
+        pass
+
+    def __exit__(self, *_: Any) -> None:
+        pass
+
+    @contextlib.contextmanager
+    def record_timing(
+        self, metric_name: str, accumulate: bool = False, requires_sync: bool = True
+    ) -> Iterator[None]:
+        yield
+
+    def set_training(self, training: bool) -> None:
+        pass
+
+    def update_batch_idx(self, batch_idx: int) -> None:
+        pass
+
+    def record_metric(self, metric_name: str, value: float) -> None:
+        pass
+
+    def _set_sync_device(self, sync_device: Callable[[], None]) -> None:
+        pass

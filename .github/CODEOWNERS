@@ -1,0 +1,11 @@
+# Determined codeowners file
+
+# explicit default to no owner (this should be the first line)
+*
+
+# team-specific repo segments
+/.github  @determined-ai/infrastructure
+/docs     @determined-ai/docs
+/master   @determined-ai/backend
+/agent    @determined-ai/backend
+/proto    @determined-ai/backend

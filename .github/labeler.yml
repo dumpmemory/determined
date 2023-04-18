@@ -1,0 +1,6 @@
+---
+shared-web:
+  - webui/react/src/shared/**
+documentation:
+  - docs/**
+

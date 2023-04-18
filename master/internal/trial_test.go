@@ -7,11 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/determined-ai/determined/master/internal/rm/actorrm"
+
 	"github.com/determined-ai/determined/master/pkg/actor/actors"
 
 	"github.com/pkg/errors"
 
 	"github.com/determined-ai/determined/master/internal/db"
+	"github.com/determined-ai/determined/master/internal/rm"
 
 	"github.com/determined-ai/determined/master/internal/task"
 
@@ -35,7 +38,8 @@ func TestTrial(t *testing.T) {
 	system, db, rID, tr, self := setup(t)
 
 	// Pre-scheduled stage.
-	require.NoError(t, system.Ask(self, model.ActiveState).Error())
+	require.NoError(t, system.Ask(self,
+		model.StateWithReason{State: model.ActiveState}).Error())
 	require.NoError(t, system.Ask(self, trialSearcherState{
 		Create: searcher.Create{RequestID: rID},
 		Op: searcher.ValidateAfter{
@@ -86,7 +90,8 @@ func TestTrialRestarts(t *testing.T) {
 	system, db, rID, tr, self := setup(t)
 
 	// Pre-scheduled stage.
-	require.NoError(t, system.Ask(self, model.ActiveState).Error())
+	require.NoError(t, system.Ask(self,
+		model.StateWithReason{State: model.ActiveState}).Error())
 	require.NoError(t, system.Ask(self, trialSearcherState{
 		Create: searcher.Create{RequestID: rID},
 		Op: searcher.ValidateAfter{
@@ -137,7 +142,8 @@ func TestTrialSimultaneousCancelAndAllocation(t *testing.T) {
 	system, db, rID, tr, self := setup(t)
 
 	// Pre-scheduled stage.
-	require.NoError(t, system.Ask(self, model.ActiveState).Error())
+	require.NoError(t, system.Ask(self,
+		model.StateWithReason{State: model.ActiveState}).Error())
 	require.NoError(t, system.Ask(self, trialSearcherState{
 		Create: searcher.Create{RequestID: rID},
 		Op: searcher.ValidateAfter{
@@ -151,7 +157,9 @@ func TestTrialSimultaneousCancelAndAllocation(t *testing.T) {
 
 	// Send the trial a termination, but don't setup our mock allocation to handle it, as if it
 	// is busy handling receiving resources.
-	require.NoError(t, system.Ask(self, model.StoppingCanceledState).Error())
+	require.NoError(t, system.Ask(self, model.StateWithReason{
+		State: model.StoppingCanceledState,
+	}).Error())
 
 	// Now the allocation checks in to get what to launch while we're canceled.
 	require.Error(t, system.Ask(tr.allocation, actors.ForwardThroughMock{
@@ -182,8 +190,8 @@ func setup(t *testing.T) (*actor.System, *mocks.DB, model.RequestID, *trial, *ac
 	system := actor.NewSystem("system")
 
 	// mock resource manager.
-	rmImpl := actors.MockActor{Responses: map[string]*actors.MockResponse{}}
-	rm := system.MustActorOf(actor.Addr("rm"), &rmImpl)
+	rmActor := actors.MockActor{Responses: map[string]*actors.MockResponse{}}
+	rmImpl := actorrm.Wrap(system.MustActorOf(actor.Addr("rm"), &rmActor))
 
 	// mock logger.
 	loggerImpl := actors.MockActor{Responses: map[string]*actors.MockResponse{}}
@@ -193,7 +201,7 @@ func setup(t *testing.T) (*actor.System, *mocks.DB, model.RequestID, *trial, *ac
 	// mock allocation
 	allocImpl := actors.MockActor{Responses: map[string]*actors.MockResponse{}}
 	taskAllocator = func(
-		logCtx detLogger.Context, req sproto.AllocateRequest, db db.DB, rm *actor.Ref,
+		logCtx detLogger.Context, req sproto.AllocateRequest, db db.DB, rm rm.ResourceManager,
 		l *task.Logger,
 	) actor.Actor {
 		return &allocImpl
@@ -201,6 +209,7 @@ func setup(t *testing.T) (*actor.System, *mocks.DB, model.RequestID, *trial, *ac
 
 	// mock db.
 	db := &mocks.DB{}
+	db.On("AddTask", mock.Anything).Return(nil)
 
 	// instantiate the trial
 	rID := model.NewRequestID(rand.Reader)
@@ -213,7 +222,8 @@ func setup(t *testing.T) (*actor.System, *mocks.DB, model.RequestID, *trial, *ac
 		1,
 		model.PausedState,
 		trialSearcherState{Create: searcher.Create{RequestID: rID}, Complete: true},
-		rm, logger,
+		logger,
+		rmImpl,
 		db,
 		schemas.WithDefaults(expconf.ExperimentConfig{
 			RawCheckpointStorage: &expconf.CheckpointStorageConfigV0{
@@ -222,12 +232,13 @@ func setup(t *testing.T) (*actor.System, *mocks.DB, model.RequestID, *trial, *ac
 					RawContainerPath: ptrs.Ptr("determined-sharedfs"),
 				},
 			},
-		}).(expconf.ExperimentConfig),
+		}),
 		&model.Checkpoint{},
 		&tasks.TaskSpec{
 			AgentUserGroup: &model.AgentUserGroup{},
 			SSHRsaSize:     1024,
 		},
+		false,
 	)
 	self := system.MustActorOf(actor.Addr("trial"), tr)
 	return system, db, rID, tr, self

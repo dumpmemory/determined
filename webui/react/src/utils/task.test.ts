@@ -6,16 +6,21 @@ const SampleTask: Task = { id: '', name: '', resourcePool: '', startTime: '' };
 const SampleExperimentTask: ExperimentTask = {
   ...SampleTask,
   archived: false,
+  parentArchived: false,
+  projectId: 0,
   resourcePool: '',
   state: 'ACTIVE' as RunState,
+  userId: 345,
   username: '',
+  workspaceId: 0,
 };
 const SampleCommandTask: CommandTask = {
   ...SampleTask,
   resourcePool: '',
   state: 'PENDING' as CommandState,
   type: 'COMMAND' as CommandType,
-  username: '',
+  userId: 345,
+  workspaceId: 0,
 };
 
 describe('isExperimentTask', () => {
@@ -32,8 +37,9 @@ describe('canBeOpened', () => {
     expect(canBeOpened(SampleExperimentTask)).toStrictEqual(true);
   });
   it('Terminated Command Task', () => {
-    expect(canBeOpened({ ...SampleCommandTask, state: 'TERMINATED' as CommandState }))
-      .toStrictEqual(false);
+    expect(
+      canBeOpened({ ...SampleCommandTask, state: 'TERMINATED' as CommandState }),
+    ).toStrictEqual(false);
   });
   it('Command Task without service address', () => {
     expect(canBeOpened(SampleCommandTask)).toStrictEqual(false);

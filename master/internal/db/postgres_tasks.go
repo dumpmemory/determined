@@ -18,9 +18,13 @@ import (
 	"github.com/determined-ai/determined/master/pkg/model"
 )
 
-// initAllocationSessions creates a row in the allocation_sessions table.
+// initAllocationSessions purges sessions of all closed allocations.
 func (db *PgDB) initAllocationSessions() error {
-	_, err := db.sql.Exec("DELETE FROM allocation_sessions")
+	_, err := db.sql.Exec(`
+DELETE FROM allocation_sessions WHERE allocation_id in (
+	SELECT allocation_id FROM allocations
+	WHERE start_time IS NOT NULL AND end_time IS NOT NULL
+)`)
 	return err
 }
 
@@ -45,15 +49,14 @@ EXISTS(
 	return exists, err
 }
 
-// AddTask persists the existence of a task.
+// AddTask UPSERT's the existence of a task.
 func (db *PgDB) AddTask(t *model.Task) error {
-	return addTask(db.sql, t)
-}
-
-func addTask(q queryHandler, t *model.Task) error {
-	if _, err := q.NamedExec(`
+	if _, err := db.sql.NamedExec(`
 INSERT INTO tasks (task_id, task_type, start_time, job_id, log_version)
 VALUES (:task_id, :task_type, :start_time, :job_id, :log_version)
+ON CONFLICT (task_id) DO UPDATE SET
+task_type=EXCLUDED.task_type, start_time=EXCLUDED.start_time,
+job_id=EXCLUDED.job_id, log_version=EXCLUDED.log_version
 `, t); err != nil {
 		return errors.Wrap(err, "adding task")
 	}
@@ -89,11 +92,20 @@ WHERE task_id = $1
 	return nil
 }
 
-// AddAllocation persists the existence of an allocation.
+// AddAllocation upserts the existence of an allocation. Allocation IDs may conflict in the event
+// the master restarts and the trial run ID increment is not persisted, but it is the same
+// allocation so this is OK.
 func (db *PgDB) AddAllocation(a *model.Allocation) error {
 	return db.namedExecOne(`
-INSERT INTO allocations (task_id, allocation_id, slots, resource_pool, agent_label, start_time)
-VALUES (:task_id, :allocation_id, :slots, :resource_pool, :agent_label, :start_time)
+INSERT INTO allocations
+	(task_id, allocation_id, slots, resource_pool, start_time, state, ports)
+VALUES
+	(:task_id, :allocation_id, :slots, :resource_pool, :start_time, :state, :ports)
+ON CONFLICT
+	(allocation_id)
+DO UPDATE SET
+	task_id=EXCLUDED.task_id, slots=EXCLUDED.slots, resource_pool=EXCLUDED.resource_pool,
+	start_time=EXCLUDED.start_time, state=EXCLUDED.state, ports=EXCLUDED.ports
 `, a)
 }
 
@@ -105,7 +117,7 @@ func (db *PgDB) CompleteAllocation(a *model.Allocation) error {
 
 	_, err := db.sql.Exec(`
 UPDATE allocations
-SET start_time = $2, end_time = $3 
+SET start_time = $2, end_time = $3
 WHERE allocation_id = $1`, a.AllocationID, a.StartTime, a.EndTime)
 
 	return err
@@ -129,23 +141,27 @@ WHERE a.allocation_id = $1;
 // AllocationByID retrieves an allocation by its ID.
 func (db *PgDB) AllocationByID(aID model.AllocationID) (*model.Allocation, error) {
 	var a model.Allocation
-	if err := db.query(`
-SELECT *
-FROM allocations
-WHERE allocation_id = $1
-`, &a, aID); err != nil {
-		return nil, errors.Wrap(err, "querying allocation")
+	if err := Bun().NewSelect().Model(&a).Where("allocation_id = ?", aID).
+		Scan(context.TODO()); err != nil {
+		return nil, err
 	}
 	return &a, nil
 }
 
 // StartAllocationSession creates a row in the allocation_sessions table.
-func (db *PgDB) StartAllocationSession(allocationID model.AllocationID) (string, error) {
+func (db *PgDB) StartAllocationSession(
+	allocationID model.AllocationID, owner *model.User,
+) (string, error) {
 	taskSession := &model.AllocationSession{
 		AllocationID: allocationID,
 	}
+	if owner != nil {
+		taskSession.OwnerID = &owner.ID
+	}
 
-	query := "INSERT INTO allocation_sessions (allocation_id) VALUES (:allocation_id) RETURNING id"
+	query := `
+INSERT INTO allocation_sessions (allocation_id, owner_id) VALUES
+	(:allocation_id, :owner_id) RETURNING id`
 	if err := db.namedGet(&taskSession.ID, query, *taskSession); err != nil {
 		return "", err
 	}
@@ -156,26 +172,6 @@ func (db *PgDB) StartAllocationSession(allocationID model.AllocationID) (string,
 		return "", errors.Wrap(err, "failed to generate task authentication token")
 	}
 	return token, nil
-}
-
-// AllocationSessionByToken returns a task session given an authentication token.
-func (db *PgDB) AllocationSessionByToken(token string) (*model.AllocationSession, error) {
-	v2 := paseto.NewV2()
-
-	var session model.AllocationSession
-	err := v2.Verify(token, db.tokenKeys.PublicKey, &session, nil)
-	if err != nil {
-		return nil, ErrNotFound
-	}
-
-	query := `SELECT * FROM allocation_sessions WHERE id=$1`
-	if err := db.query(query, &session, session.ID); errors.Cause(err) == ErrNotFound {
-		return nil, ErrNotFound
-	} else if err != nil {
-		return nil, err
-	}
-
-	return &session, nil
 }
 
 // DeleteAllocationSession deletes the task session with the given AllocationID.
@@ -195,6 +191,15 @@ func (db *PgDB) UpdateAllocationState(a model.Allocation) error {
 	return err
 }
 
+// UpdateAllocationPorts stores the latest task state and readiness.
+func UpdateAllocationPorts(a model.Allocation) error {
+	_, err := Bun().NewUpdate().Table("allocations").
+		Set("ports = ?", a.Ports).
+		Where("allocation_id = ?", a.AllocationID).
+		Exec(context.TODO())
+	return err
+}
+
 // UpdateAllocationStartTime stores the latest start time.
 func (db *PgDB) UpdateAllocationStartTime(a model.Allocation) error {
 	_, err := db.sql.Exec(`
@@ -207,7 +212,7 @@ func (db *PgDB) UpdateAllocationStartTime(a model.Allocation) error {
 
 // CloseOpenAllocations finds all allocations that were open when the master crashed
 // and adds an end time.
-func (db *PgDB) CloseOpenAllocations() error {
+func (db *PgDB) CloseOpenAllocations(exclude []model.AllocationID) error {
 	if _, err := db.sql.Exec(`
 	UPDATE allocations
 	SET start_time = cluster_heartbeat FROM cluster_id
@@ -216,11 +221,23 @@ func (db *PgDB) CloseOpenAllocations() error {
 			"setting start time to cluster heartbeat when it's assigned to zero value")
 	}
 
+	excludedFilter := ""
+	if len(exclude) > 0 {
+		excludeStr := make([]string, 0, len(exclude))
+		for _, v := range exclude {
+			excludeStr = append(excludeStr, v.String())
+		}
+
+		excludedFilter = strings.Join(excludeStr, ",")
+	}
+
 	if _, err := db.sql.Exec(`
 	UPDATE allocations
-	SET end_time = greatest(cluster_heartbeat, start_time)
+	SET end_time = greatest(cluster_heartbeat, start_time), state = 'TERMINATED'
 	FROM cluster_id
-	WHERE end_time IS NULL`); err != nil {
+	WHERE end_time IS NULL AND
+	($1 = '' OR allocation_id NOT IN (
+		SELECT unnest(string_to_array($1, ','))))`, excludedFilter); err != nil {
 		return errors.Wrap(err, "closing old allocations")
 	}
 	return nil
@@ -270,7 +287,7 @@ FROM task_logs l
 WHERE l.task_id = $1
 %s
 ORDER BY l.id %s LIMIT $2
-`, fragment, orderByToSQL(order))
+`, fragment, OrderByToSQL(order))
 
 	var b []*model.TaskLog
 	if err := db.queryRows(query, &b, params...); err != nil {
@@ -371,11 +388,14 @@ func RecordTaskEndStatsBun(stats *model.TaskStats) error {
 	return err
 }
 
-// EndAllTaskStats called at master starts, in case master previously crushed.
+// EndAllTaskStats called at master starts, in case master previously crashed.
 func (db *PgDB) EndAllTaskStats() error {
 	_, err := db.sql.Exec(`
-UPDATE task_stats SET end_time = greatest(cluster_heartbeat, start_time) FROM cluster_id
-WHERE end_time IS NULL`)
+UPDATE task_stats SET end_time = greatest(cluster_heartbeat, task_stats.start_time)
+FROM cluster_id, allocations
+WHERE allocations.allocation_id = task_stats.allocation_id
+AND allocations.end_time IS NOT NULL
+AND task_stats.end_time IS NULL`)
 	return err
 }
 

@@ -1,8 +1,15 @@
 import hashlib
+import os
 import socket
 import ssl
 import sys
-from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, FileType, Namespace
+from argparse import (
+    ArgumentDefaultsHelpFormatter,
+    ArgumentError,
+    ArgumentParser,
+    FileType,
+    Namespace,
+)
 from typing import List, Sequence, Union, cast
 
 import argcomplete
@@ -17,12 +24,15 @@ import determined.cli
 from determined.cli import render
 from determined.cli.agent import args_description as agent_args_description
 from determined.cli.checkpoint import args_description as checkpoint_args_description
+from determined.cli.dev import args_description as dev_args_description
 from determined.cli.experiment import args_description as experiment_args_description
 from determined.cli.job import args_description as job_args_description
 from determined.cli.master import args_description as master_args_description
 from determined.cli.model import args_description as model_args_description
 from determined.cli.notebook import args_description as notebook_args_description
 from determined.cli.oauth import args_description as oauth_args_description
+from determined.cli.project import args_description as project_args_description
+from determined.cli.rbac import args_description as rbac_args_description
 from determined.cli.remote import args_description as remote_args_description
 from determined.cli.resources import args_description as resources_args_description
 from determined.cli.shell import args_description as shell_args_description
@@ -33,10 +43,12 @@ from determined.cli.tensorboard import args_description as tensorboard_args_desc
 from determined.cli.top_arg_descriptions import deploy_cmd
 from determined.cli.trial import args_description as trial_args_description
 from determined.cli.user import args_description as user_args_description
+from determined.cli.user_groups import args_description as user_groups_args_description
 from determined.cli.version import args_description as version_args_description
 from determined.cli.version import check_version
+from determined.cli.workspace import args_description as workspace_args_description
 from determined.common import api, yaml
-from determined.common.api import authentication, certs
+from determined.common.api import authentication, bindings, certs
 from determined.common.check import check_not_none
 from determined.common.declarative_argparse import Arg, Cmd, add_args, generate_aliases
 from determined.common.util import (
@@ -45,8 +57,9 @@ from determined.common.util import (
     get_default_master_address,
     safe_load_yaml_with_exceptions,
 )
+from determined.errors import EnterpriseOnlyError
 
-from .errors import EnterpriseOnlyError
+from .errors import CliError, FeatureFlagDisabled
 
 
 @authentication.required
@@ -139,6 +152,7 @@ all_args_description = (
     + notebook_args_description
     + job_args_description
     + resources_args_description
+    + project_args_description
     + shell_args_description
     + task_args_description
     + template_args_description
@@ -146,9 +160,13 @@ all_args_description = (
     + trial_args_description
     + remote_args_description
     + user_args_description
+    + user_groups_args_description
+    + rbac_args_description
     + version_args_description
+    + workspace_args_description
     + auth_args_description
     + oauth_args_description
+    + dev_args_description
 )
 
 
@@ -161,6 +179,10 @@ def make_parser() -> ArgumentParser:
 def main(
     args: List[str] = sys.argv[1:],
 ) -> None:
+    if sys.platform == "win32":
+        # Magic incantation to make a Windows 10 cmd.exe process color-related ANSI escape codes.
+        os.system("")
+
     # TODO: we lazily import "det deploy" but in the future we'd want to lazily import everything.
     parser = make_parser()
 
@@ -178,13 +200,13 @@ def main(
 
         parsed_args = parser.parse_args(args)
 
-        def die(message: str, always_print_traceback: bool = False) -> None:
+        def die(message: str, always_print_traceback: bool = False, exit_code: int = 1) -> None:
             if always_print_traceback or debug_mode():
                 import traceback
 
                 traceback.print_exc(file=sys.stderr)
 
-            parser.exit(1, colored(message + "\n", "red"))
+            parser.exit(exit_code, colored(message + "\n", "red"))
 
         v = vars(parsed_args)
         if not v.get("func"):
@@ -216,17 +238,24 @@ def main(
                     conn.set_tlsext_host_name(cast(str, addr.hostname).encode())
                     conn.connect(cast(Sequence[Union[str, int]], (addr.hostname, addr.port)))
                     conn.do_handshake()
-                    cert_pem_data = "".join(
+                    peer_cert_chain = conn.get_peer_cert_chain()
+                    if peer_cert_chain is None or len(peer_cert_chain) == 0:
+                        # Peer presented no cert.  It seems unlikely that this is possible after
+                        # do_handshake() succeeded, but checking for None makes mypy happy.
+                        raise crypto.Error()
+                    cert_pem_data = [
                         crypto.dump_certificate(crypto.FILETYPE_PEM, cert).decode()
-                        for cert in conn.get_peer_cert_chain()
-                    )
+                        for cert in peer_cert_chain
+                    ]
                 except crypto.Error:
                     die(
                         "Tried to connect over HTTPS but couldn't get a certificate from the "
                         "master; consider using HTTP"
                     )
 
-                cert_hash = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert_pem_data)).hexdigest()
+                # Compute the fingerprint of the certificate; this is the same as the output of
+                # `openssl x509 -fingerprint -sha256 -inform pem -noout -in <cert>`.
+                cert_hash = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert_pem_data[0])).hexdigest()
                 cert_fingerprint = ":".join(chunks(cert_hash, 2))
 
                 if not render.yes_or_no(
@@ -237,10 +266,11 @@ def main(
                 ):
                     die("Unable to verify master certificate")
 
-                certs.CertStore(certs.default_store()).set_cert(parsed_args.master, cert_pem_data)
+                joined_certs = "".join(cert_pem_data)
+                certs.CertStore(certs.default_store()).set_cert(parsed_args.master, joined_certs)
                 # Reconfigure the CLI's Cert singleton, but preserve the certificate name.
                 old_cert_name = certs.cli_cert.name
-                certs.cli_cert = certs.Cert(cert_pem=cert_pem_data, name=old_cert_name)
+                certs.cli_cert = certs.Cert(cert_pem=joined_certs, name=old_cert_name)
 
                 check_version(parsed_args)
 
@@ -256,6 +286,14 @@ def main(
             )
         except EnterpriseOnlyError as e:
             die(f"Determined Enterprise Edition is required for this functionality: {e}")
+        except FeatureFlagDisabled as e:
+            die(f"Master does not support this operation: {e}")
+        except CliError as e:
+            die(e.message, exit_code=e.exit_code)
+        except ArgumentError as e:
+            die(e.message, exit_code=2)
+        except bindings.APIHttpError as e:
+            die("Failed on operation {}: {}".format(e.operation_name, e.message))
         except Exception:
             die("Failed to {}".format(parsed_args.func.__name__), always_print_traceback=True)
     except KeyboardInterrupt:

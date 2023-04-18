@@ -1,4 +1,4 @@
-FROM determinedai/environments:cuda-11.3-pytorch-1.10-lightning-1.5-tf-2.8-gpt-neox-deepspeed-gpu-ed66d8a
+FROM determinedai/environments:cuda-11.3-pytorch-1.10-gpt-neox-deepspeed-gpu-9b5db1b
 
 # Install deepspeed & dependencies
 RUN apt-get install -y mpich
@@ -10,4 +10,6 @@ RUN git clone -b determined https://github.com/determined-ai/gpt-neox.git
 
 RUN python gpt-neox/megatron/fused_kernels/setup.py install
 RUN pip install -r gpt-neox/requirements/requirements.txt
-RUN cd gpt-neox; python prepare_data.py -d ./data
+RUN gsutil cp -r gs://determined-ai-public-datasets/text_data /gpt-neox && mv /gpt-neox/text_data /gpt-neox/data
+RUN chmod -R 777 /gpt-neox
+RUN chmod -R 777 /tmp

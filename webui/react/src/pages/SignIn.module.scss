@@ -11,8 +11,22 @@
     flex-direction: column;
     max-width: 220px;
 
-    & > * { margin-bottom: var(--theme-sizes-layout-enormous); }
-    & > *:last-child { margin-bottom: 0; }
+    & > *:first-child {
+      margin-bottom: 24px;
+    }
+    & > *:last-child {
+      margin-bottom: 0;
+    }
+  }
+  .form {
+    width: 100%;
+
+    & :global(p) {
+      text-align: center;
+    }
+    & :global(button) {
+      width: 100%;
+    }
   }
   .ssoButton {
     align-items: center;
@@ -21,9 +35,21 @@
     padding: 0;
     width: 100%;
   }
-  .ssoButton > img {
+  .ssoLogo {
     height: 20px;
-    margin: 0 var(--theme-sizes-layout-small);
+    margin: 0 6px;
     width: 20px;
+  }
+  .ssoProviderInfo {
+    align-items: center;
+    display: flex;
+    justify-content: center;
+    width: 100%;
+
+    & > span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
   }
 }

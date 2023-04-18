@@ -36,6 +36,26 @@ enum State {
   STATE_DELETE_FAILED = 11;
   // The experiment is killed and is shutting down.
   STATE_STOPPING_KILLED = 12;
+  // The experiment is queued (waiting to be run, or job state is still queued).
+  // Queued is a substate of the Active state.
+  STATE_QUEUED = 13;
+  // The experiment is pulling the image. Pulling is a substate of the Active
+  // state.
+  STATE_PULLING = 14;
+  // The experiment is preparing the environment after finishing pulling the
+  // image. Starting is a substate of the Active state.
+  STATE_STARTING = 15;
+  // The experiment has an allocation actively running.
+  // Running is a substate of the Active state.
+  STATE_RUNNING = 16;
+}
+
+// ExperimentTrial is trial-level data that is surfaced to the experiment
+// level.
+message ExperimentTrial {
+  // the searcher metric value associated with the best_validation_id for the
+  // trial.
+  optional double searcher_metric_value = 1;
 }
 
 // Experiment is a collection of one or more trials that are exploring a
@@ -52,7 +72,11 @@ message Experiment {
         "num_trials",
         "username",
         "job_id",
-        "searcher_type"
+        "searcher_type",
+        "project_id",
+        "original_config",
+        "project_owner_id",
+        "config"
       ]
     }
   };
@@ -94,6 +118,33 @@ message Experiment {
   google.protobuf.Int32Value forked_from = 16;
   // The current progress of a running experiment.
   google.protobuf.DoubleValue progress = 17;
+  // The id of the project associated with this experiment.
+  int32 project_id = 21;
+  // The name of the project associated with this experiment.
+  string project_name = 22;
+  // The id of the workspace associated with this experiment.
+  int32 workspace_id = 23;
+  // The name of the workspace associated with this experiment.
+  string workspace_name = 24;
+  // The archived status of the parent project (can be inherited from
+  // workspace).
+  bool parent_archived = 25;
+  // The configuration of the experiment.
+  google.protobuf.Struct config = 26;
+  // The original configuration that the user submitted.
+  string original_config = 27;
+  // The id of the user who created the parent project.
+  int32 project_owner_id = 28;
+  // The total size of checkpoints.
+  int64 checkpoint_size = 29;
+  // The count of checkpoints.
+  int32 checkpoint_count = 30;
+  // The metrics and hyperparameters associated with the best trial by searcher
+  // metric.
+  optional double best_trial_searcher_metric = 31;
+  // Id of experiment's best trial, calculated by the best searcher metrics
+  // value of trial's best validation.
+  optional int32 best_trial_id = 32;
 }
 
 // PatchExperiment is a partial update to an experiment with only id required.
@@ -126,4 +177,22 @@ message ValidationHistoryEntry {
   // The value of the `searcher.metric`, indicated by the experiment config, for
   // the validation.
   float searcher_metric = 3;
+}
+
+// File node is one node of file in experiment model definition file tree.
+message FileNode {
+  // Path of file.
+  string path = 1;
+  // Name of file.
+  string name = 2;
+  // Modification time of file.
+  google.protobuf.Timestamp modified_time = 3;
+  // Number of bytes in file content.
+  int32 content_length = 4;
+  // Is this a directory.
+  bool is_dir = 5;
+  // MIME type of file.
+  string content_type = 6;
+  // Subdirectory files.
+  repeated FileNode files = 7;
 }

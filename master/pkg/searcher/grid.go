@@ -64,7 +64,8 @@ func (s *gridSearch) initialOperations(ctx context) ([]Operation, error) {
 
 func (s *gridSearch) progress(
 	trialProgress map[model.RequestID]PartialUnits,
-	trialsClosed map[model.RequestID]bool) float64 {
+	trialsClosed map[model.RequestID]bool,
+) float64 {
 	if s.MaxConcurrentTrials() > 0 && s.PendingTrials > s.MaxConcurrentTrials() {
 		panic("pending trials is greater than max_concurrent_trials")
 	}
@@ -94,18 +95,7 @@ func (s *gridSearch) progress(
 func (s *gridSearch) trialExitedEarly(
 	ctx context, requestID model.RequestID, exitedReason model.ExitedReason,
 ) ([]Operation, error) {
-	s.PendingTrials--
-	var ops []Operation
-	if len(s.RemainingTrials) > 0 {
-		params := s.RemainingTrials[len(s.RemainingTrials)-1]
-		s.RemainingTrials = s.RemainingTrials[:len(s.RemainingTrials)-1]
-		create := NewCreate(ctx.rand, params, model.TrialWorkloadSequencerType)
-		ops = append(ops, create)
-		ops = append(ops, NewValidateAfter(create.RequestID, s.MaxLength().Units))
-		ops = append(ops, NewClose(create.RequestID))
-		s.PendingTrials++
-	}
-	return ops, nil
+	return nil, nil
 }
 
 func (s *gridSearch) trialClosed(ctx context, _ model.RequestID) ([]Operation, error) {

@@ -1,23 +1,34 @@
-import React, { PropsWithChildren } from 'react';
+import { Typography } from 'antd';
+import React from 'react';
+
+import Card from 'components/kit/Card';
 
 import css from './OverviewStats.module.scss';
 
 interface Props {
+  children: React.ReactNode;
   focused?: boolean;
   onClick?: () => void;
   title: string;
 }
 
-const OverviewStats: React.FC<Props> = (props: PropsWithChildren<Props>) => {
-  const classes = [ css.base ];
-  if (props.onClick) classes.push(css.clickable);
-  if (props.focused) classes.push(css.focused);
+const OverviewStats: React.FC<Props> = (props: Props) => {
+  const childClasses = [css.info];
+  if (props.onClick) childClasses.push(css.clickable);
 
   return (
-    <div className={classes.join(' ')} onClick={props.onClick}>
-      <div className={css.title}>{props.title}</div>
-      <div className={css.info}>{props.children}</div>
-    </div>
+    <Card onClick={props.onClick}>
+      <div className={css.base}>
+        <Typography.Title className={css.title} ellipsis={{ rows: 1, tooltip: true }} level={5}>
+          {props.title}
+        </Typography.Title>
+        <strong className={childClasses.join(' ')}>
+          <Typography.Paragraph ellipsis={{ rows: 1, tooltip: true }}>
+            {props.children}
+          </Typography.Paragraph>
+        </strong>
+      </div>
+    </Card>
   );
 };
 

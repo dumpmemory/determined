@@ -6,11 +6,16 @@ import (
 
 	structpb "github.com/golang/protobuf/ptypes/struct"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/determined-ai/determined/master/internal/api"
+	"github.com/determined-ai/determined/master/internal/cluster"
+	"github.com/determined-ai/determined/master/internal/config"
 	"github.com/determined-ai/determined/master/internal/grpcutil"
+	"github.com/determined-ai/determined/master/internal/plugin/sso"
 	"github.com/determined-ai/determined/master/pkg/logger"
 	"github.com/determined-ai/determined/master/version"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
@@ -20,21 +25,34 @@ import (
 var masterLogsBatchMissWaitTime = time.Second
 
 func (a *apiServer) GetMaster(
-	_ context.Context, _ *apiv1.GetMasterRequest) (*apiv1.GetMasterResponse, error) {
-	return &apiv1.GetMasterResponse{
-		Version:           version.Version,
-		MasterId:          a.m.MasterID,
-		ClusterId:         a.m.ClusterID,
-		ClusterName:       a.m.config.ClusterName,
-		TelemetryEnabled:  a.m.config.Telemetry.Enabled && a.m.config.Telemetry.SegmentWebUIKey != "",
-		ExternalLoginUri:  a.m.config.InternalConfig.ExternalSessions.LoginURI,
-		ExternalLogoutUri: a.m.config.InternalConfig.ExternalSessions.LogoutURI,
-		Branding:          "determined",
-	}, nil
+	_ context.Context, _ *apiv1.GetMasterRequest,
+) (*apiv1.GetMasterResponse, error) {
+	product := apiv1.GetMasterResponse_PRODUCT_UNSPECIFIED
+	if a.m.config.InternalConfig.ExternalSessions.Enabled() {
+		product = apiv1.GetMasterResponse_PRODUCT_COMMUNITY
+	}
+	masterResp := &apiv1.GetMasterResponse{
+		Version:               version.Version,
+		MasterId:              a.m.MasterID,
+		ClusterId:             a.m.ClusterID,
+		ClusterName:           a.m.config.ClusterName,
+		TelemetryEnabled:      a.m.config.Telemetry.Enabled && a.m.config.Telemetry.SegmentWebUIKey != "",
+		ExternalLoginUri:      a.m.config.InternalConfig.ExternalSessions.LoginURI,
+		ExternalLogoutUri:     a.m.config.InternalConfig.ExternalSessions.LogoutURI,
+		Branding:              "determined",
+		RbacEnabled:           config.GetAuthZConfig().IsRBACUIEnabled(),
+		Product:               product,
+		UserManagementEnabled: !a.m.config.InternalConfig.ExternalSessions.Enabled(),
+		FeatureSwitches:       a.m.config.FeatureSwitches,
+	}
+	sso.AddProviderInfoToMasterResponse(a.m.config, masterResp)
+
+	return masterResp, nil
 }
 
 func (a *apiServer) GetTelemetry(
-	_ context.Context, _ *apiv1.GetTelemetryRequest) (*apiv1.GetTelemetryResponse, error) {
+	_ context.Context, _ *apiv1.GetTelemetryRequest,
+) (*apiv1.GetTelemetryResponse, error) {
 	resp := apiv1.GetTelemetryResponse{}
 	if a.m.config.Telemetry.Enabled && a.m.config.Telemetry.SegmentWebUIKey != "" {
 		resp.Enabled = true
@@ -44,7 +62,17 @@ func (a *apiServer) GetTelemetry(
 }
 
 func (a *apiServer) GetMasterConfig(
-	_ context.Context, _ *apiv1.GetMasterConfigRequest) (*apiv1.GetMasterConfigResponse, error) {
+	ctx context.Context, _ *apiv1.GetMasterConfigRequest,
+) (*apiv1.GetMasterConfigResponse, error) {
+	// TODO: migrate to RBAC.
+	u, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !u.Admin {
+		return nil, grpcutil.ErrPermissionDenied
+	}
+
 	config, err := a.m.config.Printable()
 	if err != nil {
 		return nil, errors.Wrap(err, "error parsing master config")
@@ -57,7 +85,8 @@ func (a *apiServer) GetMasterConfig(
 }
 
 func (a *apiServer) MasterLogs(
-	req *apiv1.MasterLogsRequest, resp apiv1.Determined_MasterLogsServer) error {
+	req *apiv1.MasterLogsRequest, resp apiv1.Determined_MasterLogsServer,
+) error {
 	if err := grpcutil.ValidateRequest(
 		grpcutil.ValidateLimit(req.Limit),
 		grpcutil.ValidateFollow(req.Limit, req.Follow),
@@ -78,6 +107,19 @@ func (a *apiServer) MasterLogs(
 
 	ctx, cancel := context.WithCancel(resp.Context())
 	defer cancel()
+
+	u, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	permErr, err := cluster.AuthZProvider.Get().CanGetMasterLogs(ctx, u)
+	if err != nil {
+		return err
+	}
+	if permErr != nil {
+		return status.Error(codes.PermissionDenied, permErr.Error())
+	}
 
 	res := make(chan api.BatchResult, 1)
 	go api.NewBatchStreamProcessor(
@@ -105,21 +147,29 @@ func (a *apiServer) MasterLogs(
 }
 
 func (a *apiServer) ResourceAllocationRaw(
-	_ context.Context,
+	ctx context.Context,
 	req *apiv1.ResourceAllocationRawRequest,
 ) (*apiv1.ResourceAllocationRawResponse, error) {
 	resp := &apiv1.ResourceAllocationRawResponse{}
 
+	u, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.m.canGetUsageDetails(ctx, u); err != nil {
+		return nil, err
+	}
+
 	if req.TimestampAfter == nil {
-		return nil, errors.New("no start time provided")
+		return nil, status.Error(codes.InvalidArgument, "no start time provided")
 	}
 	if req.TimestampBefore == nil {
-		return nil, errors.New("no end time provided")
+		return nil, status.Error(codes.InvalidArgument, "no end time provided")
 	}
 	start := time.Unix(req.TimestampAfter.Seconds, int64(req.TimestampAfter.Nanos)).UTC()
 	end := time.Unix(req.TimestampBefore.Seconds, int64(req.TimestampBefore.Nanos)).UTC()
 	if start.After(end) {
-		return nil, errors.New("start time cannot be after end time")
+		return nil, status.Error(codes.InvalidArgument, "start time cannot be after end time")
 	}
 
 	if err := a.m.db.QueryProto(
@@ -132,8 +182,16 @@ func (a *apiServer) ResourceAllocationRaw(
 }
 
 func (a *apiServer) ResourceAllocationAggregated(
-	_ context.Context,
+	ctx context.Context,
 	req *apiv1.ResourceAllocationAggregatedRequest,
 ) (*apiv1.ResourceAllocationAggregatedResponse, error) {
+	u, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.m.canGetUsageDetails(ctx, u); err != nil {
+		return nil, err
+	}
+
 	return a.m.fetchAggregatedResourceAllocation(req)
 }

@@ -6,7 +6,7 @@ import pathlib
 import pickle
 import random
 import time
-import uuid
+import warnings
 from typing import Any, Callable, Dict, Iterator, List, Optional, Type, Union, cast
 
 import deepspeed
@@ -16,7 +16,6 @@ from deepspeed.runtime import dataloader as ds_loader
 
 import determined as det
 from determined import layers, pytorch, util, workload
-from determined.common import storage
 from determined.pytorch import deepspeed as det_ds
 
 
@@ -45,6 +44,14 @@ class DeepSpeedTrialController(det.TrialController):
         if torch.cuda.is_available():
             self.prof._set_sync_device(self._sync_device)
         self.callbacks = self.trial.build_callbacks()
+        for callback in self.callbacks.values():
+            if util.is_overridden(callback.on_checkpoint_end, pytorch.PyTorchCallback):
+                warnings.warn(
+                    "The on_checkpoint_end callback is deprecated, please use "
+                    "on_checkpoint_write_end instead",
+                    FutureWarning,
+                    stacklevel=2,
+                )
 
         if len(self.context.models) == 0:
             raise det.errors.InvalidExperimentException(
@@ -58,7 +65,7 @@ class DeepSpeedTrialController(det.TrialController):
                 self.context._core, self.env, self.context.models[0].train_batch_size()
             )
 
-        self.latest_batch = self.env.latest_batch
+        self.steps_completed = self.env.steps_completed
 
     @classmethod
     def pre_execute_hook(
@@ -90,12 +97,8 @@ class DeepSpeedTrialController(det.TrialController):
     ) -> det.TrialController:
         return cls(*args, **kwargs)
 
-    @classmethod
-    def supports_averaging_training_metrics(cls: Type["DeepSpeedTrialController"]) -> bool:
-        return True
-
     def _set_data_loaders(self) -> None:
-        skip_batches = self.env.latest_batch
+        skip_batches = self.env.steps_completed
 
         # Training and validation data loaders are not built for every slot when model parallelism
         # is used.
@@ -175,7 +178,7 @@ class DeepSpeedTrialController(det.TrialController):
             # like a DataLoader but is not.
             self.validation_loader = cast(torch.utils.data.DataLoader, self.validation_loader)
             self.num_validation_batches = len(self.validation_loader)
-            self.validation_batch_size = len(next(iter(self.validation_loader)))
+            self.validation_batch_size = pytorch.data_length(next(iter(self.validation_loader)))
 
             if self.context.use_pipeline_parallel:
                 self.num_validation_batches = (
@@ -234,7 +237,7 @@ class DeepSpeedTrialController(det.TrialController):
                 fn(*args)
 
         # We define on_shutdown here instead of inside the `for callback in...` loop to ensure we
-        # don't bind a the loop iteration variable `callback`, which would likely cause us to call
+        # don't bind the loop iteration variable `callback`, which would likely cause us to call
         # on_trial_shutdown() multiple times for the final callback, and not at all for the others.
         def on_shutdown(callback_name: str, on_trial_shutdown: Callable) -> None:
             with self.prof.record_timing(f"callbacks.{callback_name}.on_trial_shutdown"):
@@ -245,7 +248,7 @@ class DeepSpeedTrialController(det.TrialController):
                 with self.prof.record_timing(
                     f"callbacks.{callback.__class__.__name__}.on_trial_startup"
                 ):
-                    callback.on_trial_startup(self.latest_batch, self.env.latest_checkpoint)
+                    callback.on_trial_startup(self.steps_completed, self.env.latest_checkpoint)
                 exit_stack.enter_context(
                     defer(on_shutdown, callback.__class__.__name__, callback.on_trial_shutdown)
                 )
@@ -293,64 +296,42 @@ class DeepSpeedTrialController(det.TrialController):
             try:
                 if w.kind == workload.Workload.Kind.RUN_STEP:
                     action = "training"
+                    metrics = self._train_for_step(
+                        w.step_id,
+                        w.num_batches,
+                        w.total_batches_processed,
+                    )
                     response = {
-                        "metrics": self._train_for_step(
-                            w.step_id,
-                            w.num_batches,
-                            w.total_batches_processed,
-                        ),
+                        "metrics": metrics,
                         "stop_requested": self.context.get_stop_requested(),
                     }  # type: workload.Response
-
+                    metrics = self.context.distributed.broadcast(metrics)
+                    for callback in self.callbacks.values():
+                        callback.on_training_workload_end(
+                            avg_metrics=metrics["avg_metrics"],
+                            batch_metrics=metrics["batch_metrics"],
+                        )
                 elif w.kind == workload.Workload.Kind.COMPUTE_VALIDATION_METRICS:
                     action = "validation"
                     response = {
                         "metrics": self._compute_validation_metrics(),
                         "stop_requested": self.context.get_stop_requested(),
                     }
-
                 elif w.kind == workload.Workload.Kind.CHECKPOINT_MODEL:
                     action = "checkpointing"
-                    # The checkpointing api would have been sufficient if the base_path for the
-                    # storage manager is guaranteed to be a shared file system.
-                    #
-                    # Since we can't guarantee that, we use the base storage_manager instead for
-                    # more flexibility.  Since checkpoints can be distributed across multiple
-                    # nodes, we will use the same uuid and separate path but each node
-                    # will upload its checkpoints to the storage manager individually.
-                    storage_manager = self.context._core.checkpoint._storage_manager
-                    if self.is_chief:
-                        metadata = {
-                            "latest_batch": self.latest_batch,
-                            "framework": f"torch-{torch.__version__}",
-                            "format": "pickle",
-                        }
-                        storage_id = str(uuid.uuid4())
-                        with storage_manager.store_path(storage_id) as path:
-                            # Broadcast checkpoint path to all ranks.
-                            self.context.distributed.broadcast((storage_id, path))
-                            self._save(path)
-                            # Gather resources across nodes.
-                            all_resources = self.context.distributed.gather(
-                                storage.StorageManager._list_directory(path)
-                            )
-                        resources = {k: v for d in all_resources for k, v in d.items()}
-
-                        self.context._core.checkpoint._report_checkpoint(
-                            storage_id, resources, metadata
-                        )
-                        response = {"uuid": storage_id}
-                    else:
-                        storage_id, path = self.context.distributed.broadcast(None)
+                    metadata = {
+                        "steps_completed": self.steps_completed,
+                        "framework": f"torch-{torch.__version__}",
+                        "format": "pickle",
+                    }
+                    with self.context._core.checkpoint.store_path(metadata, shard=True) as (
+                        path,
+                        storage_id,
+                    ):
                         self._save(path)
-                        # Gather resources across nodes.
-                        _ = self.context.distributed.gather(
-                            storage.StorageManager._list_directory(path)
-                        )
-                        if self.context.distributed.local_rank == 0:
-                            storage_manager.post_store_path(str(path), storage_id)
-                        response = {}
-
+                    response = {"uuid": storage_id}
+                    for callback in self.callbacks.values():
+                        callback.on_checkpoint_upload_end(uuid=storage_id)
                 else:
                     raise AssertionError("Unexpected workload: {}".format(w.kind))
 
@@ -358,13 +339,15 @@ class DeepSpeedTrialController(det.TrialController):
                 logging.info(f"Invalid hyperparameter exception during {action}: {e}")
                 response = workload.InvalidHP()
             response_func(response)
+            self.context._maybe_reset_tbd_writer()
+            self.upload_tb_files()
 
     def get_epoch_idx(self, batch_id: int) -> int:
         return batch_id // cast(int, self.context._epoch_len)
 
     def _train_for_step(
         self, step_id: int, num_batches: int, total_batches_processed: int
-    ) -> workload.Response:
+    ) -> workload.Metrics:
         """
         DeepSpeed allows specifying train_batch_size, train_micro_batch_size_per_gpu, and
         gradient_accumulation_steps. The three are related as follows:
@@ -402,7 +385,7 @@ class DeepSpeedTrialController(det.TrialController):
         num_inputs = 0
 
         for batch_idx in range(start, end):
-            self.latest_batch += 1
+            self.steps_completed += 1
             self.prof.update_batch_idx(batch_idx)
             batch_start_time = time.time()
             self.context._current_batch_idx = batch_idx
@@ -414,7 +397,7 @@ class DeepSpeedTrialController(det.TrialController):
                         callback.on_training_epoch_start(self.get_epoch_idx(batch_idx))
             # This can be inaccurate if the user's data loader does not return batches with
             # the micro batch size.  It is also slightly inaccurate if the data loader can return
-            # partial batches.  The same sort of assumptions are made in the DeepSpeed
+            # partial batches.  The same sort of assumptions is made in the DeepSpeed
             # model engine's accounting and profiling computations.
             batch_inputs = (
                 self.context.train_micro_batch_size_per_gpu
@@ -485,13 +468,23 @@ class DeepSpeedTrialController(det.TrialController):
                 pytorch._convert_metrics_to_numpy(self.context.reduce_metrics(for_training=True))
             )
 
-        if not self.is_chief:
-            # The training metrics are reported only in the chief process.
-            return {}
+        if self.is_chief:
+            step_duration = time.time() - step_start_time
+            logging.info(
+                det.util.make_timing_log("trained", step_duration, num_inputs, num_batches)
+            )
+            self.prof.set_training(False)
 
-        step_duration = time.time() - step_start_time
-        logging.info(det.util.make_timing_log("trained", step_duration, num_inputs, num_batches))
-        self.prof.set_training(False)
+            det.pytorch._log_tb_metrics(
+                self.context.get_tensorboard_writer(),
+                "train",
+                self.steps_completed,
+                metrics["avg_metrics"],
+                metrics["batch_metrics"],
+            )
+
+        if not self.is_chief:
+            return {}
 
         return metrics
 
@@ -504,14 +497,6 @@ class DeepSpeedTrialController(det.TrialController):
             model.eval()
 
         step_start_time = time.time()
-
-        for callback in self.callbacks.values():
-            if util.is_overridden(callback.on_validation_step_start, pytorch.PyTorchCallback):
-                logging.warning(
-                    "on_validation_step_start is now deprecated, "
-                    "please use on_validation_start instead"
-                )
-                callback.on_validation_step_start()
 
         for callback in self.callbacks.values():
             callback.on_validation_start()
@@ -529,7 +514,7 @@ class DeepSpeedTrialController(det.TrialController):
             # Note that when using pipeline parallelism, each call to evaluate_batch will request
             # self.context.num_micro_batches_per_slot batches from the validation iterator.
             # This is why we set self.num_validation_batches differently for pipeline parallel
-            # and no pipeline parallel when building the data laoders.
+            # and no pipeline parallel when building the data loaders.
             vld_metrics = self.trial.evaluate_batch(validation_iterator, idx)
             if self.context._mpu.should_report_metrics:
                 if not isinstance(vld_metrics, dict):
@@ -573,11 +558,8 @@ class DeepSpeedTrialController(det.TrialController):
         )
 
         if self.context.distributed.size > 1 and any(
-            map(
-                lambda c: util.is_overridden(c.on_validation_end, pytorch.PyTorchCallback)
-                or util.is_overridden(c.on_validation_step_end, pytorch.PyTorchCallback),
-                self.callbacks.values(),
-            )
+            util.is_overridden(c.on_validation_end, pytorch.PyTorchCallback)
+            for c in self.callbacks.values()
         ):
             logging.debug(
                 "Broadcasting metrics to all worker processes to execute a "
@@ -586,27 +568,30 @@ class DeepSpeedTrialController(det.TrialController):
             metrics = self.context.distributed.broadcast(metrics)
 
         for callback in self.callbacks.values():
-            if util.is_overridden(callback.on_validation_step_end, pytorch.PyTorchCallback):
-                logging.warning(
-                    "on_validation_step_end is now deprecated, please use on_validation_end instead"
-                )
-                callback.on_validation_step_end(metrics)
-
-        for callback in self.callbacks.values():
             callback.on_validation_end(metrics)
+
+        if self.is_chief:
+            num_inputs *= self.context._mpu.data_parallel_world_size
+            step_duration = time.time() - step_start_time
+            logging.info(
+                det.util.make_timing_log(
+                    "validated", step_duration, num_inputs, cast(int, self.num_validation_batches)
+                )
+            )
+
+            det.pytorch._log_tb_metrics(
+                self.context.get_tensorboard_writer(), "val", self.steps_completed, metrics
+            )
 
         if not self.is_chief:
             return {}
 
-        num_inputs *= self.context._mpu.data_parallel_world_size
-        step_duration = time.time() - step_start_time
-        logging.info(
-            det.util.make_timing_log(
-                "validated", step_duration, num_inputs, cast(int, self.num_validation_batches)
-            )
-        )
-
         return {"num_inputs": num_inputs, "validation_metrics": metrics}
+
+    def on_validation_step_end(self, metrics: Dict[str, Any]) -> None:
+        det.pytorch._log_tb_metrics(
+            self.context.get_tensorboard_writer(), "val", self.steps_completed, metrics
+        )
 
     def _load(self, load_path: pathlib.Path) -> None:
         # Right now we will load all checkpoint shards on each node regardless of which
@@ -630,7 +615,7 @@ class DeepSpeedTrialController(det.TrialController):
         for callback in self.callbacks.values():
             callback.on_checkpoint_load_start(checkpoint)
 
-        # We allow users to override load behavior if needed but we default to using
+        # We allow users to override load behavior if needed, but we default to using
         # the load method provided by DeepSpeed.
         self.trial.load(self.context, load_path)
 
@@ -716,12 +701,14 @@ class DeepSpeedTrialController(det.TrialController):
         ckpt_name = f"det_state_dict_rank{self.context.distributed.rank}.pth"
         torch.save(checkpoint, str(path.joinpath(ckpt_name)))
 
-        # We allow users to override save behavior if needed but we default to using
+        # We allow users to override save behavior if needed, but we default to using
         # the save method provided by DeepSpeed.
         self.trial.save(self.context, path)
 
         for callback in self.callbacks.values():
+            # TODO(DET-7912): remove on_checkpoint_end once it has been deprecated long enough.
             callback.on_checkpoint_end(str(path))
+            callback.on_checkpoint_write_end(str(path))
 
     def _sync_device(self) -> None:
         torch.cuda.synchronize(self.context.device)
@@ -736,7 +723,7 @@ class DeepSpeedTrial(det.Trial):
     * **Define the DeepSpeed model engine which includes the model, optimizer, and lr_scheduler**.
 
        In the :meth:`__init__` method, initialize models and, optionally, optimizers and
-       LR schedulers and pass them to deepspeed.initialize to build the model engine.  Then
+       LR schedulers and pass them to ``deepspeed.initialize`` to build the model engine.  Then
        pass the created model engine to ``wrap_model_engine`` provided by
        :class:`~determined.pytorch.deepspeed.DeepSpeedTrialContext`.
        We support multiple DeepSpeed model engines if they only use data parallelism or if
@@ -795,7 +782,7 @@ class DeepSpeedTrial(det.Trial):
         batch_idx: int,
     ) -> Union[torch.Tensor, Dict[str, Any]]:
         """
-        Train one full batch (i.e. train on ``train_batch_size`` samples, perhaps consisting of
+        Train one full batch (i.e. train on ``train_batch_size`` samples, perhaps consisting
         of multiple micro-batches).
 
         If training without pipeline parallelism, users should implement this function by doing

@@ -7,6 +7,7 @@ import (
 
 	"github.com/determined-ai/determined/master/pkg/aproto"
 	"github.com/determined-ai/determined/master/pkg/cproto"
+	"github.com/determined-ai/determined/proto/pkg/taskv1"
 )
 
 // All the From... methods expose the more abstract representation returned by resource managers
@@ -75,6 +76,24 @@ type ResourcesStarted struct {
 	NativeResourcesID string
 }
 
+// Proto returns the proto representation of ResourcesStarted.
+func (r *ResourcesStarted) Proto() *taskv1.ResourcesStarted {
+	if r == nil {
+		return nil
+	}
+
+	pbAddresses := []*taskv1.Address{}
+
+	for _, address := range r.Addresses {
+		pbAddresses = append(pbAddresses, address.Proto())
+	}
+
+	return &taskv1.ResourcesStarted{
+		Addresses:         pbAddresses,
+		NativeResourcesId: r.NativeResourcesID,
+	}
+}
+
 // FromContainerStarted converts an aproto.ContainerStarted message to ResourcesStarted.
 func FromContainerStarted(cs *aproto.ContainerStarted) *ResourcesStarted {
 	if cs == nil {
@@ -90,6 +109,16 @@ func FromContainerStarted(cs *aproto.ContainerStarted) *ResourcesStarted {
 // ResourcesStopped contains the information needed by tasks from container stopped.
 type ResourcesStopped struct {
 	Failure *ResourcesFailure
+}
+
+// Proto returns the proto representation of ResourcesStopped.
+func (r *ResourcesStopped) Proto() *taskv1.ResourcesStopped {
+	if r == nil {
+		return nil
+	}
+	return &taskv1.ResourcesStopped{
+		Failure: r.Failure.Proto(),
+	}
 }
 
 // FromContainerStopped converts an aproto.ContainerStopped message to ResourcesStopped.
@@ -130,30 +159,54 @@ func ResourcesError(failureType FailureType, err error) ResourcesStopped {
 
 func (r ResourcesStopped) String() string {
 	if r.Failure == nil {
-		return "container exited successfully with a zero exit code"
+		return "resources exited successfully with a zero exit code"
 	}
 	return r.Failure.Error()
 }
 
-// ResourcesFailure contains information about resources' failure.
+// ResourcesFailure contains information about restored resources' failure.
 type ResourcesFailure struct {
 	FailureType FailureType
 	ErrMsg      string
 	ExitCode    *ExitCode
 }
 
+// Proto returns the proto representation of ResourcesFailure.
+func (f *ResourcesFailure) Proto() *taskv1.ResourcesFailure {
+	if f == nil {
+		return nil
+	}
+
+	pbResourcesFailure := taskv1.ResourcesFailure{
+		FailureType: f.FailureType.Proto(),
+		ErrMsg:      f.ErrMsg,
+	}
+
+	if f.ExitCode != nil {
+		exitCode := int32(*f.ExitCode)
+		pbResourcesFailure.ExitCode = &exitCode
+	}
+
+	return &pbResourcesFailure
+}
+
 // NewResourcesFailure returns a resources failure message wrapping the type, msg and exit code.
-func NewResourcesFailure(failureType FailureType, msg string, code ExitCode) *ResourcesFailure {
+func NewResourcesFailure(
+	failureType FailureType, msg string, code *ExitCode,
+) *ResourcesFailure {
 	return &ResourcesFailure{
 		FailureType: failureType,
 		ErrMsg:      msg,
-		ExitCode:    &code,
+		ExitCode:    code,
 	}
 }
 
 func (f ResourcesFailure) Error() string {
 	if f.ExitCode == nil {
-		return fmt.Sprintf("%s: %s", f.FailureType, f.ErrMsg)
+		if len(f.ErrMsg) > 0 {
+			return fmt.Sprintf("%s: %s", f.FailureType, f.ErrMsg)
+		}
+		return fmt.Sprintf("%s", f.FailureType)
 	}
 	return fmt.Sprintf("%s: %s (exit code %d)", f.FailureType, f.ErrMsg, *f.ExitCode)
 }
@@ -181,62 +234,117 @@ func FromContainerExitCode(c *aproto.ExitCode) *ExitCode {
 type FailureType string
 
 const (
-	// ContainerFailed denotes that the container ran but failed with a non-zero exit code.
-	ContainerFailed = FailureType("container failed with non-zero exit code")
+	// ResourcesFailed denotes that the container ran but failed with a non-zero exit code.
+	ResourcesFailed FailureType = "resources failed with non-zero exit code"
 
-	// ContainerAborted denotes the container was canceled before it was started.
-	ContainerAborted = FailureType("container was aborted before it started")
+	// ResourcesAborted denotes the container was canceled before it was started.
+	ResourcesAborted FailureType = "resources was aborted before it started"
+
+	// ResourcesMissing denotes the resources were missing when the master asked about it.
+	ResourcesMissing FailureType = "request for action on unknown resources"
 
 	// TaskAborted denotes that the task was canceled before it was started.
-	TaskAborted = FailureType("task was aborted before the task was started")
+	TaskAborted FailureType = "task was aborted before the task was started"
 
 	// TaskError denotes that the task failed without an associated exit code.
-	TaskError = FailureType("task failed without an associated exit code")
+	TaskError FailureType = "task failed without an associated exit code"
 
 	// AgentFailed denotes that the agent failed while the container was running.
-	AgentFailed = FailureType("agent failed while the container was running")
+	AgentFailed FailureType = "agent failed while the container was running"
 
 	// AgentError denotes that the agent failed to launch the container.
-	AgentError = FailureType("agent failed to launch the container")
+	AgentError FailureType = "agent failed to launch the container"
+
+	// RestoreError denotes a failure to restore a running allocation on master blip.
+	RestoreError FailureType = "RM failed to restore the allocation"
 
 	// UnknownError denotes an internal error that did not map to a know failure type.
-	UnknownError
+	UnknownError = "unknown agent failure: %s"
 )
+
+// Proto returns the proto representation of the device type.
+func (f FailureType) Proto() taskv1.FailureType {
+	switch f {
+	case ResourcesFailed:
+		return taskv1.FailureType_FAILURE_TYPE_RESOURCES_FAILED
+	case ResourcesAborted:
+		return taskv1.FailureType_FAILURE_TYPE_RESOURCES_ABORTED
+	case ResourcesMissing:
+		return taskv1.FailureType_FAILURE_TYPE_RESOURCES_MISSING
+	case TaskAborted:
+		return taskv1.FailureType_FAILURE_TYPE_TASK_ABORTED
+	case TaskError:
+		return taskv1.FailureType_FAILURE_TYPE_TASK_ERROR
+	case AgentFailed:
+		return taskv1.FailureType_FAILURE_TYPE_AGENT_FAILED
+	case AgentError:
+		return taskv1.FailureType_FAILURE_TYPE_AGENT_ERROR
+	case RestoreError:
+		return taskv1.FailureType_FAILURE_TYPE_RESTORE_ERROR
+	case UnknownError:
+		return taskv1.FailureType_FAILURE_TYPE_UNKNOWN_ERROR
+	default:
+		return taskv1.FailureType_FAILURE_TYPE_UNSPECIFIED
+	}
+}
 
 // FromContainerFailureType converts an aproto.FailureType to a FailureType. This mapping is not
 // guaranteed to remain one to one; this conversion may do some level of interpretation.
 func FromContainerFailureType(t aproto.FailureType) FailureType {
 	switch t {
 	case aproto.ContainerFailed:
-		return FailureType(t)
+		return ResourcesFailed
 	case aproto.ContainerAborted:
-		return FailureType(t)
+		return ResourcesAborted
+	case aproto.ContainerMissing:
+		return ResourcesMissing
 	case aproto.TaskAborted:
-		return FailureType(t)
+		return TaskAborted
 	case aproto.TaskError:
-		return FailureType(t)
+		return TaskError
 	case aproto.AgentFailed:
-		return FailureType(t)
+		return AgentFailed
 	case aproto.AgentError:
-		return FailureType(t)
+		return AgentError
+	case aproto.RestoreError:
+		return RestoreError
 	default:
-		return FailureType(t)
+		return FailureType(fmt.Sprintf(UnknownError, t))
 	}
 }
 
-// IsRestartableSystemError checks if the error is caused by the system and
+// InvalidResourcesRequestError is an unrecoverable validation error from the underlying RM.
+type InvalidResourcesRequestError struct {
+	Cause error
+}
+
+func (e InvalidResourcesRequestError) Error() string {
+	return fmt.Sprintf("invalid resources request: %s", e.Cause.Error())
+}
+
+// IsUnrecoverableSystemError checks if the error is absolutely unrecoverable.
+func IsUnrecoverableSystemError(err error) bool {
+	switch err.(type) {
+	case InvalidResourcesRequestError:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTransientSystemError checks if the error is caused by the system and
 // shouldn't count against `max_restarts`.
-func IsRestartableSystemError(err error) bool {
-	switch contErr := err.(type) {
+func IsTransientSystemError(err error) bool {
+	switch err := err.(type) {
 	case ResourcesFailure:
-		switch contErr.FailureType {
-		case ContainerFailed, TaskError:
+		switch err.FailureType {
+		case ResourcesFailed, TaskError:
 			return false
 		// Questionable, could be considered failures, but for now we don't.
-		case AgentError, AgentFailed:
+		case AgentError, AgentFailed, RestoreError:
 			return true
 		// Definitely not a failure.
-		case TaskAborted, ContainerAborted:
+		case TaskAborted, ResourcesAborted:
 			return true
 		default:
 			return false

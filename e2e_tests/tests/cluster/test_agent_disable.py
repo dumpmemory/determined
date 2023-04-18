@@ -6,48 +6,57 @@ from typing import Any, Dict, Iterator, List, Optional, cast
 
 import pytest
 
-from determined.common.api.bindings import determinedexperimentv1State
+from determined.common.api.bindings import experimentv1State, get_GetSlot
+from tests import api_utils
 from tests import config as conf
 from tests import experiment as exp
 
+from .test_users import ADMIN_CREDENTIALS, logged_in_user
 from .utils import get_command_info, run_zero_slot_command, wait_for_command_state
 
 
 @pytest.mark.e2e_cpu
 def test_disable_and_enable_slots() -> None:
-    command = [
-        "det",
-        "-m",
-        conf.make_master_url(),
-        "slot",
-        "list",
-        "--json",
-    ]
-    output = subprocess.check_output(command).decode()
-    slots = json.loads(output)
-    assert len(slots) == 1
+    with logged_in_user(ADMIN_CREDENTIALS):
+        command = [
+            "det",
+            "-m",
+            conf.make_master_url(),
+            "slot",
+            "list",
+            "--json",
+        ]
+        output = subprocess.check_output(command).decode()
+        slots = json.loads(output)
+        assert len(slots) == 1
 
-    command = [
-        "det",
-        "-m",
-        conf.make_master_url(),
-        "slot",
-        "disable",
-        slots[0]["agent_id"],
-        slots[0]["slot_id"],
-    ]
-    subprocess.check_call(command)
+        slot_id, agent_id = slots[0]["slot_id"], slots[0]["agent_id"]
 
-    command = [
-        "det",
-        "-m",
-        conf.make_master_url(),
-        "slot",
-        "enable",
-        slots[0]["agent_id"],
-        slots[0]["slot_id"],
-    ]
-    subprocess.check_call(command)
+        command = [
+            "det",
+            "-m",
+            conf.make_master_url(),
+            "slot",
+            "disable",
+            agent_id,
+            slot_id,
+        ]
+        subprocess.check_call(command)
+
+        slot = get_GetSlot(
+            api_utils.determined_test_session(), agentId=agent_id, slotId=slot_id
+        ).slot
+        assert slot is not None
+        assert slot.enabled is False
+
+        command = ["det", "-m", conf.make_master_url(), "slot", "enable", agent_id, slot_id]
+        subprocess.check_call(command)
+
+        slot = get_GetSlot(
+            api_utils.determined_test_session(), agentId=agent_id, slotId=slot_id
+        ).slot
+        assert slot is not None
+        assert slot.enabled is True
 
 
 def _fetch_slots() -> List[Dict[str, Any]]:
@@ -83,10 +92,43 @@ def _disable_agent(agent_id: str, drain: bool = False, json: bool = False) -> It
         + [agent_id]
     )
     try:
-        yield subprocess.check_output(command).decode()
+        with logged_in_user(ADMIN_CREDENTIALS):
+            out = subprocess.check_output(command).decode()
+        yield out
     finally:
-        command = ["det", "-m", conf.make_master_url(), "agent", "enable", agent_id]
-        subprocess.check_call(command)
+        with logged_in_user(ADMIN_CREDENTIALS):
+            command = ["det", "-m", conf.make_master_url(), "agent", "enable", agent_id]
+            subprocess.check_call(command)
+
+
+@pytest.mark.e2e_cpu
+def test_disable_agent_experiment_resume() -> None:
+    """
+    Start an experiment with max_restarts=0 and ensure that being killed due to an explicit agent
+    disable/enable (without draining) does not count toward the number of restarts.
+    """
+    slots = _fetch_slots()
+    assert len(slots) == 1
+    agent_id = slots[0]["agent_id"]
+
+    exp_id = exp.create_experiment(
+        conf.fixtures_path("no_op/single-medium-train-step.yaml"),
+        conf.fixtures_path("no_op"),
+        ["--config", "max_restarts=0"],
+    )
+    exp.wait_for_experiment_workload_progress(exp_id)
+
+    with _disable_agent(agent_id):
+        # Wait for the allocation to go away.
+        for _ in range(20):
+            slots = _fetch_slots()
+            print(slots)
+            if not any(s["allocation_id"] != "FREE" for s in slots):
+                break
+            time.sleep(1)
+        else:
+            pytest.fail("Experiment stayed scheduled after agent was disabled")
+    exp.wait_for_experiment_state(exp_id, experimentv1State.COMPLETED)
 
 
 @pytest.mark.e2e_cpu
@@ -128,7 +170,7 @@ def test_drain_agent() -> None:
         conf.fixtures_path("no_op"),
         None,
     )
-    exp.wait_for_experiment_state(experiment_id, determinedexperimentv1State.STATE_ACTIVE)
+    exp.wait_for_experiment_state(experiment_id, experimentv1State.RUNNING)
     exp.wait_for_experiment_active_workload(experiment_id)
     exp.wait_for_experiment_workload_progress(experiment_id)
 
@@ -144,7 +186,7 @@ def test_drain_agent() -> None:
         None,
     )
     time.sleep(5)
-    exp.wait_for_experiment_state(experiment_id_no_start, determinedexperimentv1State.STATE_ACTIVE)
+    exp.wait_for_experiment_state(experiment_id_no_start, experimentv1State.QUEUED)
 
     with _disable_agent(agent_id, drain=True):
         # Check for 15 seconds it doesn't get scheduled into the same slot.
@@ -153,7 +195,7 @@ def test_drain_agent() -> None:
             assert len(trials) == 0
 
         # Ensure the first one has finished with the correct number of workloads.
-        exp.wait_for_experiment_state(experiment_id, determinedexperimentv1State.STATE_COMPLETED)
+        exp.wait_for_experiment_state(experiment_id, experimentv1State.COMPLETED)
         trials = exp.experiment_trials(experiment_id)
         assert len(trials) == 1
         assert len(trials[0].workloads) == 7
@@ -173,7 +215,7 @@ def test_drain_agent() -> None:
         assert agent_data["enabled"] is False
         assert agent_data["draining"] is True
 
-        exp.cancel_single(experiment_id_no_start)
+        exp.kill_single(experiment_id_no_start)
 
 
 @pytest.mark.e2e_cpu_2a
@@ -203,7 +245,7 @@ def test_drain_agent_sched() -> None:
             conf.fixtures_path("no_op"),
             None,
         )
-        exp.wait_for_experiment_state(exp_id2, determinedexperimentv1State.STATE_ACTIVE)
+        exp.wait_for_experiment_state(exp_id2, experimentv1State.RUNNING)
 
         # Wait for a state when *BOTH* experiments are scheduled.
         for _ in range(20):
@@ -219,8 +261,8 @@ def test_drain_agent_sched() -> None:
                 "while the first agent was draining"
             )
 
-        exp.wait_for_experiment_state(exp_id1, determinedexperimentv1State.STATE_COMPLETED)
-        exp.wait_for_experiment_state(exp_id2, determinedexperimentv1State.STATE_COMPLETED)
+        exp.wait_for_experiment_state(exp_id1, experimentv1State.COMPLETED)
+        exp.wait_for_experiment_state(exp_id2, experimentv1State.COMPLETED)
 
         trials1 = exp.experiment_trials(exp_id1)
         trials2 = exp.experiment_trials(exp_id2)
@@ -231,7 +273,7 @@ def test_drain_agent_sched() -> None:
 def _task_data(task_id: str) -> Optional[Dict[str, Any]]:
     command = ["det", "-m", conf.make_master_url(), "task", "list", "--json"]
     tasks_data: Dict[str, Dict[str, Any]] = json.loads(subprocess.check_output(command).decode())
-    matches = [t for t in tasks_data.values() if t["task_id"] == task_id]
+    matches = [t for t in tasks_data.values() if t["taskId"] == task_id]
     return matches[0] if matches else None
 
 
@@ -239,7 +281,7 @@ def _task_agents(task_id: str) -> List[str]:
     task_data = _task_data(task_id)
     if not task_data:
         return []
-    return [a for r in task_data.get("resources", []) for a in r["agent_devices"]]
+    return [a for r in task_data.get("resources", []) for a in r["agentDevices"]]
 
 
 @pytest.mark.e2e_cpu_2a

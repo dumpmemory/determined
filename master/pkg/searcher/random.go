@@ -46,7 +46,7 @@ func newSingleSearch(config expconf.SingleConfig) SearchMethod {
 			RawMaxTrials:           ptrs.Ptr(1),
 			RawMaxLength:           ptrs.Ptr(config.MaxLength()),
 			RawMaxConcurrentTrials: ptrs.Ptr(1),
-		}).(expconf.RandomConfig),
+		}),
 		randomSearchState: randomSearchState{
 			SearchMethodType: SingleSearch,
 		},
@@ -72,7 +72,8 @@ func (s *randomSearch) initialOperations(ctx context) ([]Operation, error) {
 
 func (s *randomSearch) progress(
 	trialProgress map[model.RequestID]PartialUnits,
-	trialsClosed map[model.RequestID]bool) float64 {
+	trialsClosed map[model.RequestID]bool,
+) float64 {
 	if s.MaxConcurrentTrials() > 0 && s.PendingTrials > s.MaxConcurrentTrials() {
 		panic("pending trials is greater than max_concurrent_trials")
 	}
@@ -102,14 +103,10 @@ func (s *randomSearch) trialExitedEarly(
 	s.PendingTrials--
 	if s.SearchMethodType == RandomSearch {
 		if exitedReason == model.InvalidHP || exitedReason == model.InitInvalidHP {
-			var ops []Operation
-			create := NewCreate(ctx.rand, sampleAll(ctx.hparams, ctx.rand), model.TrialWorkloadSequencerType)
-			ops = append(ops, create)
-			ops = append(ops, NewValidateAfter(create.RequestID, s.MaxLength().Units))
-			ops = append(ops, NewClose(create.RequestID))
-			// We don't increment CreatedTrials here because this trial is replacing the invalid trial.
-			s.PendingTrials++
-			return ops, nil
+			// We decrement CreatedTrials here because this trial is replacing the invalid trial.
+			// It will be created by trialClosed when the close is received for this trial.
+			s.CreatedTrials--
+			return nil, nil
 		}
 	}
 	return nil, nil
@@ -128,6 +125,7 @@ func (s *randomSearch) trialClosed(ctx context, requestID model.RequestID) ([]Op
 	}
 	return ops, nil
 }
+
 func (s *randomSearch) Snapshot() (json.RawMessage, error) {
 	return json.Marshal(s.randomSearchState)
 }

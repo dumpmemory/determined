@@ -13,7 +13,6 @@ from torch.optim.lr_scheduler import _LRScheduler
 from torch.optim.optimizer import Optimizer
 from typing_extensions import Literal
 
-from determined.common import check
 from determined.errors import InvalidModelException
 from determined.monkey_patch import monkey_patch
 from determined.pytorch import (
@@ -23,7 +22,6 @@ from determined.pytorch import (
     PyTorchTrial,
     PyTorchTrialContext,
 )
-from determined.tensorboard.metric_writers import pytorch
 from determined.util import filter_duplicates, has_param
 
 TorchData = Union[Dict[str, torch.Tensor], Sequence[torch.Tensor], torch.Tensor]
@@ -58,9 +56,7 @@ def check_compatibility(lm: pl.LightningModule) -> None:
     }
 
     members = inspect.getmembers(lm, predicate=inspect.ismethod)
-    overridden_members = set(
-        map(lambda m: m[0], filter(lambda m: is_overridden(m[0], lm), members))
-    )
+    overridden_members = {m[0] for m in members if is_overridden(m[0], lm)}
 
     matches = unsupported_members & overridden_members
     if len(matches) > 0:
@@ -81,7 +77,7 @@ def check_compatibility(lm: pl.LightningModule) -> None:
 
 
 def override_unsupported_nud(lm: pl.LightningModule, context: PyTorchTrialContext) -> None:
-    writer = pytorch.TorchWriter()
+    writer = context.get_tensorboard_writer()
 
     def lm_print(*args: Any, **kwargs: Any) -> None:
         if context.distributed.get_rank() == 0:
@@ -132,7 +128,7 @@ class LightningAdapter(PyTorchTrial):
         lightning_module: pl.LightningModule,
         precision: Union[Literal[32], Literal[16]] = 32,
         amp_backend: Union[Literal["native"], Literal["apex"]] = "native",
-        amp_level: Union[Literal["O0", "O1", "O2", "O3"]] = "O2",
+        amp_level: Literal["O0", "O1", "O2", "O3"] = "O2",
     ):
         """
         This performs the necessary initialization steps to:
@@ -172,8 +168,12 @@ class LightningAdapter(PyTorchTrial):
 
         """
 
-        check.check_in(precision, {16, 32}, "only precisions 16 & 32 are supported.")
-        check.check_in(amp_backend, {"native", "apex"}, 'only "native", and "apex" are supported')
+        if precision not in {16, 32}:
+            raise ValueError(f"Only precisions 16 & 32 are supported; got {precision}.")
+        if amp_backend not in {"native", "apex"}:
+            raise ValueError(
+                f'Only "native" and "apex" AMP-backends are supported; got "{amp_backend}"'
+            )
 
         check_compatibility(lightning_module)
         override_unsupported_nud(lightning_module, context)
@@ -290,7 +290,7 @@ class LightningAdapter(PyTorchTrial):
             if wrapped_opt is None:
                 raise InvalidModelException(
                     "An LRScheduler is returned in `configure_optimizers` without having "
-                    "returned the optimizer itself. Please follow PyTorchLightning's documenation"
+                    "returned the optimizer itself. Please follow PyTorchLightning's documentation"
                     "to make sure you're returning one of the expected values."
                     "- Single optimizer.\n"
                     "- List or Tuple - List of optimizers.\n"
@@ -301,12 +301,11 @@ class LightningAdapter(PyTorchTrial):
                     "- Tuple of dictionaries as described, with an optional ‘frequency’ key.\n"
                 )
 
-            check.check_isinstance(
-                lrs["scheduler"].optimizer,
-                Optimizer,
-                "A returned LRScheduler from `configure_optimizers` is "
-                "missing the optimizer attribute.",
-            )
+            if not isinstance(lrs["scheduler"].optimizer, Optimizer):
+                raise TypeError(
+                    "A returned LRScheduler from `configure_optimizers` has an optimizer with the "
+                    f"wrong type: got {type(lrs['scheduler'].optimizer).__name__}."
+                )
 
             # switch the user's unwrapped optimizer with the wrapped version.
             lrs["scheduler"].optimizer = wrapped_opt
@@ -412,7 +411,7 @@ class LightningAdapter(PyTorchTrial):
 
     def evaluate_batch(self, batch: TorchData, batch_idx: int) -> Dict[str, Any]:
         """
-        evaluate_batch implements the evalute_batch interface from PyTorchTrial using user provided
+        evaluate_batch implements the evaluate_batch interface from PyTorchTrial using user provided
         lightning_module.
 
         """

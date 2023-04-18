@@ -1,20 +1,18 @@
+import { Observable, useObservable } from 'micro-observables';
 import queryString from 'query-string';
 import { useCallback } from 'react';
-import { useLocation } from 'react-router';
+import { useLocation } from 'react-router-dom';
 
-import { AUTH_COOKIE_KEY, StoreAction, useStore, useStoreDispatch } from 'contexts/Store';
 import { globalStorage } from 'globalStorage';
 import { routeAll } from 'routes/utils';
-import { getCurrentUser, isAuthFailure } from 'services/api';
 import { updateDetApi } from 'services/apiConfig';
-import { isAborted } from 'services/utils';
+import authStore, { AUTH_COOKIE_KEY } from 'stores/auth';
+import determinedStore from 'stores/determinedInfo';
 import { getCookie } from 'utils/browser';
-import handleError, { ErrorType } from 'utils/error';
 
-const useAuthCheck = (canceler: AbortController): (() => void) => {
-  const { info } = useStore();
+const useAuthCheck = (): (() => void) => {
+  const info = useObservable(determinedStore.info);
   const location = useLocation();
-  const storeDispatch = useStoreDispatch();
 
   const updateBearerToken = useCallback((token: string) => {
     globalStorage.authToken = token;
@@ -25,9 +23,9 @@ const useAuthCheck = (canceler: AbortController): (() => void) => {
     const redirect = encodeURIComponent(window.location.href);
     const authUrl = `${info.externalLoginUri}?redirect=${redirect}`;
     routeAll(authUrl);
-  }, [ info.externalLoginUri ]);
+  }, [info.externalLoginUri]);
 
-  const checkAuth = useCallback(async (): Promise<void> => {
+  const checkAuth = useCallback((): void => {
     /*
      * Check for the auth token from the following sources:
      *   1 - query param jwt from external authentication.
@@ -44,49 +42,20 @@ const useAuthCheck = (canceler: AbortController): (() => void) => {
      * If an external login URL is provided, redirect there.
      * Otherwise mark that we checked the auth and skip auth token validation.
      */
+
     if (authToken) {
       updateBearerToken(authToken);
 
-      try {
-        const user = await getCurrentUser({ signal: canceler.signal });
-        storeDispatch({
-          type: StoreAction.SetAuth,
-          value: { isAuthenticated: true, token: authToken, user },
-        });
-      } catch (e) {
-        if (isAborted(e)) return;
-
-        const isAuthError = isAuthFailure(e, !!info.externalLoginUri);
-        handleError(e, {
-          isUserTriggered: false,
-          publicMessage: 'Unable to verify current user.',
-          publicSubject: 'GET user failed',
-          silent: true,
-          type: isAuthError ? ErrorType.Auth : ErrorType.Server,
-        });
-
-        if (isAuthError) {
-          updateDetApi({ apiKey: undefined });
-          storeDispatch({ type: StoreAction.ResetAuth });
-
-          if (info.externalLoginUri) redirectToExternalSignin();
-        }
-      } finally {
-        storeDispatch({ type: StoreAction.SetAuthCheck });
-      }
+      Observable.batch(() => {
+        authStore.setAuth({ isAuthenticated: true, token: authToken });
+        authStore.setAuthChecked();
+      });
     } else if (info.externalLoginUri) {
       redirectToExternalSignin();
     } else {
-      storeDispatch({ type: StoreAction.SetAuthCheck });
+      authStore.setAuthChecked();
     }
-  }, [
-    canceler,
-    info.externalLoginUri,
-    location.search,
-    redirectToExternalSignin,
-    storeDispatch,
-    updateBearerToken,
-  ]);
+  }, [info.externalLoginUri, location.search, redirectToExternalSignin, updateBearerToken]);
 
   return checkAuth;
 };

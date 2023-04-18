@@ -25,10 +25,6 @@ official_examples = [
         "computer_vision/mnist_estimator/const.yaml",
     ),
     (
-        "computer_vision/mnist_tf_layers",
-        "computer_vision/mnist_tf_layers/const.yaml",
-    ),
-    (
         "computer_vision/cifar10_tf_keras",
         "computer_vision/cifar10_tf_keras/const.yaml",
     ),
@@ -45,16 +41,12 @@ official_examples = [
         "gan/dcgan_tf_keras/const.yaml",
     ),
     (
+        "gan/pix2pix_tf_keras",
+        "gan/pix2pix_tf_keras/const.yaml",
+    ),
+    (
         "decision_trees/gbt_titanic_estimator",
         "decision_trees/gbt_titanic_estimator/const.yaml",
-    ),
-    (
-        "features/data_layer_mnist_estimator",
-        "features/data_layer_mnist_estimator/const.yaml",
-    ),
-    (
-        "features/data_layer_mnist_tf_keras",
-        "features/data_layer_mnist_tf_keras/const.yaml",
     ),
     (
         "features/custom_reducers_mnist_pytorch",
@@ -65,6 +57,8 @@ official_examples = [
 
 @pytest.mark.parametrize("model_def,config_file", official_examples)
 def test_official(model_def: str, config_file: str) -> None:
+    if "gbt_titanic_estimator" in model_def:
+        pytest.skip("# TODO [MLG-442], see comment in {model_def}")
     examples_dir = pathlib.Path(__file__).parent.parent
     model_def_absolute = examples_dir.joinpath(model_def)
     config_file_absolute = examples_dir.joinpath(config_file)

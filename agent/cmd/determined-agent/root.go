@@ -5,17 +5,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-type options struct {
+type cobraOpts struct {
 	logLevel string
 	noColor  bool
 }
 
-var (
-	version = "dev"
-)
+var version = "dev"
 
 func newRootCmd() *cobra.Command {
-	opts := options{}
+	opts := cobraOpts{}
 
 	cmd := &cobra.Command{
 		Use:     "determined-agent",
@@ -38,7 +36,8 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 
-	cmd.PersistentFlags().StringVarP(&opts.logLevel, "log-level", "l", "info",
+	// TODO(DET-8884): Configure log level through agent config file.
+	cmd.PersistentFlags().StringVarP(&opts.logLevel, "log-level", "l", "trace",
 		"set the logging level (can be one of: debug, info, warn, error, or fatal)")
 	cmd.PersistentFlags().BoolVar(&opts.noColor, "no-color", false, "disable colored output")
 

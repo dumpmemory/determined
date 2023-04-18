@@ -63,14 +63,10 @@ class MMDetTrial(det_torch.PyTorchTrial):
 
         # Build model and make sure it's compatible with horovod.
         self.model = mmdet.models.build_detector(self.cfg.model)
-        # We need to monkey patch the reduce_mean function from mmdet.core.utils so that it uses
-        # horovod's allreduce primitive instead of pytorch distributed's all_reduce function.
-        utils.monkey_patch_reduce_mean(self.model)
-        # We need to convert pytorch SyncBatchNorm layers to horovod's.
-        utils.convert_syncbn_model(self.model)
 
         # Initialize model
         self.model.init_weights()
+
         # If use_pretrained, try loading pretrained weights for the mmcv config if available.
         if self.hparams.use_pretrained:
             ckpt_path, ckpt = utils.get_pretrained_ckpt_path("/tmp", self.hparams.config_file)
@@ -103,7 +99,7 @@ class MMDetTrial(det_torch.PyTorchTrial):
 
         # mmdet sets loggers in the package that interrupt with Determined logging.
         # We reset the root logger after mmdet models are initialized.
-        set_logger(bool(self.context.env.experiment_config.get("debug", False)))
+        set_logger(bool(self.context.get_experiment_config().get("debug", False)))
 
     def build_mmdet_config(self) -> mmcv.Config:
         """
@@ -161,9 +157,7 @@ class MMDetTrial(det_torch.PyTorchTrial):
 
     def build_callbacks(self) -> Dict[str, det_torch.PyTorchCallback]:
         self.lr_updater = None
-        hooks = {
-            "eval_callback": callbacks.EvalCallback(self.context, self.model)
-        }  # type: Dict[str, det_torch.PyTorchCallback]
+        hooks = {}  # type: Dict[str, det_torch.PyTorchCallback]
         if "lr_config" in self.cfg:
             logging.info("Adding lr updater callback.")
             self.lr_updater = callbacks.LrUpdaterCallback(

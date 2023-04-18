@@ -78,6 +78,13 @@ gobin
 
 # MacOS system files
 *.DS_Store
+.dccache
 
 # Hydra output
 model_hub/examples/mmdetection/hydra/outputs
+
+# junit test results
+*.junit.xml
+
+# go workspace sum file
+go.work.sum

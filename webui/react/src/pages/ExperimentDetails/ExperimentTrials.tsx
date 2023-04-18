@@ -1,97 +1,157 @@
-import { Button, Tooltip } from 'antd';
-import { FilterDropdownProps, SorterResult } from 'antd/es/table/interface';
+import { Dropdown, TablePaginationConfig } from 'antd';
+import type { MenuProps } from 'antd';
+import { FilterDropdownProps, FilterValue, SorterResult } from 'antd/es/table/interface';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
-import ActionDropdown from 'components/ActionDropdown';
 import Badge, { BadgeType } from 'components/Badge';
-import CheckpointModal from 'components/CheckpointModal';
+import CheckpointModalTrigger from 'components/CheckpointModalTrigger';
 import HumanReadableNumber from 'components/HumanReadableNumber';
-import Icon from 'components/Icon';
 import Link from 'components/Link';
-import ResponsiveTable from 'components/ResponsiveTable';
-import tableCss from 'components/ResponsiveTable.module.scss';
 import Section from 'components/Section';
-import { defaultRowClassName, getFullPaginationConfig } from 'components/Table';
-import { Renderer } from 'components/Table';
-import TableBatch from 'components/TableBatch';
-import TableFilterDropdown from 'components/TableFilterDropdown';
+import InteractiveTable, { InteractiveTableSettings } from 'components/Table/InteractiveTable';
+import { Renderer } from 'components/Table/Table';
+import { defaultRowClassName, getFullPaginationConfig } from 'components/Table/Table';
+import TableBatch from 'components/Table/TableBatch';
+import TableFilterDropdown from 'components/Table/TableFilterDropdown';
 import { terminalRunStates } from 'constants/states';
-import usePolling from 'hooks/usePolling';
-import useSettings from 'hooks/useSettings';
-import { paths, routeToReactUrl } from 'routes/utils';
+import useModalHyperparameterSearch from 'hooks/useModal/HyperparameterSearch/useModalHyperparameterSearch';
+import usePermissions from 'hooks/usePermissions';
+import { UpdateSettings, useSettings } from 'hooks/useSettings';
+import { paths } from 'routes/utils';
 import { getExpTrials, openOrCreateTensorBoard } from 'services/api';
-import {
-  Determinedexperimentv1State, V1GetExperimentTrialsRequestSortBy,
-} from 'services/api-ts-sdk';
+import { Experimentv1State, V1GetExperimentTrialsRequestSortBy } from 'services/api-ts-sdk';
 import { encodeExperimentState } from 'services/decoder';
-import { validateDetApiEnum, validateDetApiEnumList } from 'services/utils';
+import ActionDropdown from 'shared/components/ActionDropdown/ActionDropdown';
+import usePolling from 'shared/hooks/usePolling';
+import { ValueOf } from 'shared/types';
+import { ErrorLevel, ErrorType } from 'shared/utils/error';
+import { routeToReactUrl } from 'shared/utils/routes';
+import { validateDetApiEnum, validateDetApiEnumList } from 'shared/utils/service';
+import { humanReadableBytes } from 'shared/utils/string';
 import {
-  ExperimentAction as Action, CheckpointWorkloadExtended, CommandTask, ExperimentBase,
-  RunState, TrialItem,
+  ExperimentAction as Action,
+  CheckpointWorkloadExtended,
+  CommandResponse,
+  ExperimentBase,
+  MetricsWorkload,
+  RunState,
+  TrialItem,
 } from 'types';
-import handleError, { ErrorLevel, ErrorType } from 'utils/error';
+import handleError from 'utils/error';
 import { getMetricValue } from 'utils/metric';
-import { openCommand } from 'wait';
+import { openCommandResponse } from 'utils/wait';
 
 import css from './ExperimentTrials.module.scss';
-import settingsConfig, { Settings } from './ExperimentTrials.settings';
+import {
+  configForExperiment,
+  DEFAULT_COLUMNS,
+  isOfSortKey,
+  Settings,
+} from './ExperimentTrials.settings';
 import { columns as defaultColumns } from './ExperimentTrials.table';
 import TrialsComparisonModal from './TrialsComparisonModal';
 
 interface Props {
   experiment: ExperimentBase;
+  pageRef: React.RefObject<HTMLElement>;
 }
 
-enum TrialAction {
-  OpenTensorBoard = 'Open Tensorboard',
-  ViewLogs = 'View Logs',
-}
+const TrialAction = {
+  HyperparameterSearch: 'Hyperparameter Search',
+  OpenTensorBoard: 'Open Tensorboard',
+  ViewLogs: 'View Logs',
+} as const;
 
-const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
-  const [ total, setTotal ] = useState(0);
-  const [ activeCheckpoint, setActiveCheckpoint ] = useState<CheckpointWorkloadExtended>();
-  const [ showCheckpoint, setShowCheckpoint ] = useState(false);
-  const [ isLoading, setIsLoading ] = useState(true);
-  const [ trials, setTrials ] = useState<TrialItem[]>();
-  const [ canceler ] = useState(new AbortController());
+type TrialAction = ValueOf<typeof TrialAction>;
 
-  const { settings, updateSettings } = useSettings<Settings>(settingsConfig);
+const ExperimentTrials: React.FC<Props> = ({ experiment, pageRef }: Props) => {
+  const [total, setTotal] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  const [trials, setTrials] = useState<TrialItem[]>();
+  const [canceler] = useState(new AbortController());
+
+  const config = useMemo(() => configForExperiment(experiment.id), [experiment.id]);
+  const { settings, updateSettings } = useSettings<Settings>(config);
+
+  const workspace = { id: experiment.workspaceId };
+  const { canCreateExperiment, canViewExperimentArtifacts } = usePermissions();
+  const canHparam = canCreateExperiment({ workspace }) && canViewExperimentArtifacts({ workspace });
+
+  const {
+    contextHolder: modalHyperparameterSearchContextHolder,
+    modalOpen: openModalHyperparameterSearch,
+  } = useModalHyperparameterSearch({ experiment });
 
   const clearSelected = useCallback(() => {
     updateSettings({ row: undefined });
-  }, [ updateSettings ]);
+  }, [updateSettings]);
 
-  const handleStateFilterApply = useCallback((states: string[]) => {
-    updateSettings({
-      row: undefined,
-      state: states.length !== 0 ? states as RunState[] : undefined,
-    });
-  }, [ updateSettings ]);
+  const handleStateFilterApply = useCallback(
+    (states: string[]) => {
+      updateSettings({
+        row: undefined,
+        state: states.length !== 0 ? (states as RunState[]) : undefined,
+      });
+    },
+    [updateSettings],
+  );
 
   const handleStateFilterReset = useCallback(() => {
     updateSettings({ row: undefined, state: undefined });
-  }, [ updateSettings ]);
+  }, [updateSettings]);
 
-  const stateFilterDropdown = useCallback((filterProps: FilterDropdownProps) => (
-    <TableFilterDropdown
-      {...filterProps}
-      multiple
-      values={settings.state}
-      onFilter={handleStateFilterApply}
-      onReset={handleStateFilterReset}
-    />
-  ), [ handleStateFilterApply, handleStateFilterReset, settings.state ]);
+  const stateFilterDropdown = useCallback(
+    (filterProps: FilterDropdownProps) => {
+      return (
+        <TableFilterDropdown
+          {...filterProps}
+          multiple
+          values={settings.state}
+          onFilter={handleStateFilterApply}
+          onReset={handleStateFilterReset}
+        />
+      );
+    },
+    [handleStateFilterApply, handleStateFilterReset, settings.state],
+  );
 
-  const dropDownOnTrigger = useCallback((trial: TrialItem) => {
-    return {
-      [TrialAction.OpenTensorBoard]: async () => {
-        openCommand(await openOrCreateTensorBoard({ trialIds: [ trial.id ] }));
-      },
-      [TrialAction.ViewLogs]: () => {
-        routeToReactUrl(paths.trialLogs(trial.id, experiment.id));
-      },
-    };
-  }, [ experiment.id ]);
+  const handleOpenTensorBoard = useCallback(
+    async (trial: TrialItem) => {
+      openCommandResponse(
+        await openOrCreateTensorBoard({ trialIds: [trial.id], workspaceId: workspace.id }),
+      );
+    },
+    [workspace.id],
+  );
+
+  const handleViewLogs = useCallback(
+    (trial: TrialItem) => {
+      routeToReactUrl(paths.trialLogs(trial.id, experiment.id));
+    },
+    [experiment.id],
+  );
+
+  const handleHyperparameterSearch = useCallback(
+    (trial: TrialItem) => {
+      openModalHyperparameterSearch({ trial });
+    },
+    [openModalHyperparameterSearch],
+  );
+
+  const dropDownOnTrigger = useCallback(
+    (trial: TrialItem) => {
+      const opts: Partial<Record<TrialAction, () => Promise<void> | void>> = {
+        [TrialAction.OpenTensorBoard]: () => handleOpenTensorBoard(trial),
+        [TrialAction.ViewLogs]: () => handleViewLogs(trial),
+        [TrialAction.HyperparameterSearch]: () => handleHyperparameterSearch(trial),
+      };
+      if (!canHparam) {
+        delete opts[TrialAction.HyperparameterSearch];
+      }
+      return opts;
+    },
+    [canHparam, handleHyperparameterSearch, handleOpenTensorBoard, handleViewLogs],
+  );
 
   const columns = useMemo(() => {
     const { metric } = experiment.config?.searcher || {};
@@ -102,10 +162,25 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
       </Link>
     );
 
-    const validationRenderer = (key: string) => {
-      return function renderer (_: string, record: TrialItem): React.ReactNode {
-        /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
-        const value = getMetricValue((record as any)[key], metric);
+    const autoRestartsRenderer = (_: string, record: TrialItem): React.ReactNode => {
+      const maxRestarts = experiment.config.maxRestarts ?? 0;
+      const className = record.autoRestarts ? css.hasRestarts : undefined;
+      return (
+        <span className={className}>
+          {record.autoRestarts}
+          {maxRestarts ? `/${maxRestarts}` : ''}
+        </span>
+      );
+    };
+
+    const validationRenderer = (key: keyof TrialItem) => {
+      return function renderer(_: string, record: TrialItem): React.ReactNode {
+        const hasMetric = (obj: TrialItem[keyof TrialItem]): obj is MetricsWorkload => {
+          return !!obj && typeof obj === 'object' && 'metrics' in obj;
+        };
+
+        const item: TrialItem[keyof TrialItem] = record[key];
+        const value = getMetricValue(hasMetric(item) ? item : undefined, metric);
         return <HumanReadableNumber num={value} />;
       };
     };
@@ -118,13 +193,11 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
         trialId: record.id,
       };
       return (
-        <Tooltip title="View Checkpoint">
-          <Button
-            aria-label="View Checkpoint"
-            icon={<Icon name="checkpoint" />}
-            onClick={e => handleCheckpointShow(e, checkpoint)}
-          />
-        </Tooltip>
+        <CheckpointModalTrigger
+          checkpoint={checkpoint}
+          experiment={experiment}
+          title={`Best Checkpoint for Trial ${checkpoint.trialId}`}
+        />
       );
     };
 
@@ -132,15 +205,17 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
       <ActionDropdown<TrialAction>
         actionOrder={[
           TrialAction.OpenTensorBoard,
+          TrialAction.HyperparameterSearch,
           TrialAction.ViewLogs,
         ]}
         id={experiment.id + ''}
         kind="experiment"
+        onError={handleError}
         onTrigger={dropDownOnTrigger(record)}
       />
     );
 
-    const newColumns = [ ...defaultColumns ].map(column => {
+    const newColumns = [...defaultColumns].map((column) => {
       column.sortOrder = null;
       if (column.key === 'checkpoint') {
         column.render = checkpointRenderer;
@@ -152,14 +227,19 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
         column.render = validationRenderer('latestValidationMetric');
       } else if (column.key === V1GetExperimentTrialsRequestSortBy.STATE) {
         column.filterDropdown = stateFilterDropdown;
-        column.onHeaderCell = () => settings.state ? { className: tableCss.headerFilterOn } : {},
-        column.filters = ([ 'ACTIVE', 'CANCELED', 'COMPLETED', 'ERROR' ] as RunState[])
-          .map((value) => ({
+        column.isFiltered = (settings) => !!(settings as Settings).state;
+        column.filters = (['ACTIVE', 'CANCELED', 'COMPLETED', 'ERROR'] as RunState[]).map(
+          (value) => ({
             text: <Badge state={value} type={BadgeType.State} />,
             value,
-          }));
+          }),
+        );
+      } else if (column.key === V1GetExperimentTrialsRequestSortBy.RESTARTS) {
+        column.render = autoRestartsRenderer;
       } else if (column.key === 'actions') {
         column.render = actionRenderer;
+      } else if (column.key === V1GetExperimentTrialsRequestSortBy.CHECKPOINTSIZE) {
+        column.render = (value: number) => (value ? humanReadableBytes(value) : '');
       }
       if (column.key === settings.sortKey) {
         column.sortOrder = settings.sortDesc ? 'descend' : 'ascend';
@@ -168,39 +248,40 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
     });
 
     return newColumns;
-  }, [ experiment.config, experiment.id, settings, stateFilterDropdown, dropDownOnTrigger ]);
+  }, [experiment, settings, stateFilterDropdown, dropDownOnTrigger]);
 
-  const handleTableChange = useCallback((tablePagination, tableFilters, tableSorter) => {
-    if (Array.isArray(tableSorter)) return;
+  const handleTableChange = useCallback(
+    (
+      tablePagination: TablePaginationConfig,
+      tableFilters: Record<string, FilterValue | null>,
+      tableSorter: SorterResult<TrialItem> | SorterResult<TrialItem>[],
+    ) => {
+      if (Array.isArray(tableSorter) || !settings) return;
 
-    const { columnKey, order } = tableSorter as SorterResult<TrialItem>;
-    if (!columnKey || !columns.find(column => column.key === columnKey)) return;
+      const { columnKey, order } = tableSorter as SorterResult<TrialItem>;
+      if (!columnKey || !columns.find((column) => column.key === columnKey)) return;
 
-    const newSettings = {
-      sortDesc: order === 'descend',
-      /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
-      sortKey: columnKey as any,
-      tableLimit: tablePagination.pageSize,
-      tableOffset: (tablePagination.current - 1) * tablePagination.pageSize,
-    };
-    const shouldPush = settings.tableOffset !== newSettings.tableOffset;
-    updateSettings(newSettings, shouldPush);
-  }, [ columns, settings.tableOffset, updateSettings ]);
+      const newSettings = {
+        sortDesc: order === 'descend',
+        sortKey: isOfSortKey(columnKey)
+          ? columnKey
+          : V1GetExperimentTrialsRequestSortBy.UNSPECIFIED,
+        tableLimit: tablePagination.pageSize,
+        tableOffset: ((tablePagination.current ?? 1) - 1) * (tablePagination.pageSize ?? 0),
+      };
+      updateSettings(newSettings);
+    },
+    [columns, settings, updateSettings],
+  );
 
-  const handleCheckpointShow = (
-    event: React.MouseEvent,
-    checkpoint: CheckpointWorkloadExtended,
-  ) => {
-    event.stopPropagation();
-    setActiveCheckpoint(checkpoint);
-    setShowCheckpoint(true);
-  };
-
-  const handleCheckpointDismiss = useCallback(() => setShowCheckpoint(false), []);
-
+  const stateString = useMemo(() => settings.state?.join('.'), [settings.state]);
   const fetchExperimentTrials = useCallback(async () => {
+    if (!settings) return;
+
     try {
-      const states = (settings.state || []).map(state => encodeExperimentState(state as RunState));
+      const states = stateString
+        ?.split('.')
+        .map((state) => encodeExperimentState(state as RunState));
       const { trials: experimentTrials, pagination: responsePagination } = await getExpTrials(
         {
           id: experiment.id,
@@ -208,7 +289,7 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
           offset: settings.tableOffset,
           orderBy: settings.sortDesc ? 'ORDER_BY_DESC' : 'ORDER_BY_ASC',
           sortBy: validateDetApiEnum(V1GetExperimentTrialsRequestSortBy, settings.sortKey),
-          states: validateDetApiEnumList(Determinedexperimentv1State, states),
+          states: validateDetApiEnumList(Experimentv1State, states),
         },
         { signal: canceler.signal },
       );
@@ -223,82 +304,133 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
       });
       setIsLoading(false);
     }
-  }, [
-    experiment.id,
-    canceler,
-    settings.sortDesc,
-    settings.sortKey,
-    settings.state,
-    settings.tableLimit,
-    settings.tableOffset,
-  ]);
+  }, [experiment.id, canceler, settings, stateString]);
 
-  const sendBatchActions = useCallback(async (action: Action) => {
-    if (action === Action.OpenTensorBoard) {
-      return await openOrCreateTensorBoard({ trialIds: settings.row });
-    } else if (action === Action.CompareTrials) {
-      return updateSettings({ compare: true });
-    }
-  }, [ settings.row, updateSettings ]);
+  const sendBatchActions = useCallback(
+    async (action: Action) => {
+      if (!settings.row) return;
 
-  const submitBatchAction = useCallback(async (action: Action) => {
-    try {
-      const result = await sendBatchActions(action);
-      if (action === Action.OpenTensorBoard && result) {
-        openCommand(result as CommandTask);
+      if (action === Action.OpenTensorBoard) {
+        return await openOrCreateTensorBoard({ trialIds: settings.row, workspaceId: workspace.id });
+      } else if (action === Action.CompareTrials) {
+        return updateSettings({ compare: true });
       }
+    },
+    [settings.row, updateSettings, workspace.id],
+  );
 
-      // Refetch experiment list to get updates based on batch action.
-      await fetchExperimentTrials();
-    } catch (e) {
-      const publicSubject = action === Action.OpenTensorBoard ?
-        'Unable to View TensorBoard for Selected Trials' :
-        `Unable to ${action} Selected Trials`;
-      handleError(e, {
-        level: ErrorLevel.Error,
-        publicMessage: 'Please try again later.',
-        publicSubject,
-        silent: false,
-        type: ErrorType.Server,
-      });
-    }
-  }, [ fetchExperimentTrials, sendBatchActions ]);
+  const submitBatchAction = useCallback(
+    async (action: Action) => {
+      try {
+        const result = await sendBatchActions(action);
+        if (action === Action.OpenTensorBoard && result) {
+          openCommandResponse(result as CommandResponse);
+        }
 
-  const { stopPolling } = usePolling(fetchExperimentTrials);
+        // Refetch experiment list to get updates based on batch action.
+        await fetchExperimentTrials();
+      } catch (e) {
+        const publicSubject =
+          action === Action.OpenTensorBoard
+            ? 'Unable to View TensorBoard for Selected Trials'
+            : `Unable to ${action} Selected Trials`;
+        handleError(e, {
+          level: ErrorLevel.Error,
+          publicMessage: 'Please try again later.',
+          publicSubject,
+          silent: false,
+          type: ErrorType.Server,
+        });
+      }
+    },
+    [fetchExperimentTrials, sendBatchActions],
+  );
+
+  const { stopPolling } = usePolling(fetchExperimentTrials, { rerunOnNewFn: true });
 
   // Get new trials based on changes to the pagination, sorter and filters.
   useEffect(() => {
-    fetchExperimentTrials();
     setIsLoading(true);
-  }, [
-    fetchExperimentTrials,
-    settings.sortDesc,
-    settings.sortKey,
-    settings.state,
-    settings.tableLimit,
-    settings.tableOffset,
-  ]);
+    fetchExperimentTrials();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (terminalRunStates.has(experiment.state)) stopPolling({ terminateGracefully: true });
-  }, [ experiment.state, stopPolling ]);
+  }, [experiment.state, stopPolling]);
 
   useEffect(() => {
     return () => canceler.abort();
-  }, [ canceler ]);
+  }, [canceler]);
 
-  const handleTableRowSelect = useCallback(rowKeys => {
-    updateSettings({ row: rowKeys });
-  }, [ updateSettings ]);
+  const handleTableRowSelect = useCallback(
+    (rowKeys: React.Key[]) => {
+      updateSettings({ row: rowKeys.map(Number) });
+    },
+    [updateSettings],
+  );
 
   const handleTrialCompareCancel = useCallback(() => {
     updateSettings({ compare: false });
-  }, [ updateSettings ]);
+  }, [updateSettings]);
 
-  const handleTrialUnselect = useCallback((trialId: number) => {
-    const trialIds = settings.row ? settings.row.filter(id => id !== trialId) : undefined;
-    updateSettings({ row: trialIds });
-  }, [ settings.row, updateSettings ]);
+  const handleTrialUnselect = useCallback(
+    (trialId: number) => {
+      const trialIds = settings.row ? settings.row.filter((id) => id !== trialId) : undefined;
+      updateSettings({ row: trialIds });
+    },
+    [settings.row, updateSettings],
+  );
+
+  const TrialActionDropdown = useCallback(
+    ({
+      record,
+      onVisibleChange,
+      children,
+    }: {
+      children: React.ReactNode;
+      onVisibleChange?: (visible: boolean) => void;
+      record: TrialItem;
+    }) => {
+      const MenuKey = {
+        HyperparameterSearch: 'hyperparameter-search',
+        OpenTensorboard: 'open-tensorboard',
+        ViewLogs: 'view-logs',
+      } as const;
+
+      const funcs = {
+        [MenuKey.OpenTensorboard]: () => {
+          handleOpenTensorBoard(record);
+        },
+        [MenuKey.HyperparameterSearch]: () => {
+          handleHyperparameterSearch(record);
+        },
+        [MenuKey.ViewLogs]: () => {
+          handleViewLogs(record);
+        },
+      };
+
+      const onItemClick: MenuProps['onClick'] = (e) => {
+        funcs[e.key as ValueOf<typeof MenuKey>]();
+      };
+
+      const menuItems = [
+        { key: MenuKey.OpenTensorboard, label: TrialAction.OpenTensorBoard },
+        { key: MenuKey.HyperparameterSearch, label: TrialAction.HyperparameterSearch },
+        { key: MenuKey.ViewLogs, label: TrialAction.ViewLogs },
+      ];
+
+      return (
+        <Dropdown
+          menu={{ items: menuItems, onClick: onItemClick }}
+          trigger={['contextMenu']}
+          onOpenChange={onVisibleChange}>
+          {children}
+        </Dropdown>
+      );
+    },
+    [handleHyperparameterSearch, handleOpenTensorBoard, handleViewLogs],
+  );
 
   return (
     <div className={css.base}>
@@ -309,17 +441,22 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
             { label: Action.CompareTrials, value: Action.CompareTrials },
           ]}
           selectedRowCount={(settings.row ?? []).length}
-          onAction={action => submitBatchAction(action as Action)}
+          onAction={(action) => submitBatchAction(action as Action)}
           onClear={clearSelected}
         />
-        <ResponsiveTable
+        <InteractiveTable
           columns={columns}
+          containerRef={pageRef}
+          ContextMenu={TrialActionDropdown}
           dataSource={trials}
           loading={isLoading}
-          pagination={getFullPaginationConfig({
-            limit: settings.tableLimit,
-            offset: settings.tableOffset,
-          }, total)}
+          pagination={getFullPaginationConfig(
+            {
+              limit: settings.tableLimit,
+              offset: settings.tableOffset,
+            },
+            total,
+          )}
           rowClassName={defaultRowClassName({ clickable: false })}
           rowKey="id"
           rowSelection={{
@@ -327,20 +464,13 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
             preserveSelectedRowKeys: true,
             selectedRowKeys: settings.row ?? [],
           }}
+          settings={{ ...settings, columns: DEFAULT_COLUMNS } as InteractiveTableSettings}
           showSorterTooltip={false}
           size="small"
+          updateSettings={updateSettings as UpdateSettings}
           onChange={handleTableChange}
         />
       </Section>
-      {activeCheckpoint && (
-        <CheckpointModal
-          checkpoint={activeCheckpoint}
-          config={experiment.config}
-          show={showCheckpoint}
-          title={`Best Checkpoint for Trial ${activeCheckpoint.trialId}`}
-          onHide={handleCheckpointDismiss}
-        />
-      )}
       {settings.compare && (
         <TrialsComparisonModal
           experiment={experiment}
@@ -350,6 +480,7 @@ const ExperimentTrials: React.FC<Props> = ({ experiment }: Props) => {
           onUnselect={handleTrialUnselect}
         />
       )}
+      {modalHyperparameterSearchContextHolder}
     </div>
   );
 };

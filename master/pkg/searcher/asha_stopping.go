@@ -2,6 +2,7 @@ package searcher
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 
@@ -71,7 +72,7 @@ func (r *rung) continueTraining(requestID model.RequestID, metric float64, divis
 	// Insert the new trial result in the appropriate place in the sorted list.
 	insertIndex := sort.Search(
 		len(r.Metrics),
-		func(i int) bool { return r.Metrics[i].Metric >= metric },
+		func(i int) bool { return float64(r.Metrics[i].Metric) >= metric },
 	)
 	// We will continue training if trial ranked in top 1/divisor for the rung or
 	// if there are fewere than divisor trials in the rung.
@@ -81,7 +82,7 @@ func (r *rung) continueTraining(requestID model.RequestID, metric float64, divis
 	copy(r.Metrics[insertIndex+1:], r.Metrics[insertIndex:])
 	r.Metrics[insertIndex] = trialMetric{
 		RequestID: requestID,
-		Metric:    metric,
+		Metric:    model.ExtendedFloat64(metric),
 		Promoted:  promoteNow,
 	}
 
@@ -120,26 +121,32 @@ func (s *asyncHalvingStoppingSearch) initialOperations(ctx context) ([]Operation
 }
 
 func (s *asyncHalvingStoppingSearch) trialCreated(
-	ctx context, requestID model.RequestID) ([]Operation, error) {
+	ctx context, requestID model.RequestID,
+) ([]Operation, error) {
 	s.Rungs[0].OutstandingTrials++
 	s.TrialRungs[requestID] = 0
 	return nil, nil
 }
 
 func (s *asyncHalvingStoppingSearch) trialClosed(
-	ctx context, requestID model.RequestID) ([]Operation, error) {
+	ctx context, requestID model.RequestID,
+) ([]Operation, error) {
 	s.TrialsCompleted++
 	s.ClosedTrials[requestID] = true
 	return nil, nil
 }
 
 func (s *asyncHalvingStoppingSearch) validationCompleted(
-	ctx context, requestID model.RequestID, metric float64,
+	ctx context, requestID model.RequestID, metric interface{}, op ValidateAfter,
 ) ([]Operation, error) {
-	if !s.SmallerIsBetter {
-		metric *= -1
+	value, ok := metric.(float64)
+	if !ok {
+		return nil, fmt.Errorf("unexpected metric type for ASHA built-in search method %v", value)
 	}
-	return s.promoteAsync(ctx, requestID, metric), nil
+	if !s.SmallerIsBetter {
+		value *= -1
+	}
+	return s.promoteAsync(ctx, requestID, value), nil
 }
 
 func (s *asyncHalvingStoppingSearch) promoteAsync(
@@ -158,7 +165,7 @@ func (s *asyncHalvingStoppingSearch) promoteAsync(
 		rung.Metrics = append(rung.Metrics,
 			trialMetric{
 				RequestID: requestID,
-				Metric:    metric,
+				Metric:    model.ExtendedFloat64(metric),
 			},
 		)
 
@@ -206,7 +213,8 @@ func (s *asyncHalvingStoppingSearch) promoteAsync(
 }
 
 func (s *asyncHalvingStoppingSearch) progress(
-	map[model.RequestID]PartialUnits, map[model.RequestID]bool) float64 {
+	map[model.RequestID]PartialUnits, map[model.RequestID]bool,
+) float64 {
 	allTrials := len(s.Rungs[0].Metrics)
 	// Give ourselves an overhead of 20% of maxTrials when calculating progress.
 	progress := float64(allTrials) / (1.2 * float64(s.MaxTrials()))

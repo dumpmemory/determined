@@ -7,6 +7,12 @@ variable "det_version_key" {
 variable "project_id" {
 }
 
+variable "disk_size" {
+}
+
+variable "disk_type" {
+}
+
 variable "environment_image" {
 }
 
@@ -76,9 +82,6 @@ variable "min_dynamic_agents" {
 variable "max_dynamic_agents" {
 }
 
-variable "static_agents" {
-}
-
 variable "preemptible" {
 }
 
@@ -137,4 +140,7 @@ variable "gpu_env_image" {
 }
 
 variable "master_config_template" {
+}
+
+variable "labels" {
 }

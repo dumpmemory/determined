@@ -1,4 +1,4 @@
-import { CheckpointState, WorkloadGroup } from 'types';
+import { CheckpointState, Step, WorkloadGroup } from 'types';
 
 import * as utils from './workload';
 
@@ -59,13 +59,6 @@ describe('Workload Utilities', () => {
     });
   });
 
-  describe('getBatchNumber', () => {
-    it('should return `batch` or `totalBatches` as batch count', () => {
-      expect(utils.getBatchNumber({ batch: 100 })).toBe(100);
-      expect(utils.getBatchNumber({ totalBatches: 100 })).toBe(100);
-    });
-  });
-
   describe('getWorkload', () => {
     it('should extract first available training workload', () => {
       expect(utils.getWorkload(WORKLOADS[0])).toStrictEqual(WORKLOADS[0].training);
@@ -104,9 +97,10 @@ describe('Workload Utilities', () => {
 
   describe('hasCheckpointStep', () => {
     it('should detect checkpoint from step', () => {
-      const step = {
+      const step: Step = {
         batchNum: 100,
         checkpoint: { state: CheckpointState.Active, totalBatches: 100 },
+        key: 'step',
         startTime: '2021-11-29T00:00:00Z',
         training: { totalBatches: 100 },
       };
@@ -114,30 +108,14 @@ describe('Workload Utilities', () => {
     });
 
     it('should reject step with deleted checkpoint', () => {
-      const step = {
+      const step: Step = {
         batchNum: 100,
         checkpoint: { state: CheckpointState.Deleted, totalBatches: 100 },
+        key: 'step',
         startTime: '2021-11-29T00:00:00Z',
         training: { totalBatches: 100 },
       };
       expect(utils.hasCheckpointStep(step)).toBe(false);
-    });
-  });
-
-  describe('isMetricsWorkload', () => {
-    it('should validate metric workload', () => {
-      const metricWorkload = { metrics: {}, totalBatches: 100 };
-      expect(utils.isMetricsWorkload(metricWorkload)).toBe(true);
-    });
-
-    it('should invalidate checkpoint workload', () => {
-      const checkpointWorkload = { state: CheckpointState.Active, totalBatches: 100, uuid: 'abc' };
-      expect(utils.isMetricsWorkload(checkpointWorkload)).toBe(false);
-    });
-
-    it('should invalidate unknown workload', () => {
-      const unknownWorkload = { totalBatches: 100 };
-      expect(utils.isMetricsWorkload(unknownWorkload)).toBe(false);
     });
   });
 

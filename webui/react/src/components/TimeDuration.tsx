@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 
-import { DURATION_UNIT_MEASURES, durationInEnglish } from 'utils/datetime';
+import { DURATION_UNIT_MEASURES, durationInEnglish } from 'shared/utils/datetime';
 
 interface Props {
   duration: number;
@@ -17,11 +17,9 @@ const TimeDuration: React.FC<Props> = ({ duration, units = 2 }: Props) => {
       unitMeasures: { ...DURATION_UNIT_MEASURES, ms: 1000 },
     };
     return durationInEnglish(duration, options);
-  }, [ duration, units ]);
+  }, [duration, units]);
 
-  return (
-    <div>{durationString}</div>
-  );
+  return <div>{durationString}</div>;
 };
 
 export default TimeDuration;

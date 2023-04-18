@@ -1,12 +1,17 @@
 import json
 import subprocess
+import tempfile
 
 import numpy as np
 import pytest
 
+from determined.common import yaml
+from determined.common.api import bindings
 from determined.experimental import Determined
+from tests import api_utils
 from tests import config as conf
 from tests import experiment as exp
+from tests.cluster.test_checkpoints import wait_for_gc_to_finish
 from tests.fixtures.metric_maker.metric_maker import structure_equal, structure_to_metrics
 
 
@@ -67,7 +72,7 @@ def test_metric_gathering() -> None:
     # Check validation metrics.
     validation_workloads = exp.workloads_with_validation(trials[0].workloads)
     for validation in validation_workloads:
-        actual = validation.metrics
+        actual = validation.metrics.avgMetrics
         batches_trained = validation.totalBatches
 
         value = base_value + batches_trained
@@ -112,7 +117,7 @@ def test_nan_metrics() -> None:
     # Check validation metrics.
     validation_workloads = exp.workloads_with_validation(trials[0].workloads)
     for validation in validation_workloads:
-        actual = validation.metrics
+        actual = validation.metrics.avgMetrics
         batches_trained = validation.totalBatches
         expected = structure_to_metrics(base_value, validation_structure)
         assert structure_equal(expected, actual)
@@ -246,13 +251,15 @@ def test_end_to_end_adaptive() -> None:
         None,
     )
 
+    wait_for_gc_to_finish(experiment_id=exp_id)
+
     # Check that validation accuracy look sane (more than 93% on MNIST).
     trials = exp.experiment_trials(exp_id)
     best = None
     for trial in trials:
         assert len(trial.workloads) > 0
         last_validation = exp.workloads_with_validation(trial.workloads)[-1]
-        accuracy = last_validation.metrics["accuracy"]
+        accuracy = last_validation.metrics.avgMetrics["accuracy"]
         if not best or accuracy > best:
             best = accuracy
 
@@ -276,10 +283,12 @@ def test_end_to_end_adaptive() -> None:
     assert top_2_uuids == top_k_uuids[:2]
 
     # Check that metrics are truly in sorted order.
-    try:
-        metrics = [c.validation["metrics"]["validationMetrics"]["validation_loss"] for c in top_k]
-    except Exception:
-        metrics = [c.validation["metrics"]["validation_loss"] for c in top_k]
+    assert all(c.training is not None for c in top_k)
+    metrics = [
+        c.training.validation_metrics["avgMetrics"]["validation_loss"]
+        for c in top_k
+        if c.training is not None
+    ]
 
     assert metrics == sorted(metrics)
 
@@ -295,22 +304,39 @@ def test_end_to_end_adaptive() -> None:
     checkpoint.add_metadata({"testing": "metadata"})
     db_check = d.get_checkpoint(checkpoint.uuid)
     # Make sure the checkpoint metadata is correct and correctly saved to the db.
-    assert checkpoint.metadata == {"testing": "metadata"}
+    # Beginning with 0.18 the TrialController contributes a few items to the dict.
+    assert checkpoint.metadata.get("testing") == "metadata"
+    assert checkpoint.metadata.keys() == {
+        "determined_version",
+        "format",
+        "framework",
+        "steps_completed",
+        "testing",
+    }
     assert checkpoint.metadata == db_check.metadata
 
     checkpoint.add_metadata({"some_key": "some_value"})
     db_check = d.get_checkpoint(checkpoint.uuid)
-    assert checkpoint.metadata == {"testing": "metadata", "some_key": "some_value"}
+    assert checkpoint.metadata.items() > {"testing": "metadata", "some_key": "some_value"}.items()
+    assert checkpoint.metadata.keys() == {
+        "determined_version",
+        "format",
+        "framework",
+        "steps_completed",
+        "testing",
+        "some_key",
+    }
     assert checkpoint.metadata == db_check.metadata
 
     checkpoint.add_metadata({"testing": "override"})
     db_check = d.get_checkpoint(checkpoint.uuid)
-    assert checkpoint.metadata == {"testing": "override", "some_key": "some_value"}
+    assert checkpoint.metadata.items() > {"testing": "override", "some_key": "some_value"}.items()
     assert checkpoint.metadata == db_check.metadata
 
     checkpoint.remove_metadata(["some_key"])
     db_check = d.get_checkpoint(checkpoint.uuid)
-    assert checkpoint.metadata == {"testing": "override"}
+    assert "some_key" not in checkpoint.metadata
+    assert checkpoint.metadata["testing"] == "override"
     assert checkpoint.metadata == db_check.metadata
 
 
@@ -335,6 +361,22 @@ def test_graceful_trial_termination() -> None:
 
 
 @pytest.mark.e2e_cpu
+def test_kill_experiment_ignoring_preemption() -> None:
+    exp_id = exp.create_experiment(
+        conf.fixtures_path("core_api/sleep.yaml"),
+        conf.fixtures_path("core_api"),
+        None,
+    )
+    exp.wait_for_experiment_state(exp_id, bindings.experimentv1State.RUNNING)
+
+    bindings.post_CancelExperiment(api_utils.determined_test_session(), id=exp_id)
+    exp.wait_for_experiment_state(exp_id, bindings.experimentv1State.STOPPING_CANCELED)
+
+    bindings.post_KillExperiment(api_utils.determined_test_session(), id=exp_id)
+    exp.wait_for_experiment_state(exp_id, bindings.experimentv1State.CANCELED)
+
+
+@pytest.mark.e2e_cpu
 def test_fail_on_first_validation() -> None:
     error_log = "failed on first validation"
     config_obj = conf.load_config(conf.fixtures_path("no_op/single.yaml"))
@@ -353,3 +395,149 @@ def test_perform_initial_validation() -> None:
     config = conf.set_perform_initial_validation(config, True)
     exp_id = exp.run_basic_test_with_temp_config(config, conf.fixtures_path("no_op"), 1)
     exp.assert_performed_initial_validation(exp_id)
+
+
+@pytest.mark.e2e_cpu
+@pytest.mark.parametrize(
+    "stage,ntrials,expect_workloads,expect_checkpoints",
+    [
+        ("0_start", 1, False, False),
+        ("1_metrics", 1, True, False),
+        ("2_checkpoints", 1, True, True),
+        ("3_hpsearch", 10, True, True),
+    ],
+)
+def test_core_api_tutorials(
+    stage: str, ntrials: int, expect_workloads: bool, expect_checkpoints: bool
+) -> None:
+    exp.run_basic_test(
+        conf.tutorials_path(f"core_api/{stage}.yaml"),
+        conf.tutorials_path("core_api"),
+        ntrials,
+        expect_workloads=expect_workloads,
+        expect_checkpoints=expect_checkpoints,
+    )
+
+
+@pytest.mark.parallel
+def test_core_api_distributed_tutorial() -> None:
+    exp.run_basic_test(
+        conf.tutorials_path("core_api/4_distributed.yaml"), conf.tutorials_path("core_api"), 1
+    )
+
+
+@pytest.mark.e2e_cpu_2a
+@pytest.mark.parametrize(
+    "name,searcher_cfg",
+    [
+        (
+            "random",
+            {
+                "metric": "validation_error",
+                "name": "random",
+                "max_length": {
+                    "batches": 3000,
+                },
+                "max_trials": 8,
+                "max_concurrent_trials": 1,
+            },
+        ),
+        (
+            "grid",
+            {
+                "metric": "validation_error",
+                "name": "random",
+                "max_length": {
+                    "batches": 3000,
+                },
+                "max_trials": 8,
+                "max_concurrent_trials": 1,
+            },
+        ),
+    ],
+)
+def test_max_concurrent_trials(name: str, searcher_cfg: str) -> None:
+    config_obj = conf.load_config(conf.fixtures_path("no_op/single-very-many-long-steps.yaml"))
+    config_obj["name"] = f"{name} searcher max concurrent trials test"
+    config_obj["searcher"] = searcher_cfg
+    config_obj["hyperparameters"]["x"] = {
+        "type": "categorical",
+        # Intentionally give the searcher more to do, in case a bug involves exceeding max
+        # concurrent trials.
+        "vals": list(range(16)),
+    }
+
+    with tempfile.NamedTemporaryFile() as tf:
+        with open(tf.name, "w") as f:
+            yaml.dump(config_obj, f)
+        experiment_id = exp.create_experiment(tf.name, conf.fixtures_path("no_op"), [])
+
+    try:
+        exp.wait_for_experiment_active_workload(experiment_id)
+        trials = exp.wait_for_at_least_n_trials(experiment_id, 1)
+        assert len(trials) == 1, trials
+
+        for t in trials:
+            exp.kill_trial(t.trial.id)
+
+        # Give the experiment time to refill max_concurrent_trials.
+        trials = exp.wait_for_at_least_n_trials(experiment_id, 2)
+
+        # The experiment handling the cancel message and waiting for it to be cancelled slyly
+        # (hackishly) allows us to synchronize with the experiment state after after canceling
+        # the first two trials.
+        exp.cancel_single(experiment_id)
+
+        # Make sure that there were never more than 2 total trials created.
+        trials = exp.wait_for_at_least_n_trials(experiment_id, 2)
+        assert len(trials) == 2, trials
+
+    finally:
+        exp.kill_single(experiment_id)
+
+
+@pytest.mark.e2e_cpu
+def test_experiment_list_columns() -> None:
+    exp.create_experiment(
+        conf.fixtures_path("no_op/single-nested-hps.yaml"),
+        conf.fixtures_path("no_op"),
+        ["--project", "1"],
+    )
+    exp_hyperparameters = [
+        "global_batch_size",
+        "metrics_progression",
+        "metrics_base.min_val",
+        "metrics_base.max_val",
+    ]
+    exp_metrics = ["validation.validation_error"]
+    columns = bindings.get_GetProjectColumns(api_utils.determined_test_session(), id=1)
+    assert len(columns.general) == len(bindings.v1GeneralColumn)
+
+    hyperparameters = columns.hyperparameters
+    for hp in exp_hyperparameters:
+        assert hyperparameters.index(hp) >= 0
+    metrics = columns.metrics
+    for mc in exp_metrics:
+        assert metrics.index(mc) >= 0
+
+
+@pytest.mark.e2e_cpu
+def test_core_api_arbitrary_workload_order() -> None:
+    experiment_id = exp.run_basic_test(
+        conf.fixtures_path("core_api/arbitrary_workload_order.yaml"),
+        conf.fixtures_path("core_api"),
+        1,
+        expect_workloads=True,
+        expect_checkpoints=True,
+    )
+
+    trials = exp.experiment_trials(experiment_id)
+    assert len(trials) == 1
+    trial = trials[0]
+
+    steps = exp.workloads_with_training(trial.workloads)
+    assert len(steps) == 11
+    validations = exp.workloads_with_validation(trial.workloads)
+    assert len(validations) == 11
+    checkpoints = exp.workloads_with_checkpoint(trial.workloads)
+    assert len(checkpoints) == 11

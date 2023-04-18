@@ -2,13 +2,18 @@ import argparse
 import json
 import os
 import sys
+import typing
 from collections import OrderedDict
-from typing import Any, Callable, List
+from operator import attrgetter
+from typing import Any, Callable, Dict, List
 
+from determined import cli
 from determined.cli import render
 from determined.cli import task as cli_task
+from determined.cli.errors import CliError
 from determined.common import api
-from determined.common.api import authentication
+from determined.common.api import authentication, bindings
+from determined.common.api.bindings import devicev1Type, v1Device, v1Slot
 from determined.common.check import check_false
 from determined.common.declarative_argparse import Arg, Cmd, Group
 
@@ -19,25 +24,26 @@ def local_id(address: str) -> str:
 
 @authentication.required
 def list_agents(args: argparse.Namespace) -> None:
-    r = api.get(args.master, "agents")
+    resp = bindings.get_GetAgents(cli.setup_session(args))
 
-    agents = r.json()
     agents = [
         OrderedDict(
             [
-                ("id", local_id(agent_id)),
-                ("version", agent["version"]),
-                ("registered_time", render.format_time(agent["registered_time"])),
-                ("num_slots", len(agent["slots"])),
-                ("num_containers", agent["num_containers"]),
-                ("resource_pool", agent["resource_pool"]),
-                ("enabled", agent.get("enabled")),
-                ("draining", agent.get("draining")),
-                ("label", agent["label"]),
-                ("addresses", ", ".join(agent["addresses"])),
+                ("id", local_id(a.id)),
+                ("version", a.version),
+                ("registered_time", render.format_time(a.registeredTime)),
+                ("num_slots", len(a.slots) if a.slots is not None else ""),
+                ("num_containers", len(a.containers) if a.containers is not None else ""),
+                (
+                    "resource_pools",
+                    ", ".join(a.resourcePools) if a.resourcePools is not None else "",
+                ),
+                ("enabled", a.enabled),
+                ("draining", a.draining),
+                ("addresses", ", ".join(a.addresses) if a.addresses is not None else ""),
             ]
         )
-        for agent_id, agent in sorted(agents.items())
+        for a in sorted(resp.agents or [], key=attrgetter("id"))
     ]
 
     if args.json:
@@ -53,7 +59,6 @@ def list_agents(args: argparse.Namespace) -> None:
         "Resource Pool",
         "Enabled",
         "Draining",
-        "Label",
         "Addresses",
     ]
     values = [a.values() for a in agents]
@@ -64,9 +69,8 @@ def list_agents(args: argparse.Namespace) -> None:
 @authentication.required
 def list_slots(args: argparse.Namespace) -> None:
     task_res = api.get(args.master, "tasks")
-    agent_res = api.get(args.master, "agents")
+    resp = bindings.get_GetAgents(cli.setup_session(args))
 
-    agents = agent_res.json()
     allocations = task_res.json()
 
     c_names = {
@@ -76,30 +80,59 @@ def list_slots(args: argparse.Namespace) -> None:
         if r["container_id"]
     }
 
+    def device_type_string(deviceType: typing.Optional[devicev1Type]) -> str:
+        if deviceType == devicev1Type.CUDA:
+            return "cuda"
+        if deviceType == devicev1Type.ROCM:
+            return "rocm"
+        if deviceType == devicev1Type.CPU:
+            return "cpu"
+        return "unknown"
+
+    def get_task_name(containers: Dict[str, Any], slot: v1Slot) -> str:
+        if not slot.container:
+            return "FREE"
+
+        container_id = slot.container.id
+
+        if slot.container and container_id in containers:
+            return str(containers[container_id]["name"])
+
+        if slot.container and (
+            "determined-master-deployment" in container_id
+            or "determined-db-deployment" in container_id
+        ):
+            return f"Determined System Task: {container_id}"
+
+        if slot.container and ("dispatcherrm-inuse-slot-placeholder" in container_id):
+            return ""  # slot:task relationship not tracked on HPC clusters, so just show ""
+
+        return f"Non-Determined Task: {container_id}"
+
     slots = [
         OrderedDict(
             [
-                ("agent_id", local_id(agent_id)),
-                ("resource_pool", agent["resource_pool"]),
-                ("slot_id", local_id(slot_id)),
-                ("enabled", slot["enabled"]),
-                ("draining", slot.get("draining", False)),
+                ("agent_id", local_id(agent.id)),
+                (
+                    "resource_pools",
+                    ", ".join(agent.resourcePools) if agent.resourcePools is not None else "",
+                ),
+                ("slot_id", local_id(slot.id or "")),
+                ("enabled", slot.enabled),
+                ("draining", slot.draining),
                 (
                     "allocation_id",
-                    c_names[slot["container"]["id"]]["allocation_id"]
-                    if slot["container"]
-                    else "FREE",
+                    c_names[slot.container.id]["allocation_id"]
+                    if slot.container and slot.container.id in c_names
+                    else ("OCCUPIED" if slot.container else "FREE"),
                 ),
-                (
-                    "task_name",
-                    c_names[slot["container"]["id"]]["name"] if slot["container"] else "None",
-                ),
-                ("type", slot["device"]["type"]),
-                ("device", slot["device"]["brand"]),
+                ("task_name", get_task_name(c_names, slot)),
+                ("type", device_type_string((slot.device or v1Device()).type)),
+                ("device", (slot.device or v1Device()).brand),
             ]
         )
-        for agent_id, agent in sorted(agents.items())
-        for slot_id, slot in sorted(agent["slots"].items())
+        for agent in sorted(resp.agents or [], key=attrgetter("id"))
+        for _key, slot in (agent.slots or {}).items()
     ]
 
     headers = [
@@ -129,8 +162,7 @@ def patch_agent(enabled: bool) -> Callable[[argparse.Namespace], None]:
         check_false(args.all and args.agent_id)
 
         if not (args.all or args.agent_id):
-            print("Error: must specify exactly one of `--all` or agent_id", file=sys.stderr)
-            sys.exit(1)
+            raise CliError("Must specify exactly on of --all or --agent-id")
 
         if args.agent_id:
             agent_ids = [args.agent_id]
@@ -157,11 +189,15 @@ def patch_agent(enabled: bool) -> Callable[[argparse.Namespace], None]:
         # When draining, check if there're any tasks currently running on
         # these slots, and list them.
         if drain_mode:
-            rsp = api.get(args.master, "tasks")
+            rsp = bindings.get_GetTasks(cli.setup_session(args))
             tasks_data = {
                 k: t
-                for (k, t) in rsp.json().items()
-                if any(a in agent_ids for r in t.get("resources", []) for a in r["agent_devices"])
+                for (k, t) in (
+                    rsp.allocationIdToSummary.items()
+                    if rsp.allocationIdToSummary is not None
+                    else {}
+                )
+                if any(a in agent_ids for r in (t.resources or []) for a in (r.agentDevices or {}))
             }
 
             if not (args.json or args.csv):
@@ -178,11 +214,18 @@ def patch_agent(enabled: bool) -> Callable[[argparse.Namespace], None]:
 def patch_slot(enabled: bool) -> Callable[[argparse.Namespace], None]:
     @authentication.required
     def patch(args: argparse.Namespace) -> None:
-        path = "agents/{}/slots/{}".format(args.agent_id, args.slot_id)
-        headers = {"Content-Type": "application/merge-patch+json"}
-        payload = {"enabled": enabled}
+        if enabled:
+            bindings.post_EnableSlot(
+                cli.setup_session(args), agentId=args.agent_id, slotId=args.slot_id
+            )
+        else:
+            bindings.post_DisableSlot(
+                cli.setup_session(args),
+                agentId=args.agent_id,
+                slotId=args.slot_id,
+                body=bindings.v1DisableSlotRequest(),
+            )
 
-        api.patch(args.master, path, json=payload, headers=headers)
         status = "Disabled" if not enabled else "Enabled"
         print("{} slot {} of agent {}".format(status, args.slot_id, args.agent_id))
 
@@ -198,7 +241,7 @@ def agent_id_completer(_1: str, parsed_args: argparse.Namespace, _2: Any) -> Lis
 
 args_description = [
     Cmd("a|gent", None, "manage agents", [
-        Cmd("list", list_agents, "list agents", [
+        Cmd("list ls", list_agents, "list agents", [
             Group(
                 Arg("--csv", action="store_true", help="print as CSV"),
                 Arg("--json", action="store_true", help="print as JSON"),
@@ -225,7 +268,7 @@ args_description = [
         ]),
     ]),
     Cmd("s|lot", None, "manage slots", [
-        Cmd("list", list_slots, "list slots in cluster", [
+        Cmd("list ls", list_slots, "list slots in cluster", [
             Group(
                 Arg("--csv", action="store_true", help="print as CSV"),
                 Arg("--json", action="store_true", help="print as JSON"),

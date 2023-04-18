@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 class ExperimentConfig(dict):
@@ -8,13 +8,10 @@ class ExperimentConfig(dict):
     def scheduling_unit(self) -> int:
         return int(self.get("scheduling_unit", 100))
 
-    def native_enabled(self) -> bool:
-        return "internal" in self and self["internal"] is not None and "native" in self["internal"]
-
     def native_parallel_enabled(self) -> bool:
         return bool(self["resources"]["native_parallel"])
 
-    def averaging_training_metrics_enabled(self) -> bool:
+    def average_training_metrics_enabled(self) -> bool:
         return bool(self["optimizations"]["average_training_metrics"])
 
     def slots_per_trial(self) -> int:
@@ -34,9 +31,6 @@ class ExperimentConfig(dict):
 
     def profiling_sync_timings(self) -> bool:
         return bool(self.get("profiling", {}).get("sync_timings", True))
-
-    def get_data_layer_type(self) -> str:
-        return cast(str, self["data_layer"]["type"])
 
     def get_records_per_epoch(self) -> Optional[int]:
         records_per_epoch = self.get("records_per_epoch")
@@ -69,5 +63,10 @@ class ExperimentConfig(dict):
     def get_checkpoint_storage(self) -> Dict[str, Any]:
         return self.get("checkpoint_storage", {})
 
-    def get_entrypoint(self) -> Optional[Union[str, List[str]]]:
-        return self.get("entrypoint", None)
+    def get_entrypoint(self) -> Union[str, List[str]]:
+        entrypoint = self["entrypoint"]
+        if not isinstance(entrypoint, (str, list)):
+            raise ValueError("invalid entrypoint in experiment config: {entrypoint}")
+        if isinstance(entrypoint, list) and any(not isinstance(e, str) for e in entrypoint):
+            raise ValueError("invalid entrypoint in experiment config: {entrypoint}")
+        return entrypoint

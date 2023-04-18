@@ -1,10 +1,14 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/uptrace/bun"
 
 	"github.com/determined-ai/determined/master/pkg/protoutils"
 
@@ -17,10 +21,19 @@ import (
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/determined-ai/determined/master/pkg/command"
+	"github.com/determined-ai/determined/master/pkg/ptrs"
 	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
 	"github.com/determined-ai/determined/proto/pkg/logv1"
 )
+
+// StateWithReason is the run state of an experiment with
+// an informational reason used for logging purposes.
+type StateWithReason struct {
+	State               State
+	InformationalReason string
+}
 
 // State is the run state of an experiment / trial / step / etc.
 type State string
@@ -73,7 +86,8 @@ func StateFromProto(state experimentv1.State) State {
 
 // reverseTransitions computes the reverse transition table.
 func reverseTransitions(
-	transitions map[State]map[State]bool) map[State]map[State]bool {
+	transitions map[State]map[State]bool,
+) map[State]map[State]bool {
 	ret := make(map[State]map[State]bool)
 	for state := range transitions {
 		ret[state] = make(map[State]bool)
@@ -170,7 +184,7 @@ var ExperimentTransitions = map[State]map[State]bool{
 		DeleteFailedState: true,
 	},
 	DeleteFailedState: {
-		DeletedState: true,
+		DeletingState: true,
 	},
 	DeletedState: {},
 }
@@ -266,12 +280,16 @@ var CheckpointReverseTransitions = reverseTransitions(CheckpointTransitions)
 
 // Experiment represents a row from the `experiments` table.
 type Experiment struct {
-	ID             int                      `db:"id"`
-	JobID          JobID                    `db:"job_id"`
-	State          State                    `db:"state"`
-	Notes          string                   `db:"notes"`
-	Config         expconf.ExperimentConfig `db:"config"`
-	OriginalConfig string                   `db:"original_config"`
+	ID    int    `db:"id"`
+	JobID JobID  `db:"job_id"`
+	State State  `db:"state"`
+	Notes string `db:"notes"`
+
+	// Offer a LegacyConfig rather than ExperimentConfig since most of the system is about querying
+	// experiments which ran some time in the past, which is exactly what LegacyConfig is for.
+	Config         expconf.LegacyConfig `db:"config"`
+	OriginalConfig string               `db:"original_config"`
+
 	// The model definition is stored as a .tar.gz file (raw bytes).
 	ModelDefinitionBytes []byte     `db:"model_definition"`
 	StartTime            time.Time  `db:"start_time"`
@@ -284,6 +302,52 @@ type Experiment struct {
 	GitCommitDate        *time.Time `db:"git_commit_date"`
 	OwnerID              *UserID    `db:"owner_id"`
 	Username             string     `db:"username"`
+	ProjectID            int        `db:"project_id"`
+}
+
+// ExperimentFromProto converts a experimentv1.Experiment to a model.Experiment.
+func ExperimentFromProto(e *experimentv1.Experiment) (*Experiment, error) {
+	var uid *UserID
+	if e.UserId != 0 {
+		uid = ptrs.Ptr(UserID(e.UserId))
+	}
+	var endTime *time.Time
+	if e.EndTime != nil {
+		endTime = ptrs.Ptr(e.EndTime.AsTime())
+	}
+	var parentID *int
+	if e.ForkedFrom != nil {
+		parentID = ptrs.Ptr(int(e.ForkedFrom.Value))
+	}
+
+	byts, err := json.Marshal(e.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	config, err := expconf.ParseLegacyConfigJSON(byts)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Experiment{
+		ID:             int(e.Id),
+		JobID:          JobID(e.JobId),
+		State:          StateFromProto(e.State),
+		Notes:          e.Notes,
+		Config:         config,
+		OriginalConfig: e.OriginalConfig,
+		// ModelDefinitionBytes:
+		StartTime: e.StartTime.AsTime(),
+		EndTime:   endTime,
+		ParentID:  parentID,
+		Archived:  e.Archived,
+		// GitRemote:
+		// GitCommitDate
+		OwnerID:   uid,
+		Username:  e.Username,
+		ProjectID: int(e.ProjectId),
+	}, nil
 }
 
 // ExperimentDescriptor is a minimal description of an experiment.
@@ -292,6 +356,7 @@ type ExperimentDescriptor struct {
 	Archived bool                     `json:"archived"`
 	Config   expconf.ExperimentConfig `json:"config"`
 	Labels   []string                 `json:"labels"`
+	Warnings []command.LaunchWarning  `json:"warnings"`
 }
 
 // NewExperiment creates a new experiment struct in the paused state.  Note
@@ -304,6 +369,7 @@ func NewExperiment(
 	archived bool,
 	gitRemote, gitCommit, gitCommitter *string,
 	gitCommitDate *time.Time,
+	projectID int,
 ) (*Experiment, error) {
 	if len(modelDefinitionBytes) == 0 {
 		return nil, errors.New("empty model definition")
@@ -316,7 +382,7 @@ func NewExperiment(
 	return &Experiment{
 		State:                PausedState,
 		JobID:                NewJobID(),
-		Config:               config,
+		Config:               config.AsLegacy(),
 		OriginalConfig:       originalConfig,
 		ModelDefinitionBytes: modelDefinitionBytes,
 		StartTime:            time.Now().UTC(),
@@ -326,6 +392,7 @@ func NewExperiment(
 		GitCommit:            gitCommit,
 		GitCommitter:         gitCommitter,
 		GitCommitDate:        gitCommitDate,
+		ProjectID:            projectID,
 	}, nil
 }
 
@@ -362,6 +429,7 @@ type Trial struct {
 	HParams               JSONObj    `db:"hparams"`
 	WarmStartCheckpointID *int       `db:"warm_start_checkpoint_id"`
 	Seed                  int64      `db:"seed"`
+	TotalBatches          int        `db:"total_batches"`
 
 	JobID JobID
 }
@@ -401,14 +469,64 @@ type TrialMetrics struct {
 	TrialID      int        `db:"trial_id" json:"trial_id"`
 	TrialRunID   int        `db:"trial_run_id" json:"-"`
 	TotalBatches int        `db:"total_batches" json:"total_batches"`
-	State        State      `db:"state" json:"state"`
 	EndTime      *time.Time `db:"end_time" json:"end_time"`
 	Metrics      JSONObj    `db:"metrics" json:"metrics"`
 }
 
-// Checkpoint represents a row from the `checkpoints` table.
-type Checkpoint struct {
-	ID                int        `db:"id" json:"id"`
+// Represent order of active states (Queued -> Pulling -> Starting -> Running).
+var experimentStateIndex = map[experimentv1.State]int{
+	experimentv1.State_STATE_UNSPECIFIED:        0,
+	experimentv1.State_STATE_ACTIVE:             1,
+	experimentv1.State_STATE_QUEUED:             2,
+	experimentv1.State_STATE_PULLING:            3,
+	experimentv1.State_STATE_STARTING:           4,
+	experimentv1.State_STATE_RUNNING:            5,
+	experimentv1.State_STATE_PAUSED:             6,
+	experimentv1.State_STATE_COMPLETED:          7,
+	experimentv1.State_STATE_CANCELED:           8,
+	experimentv1.State_STATE_ERROR:              9,
+	experimentv1.State_STATE_STOPPING_COMPLETED: 10,
+	experimentv1.State_STATE_STOPPING_KILLED:    12,
+	experimentv1.State_STATE_STOPPING_CANCELED:  13,
+	experimentv1.State_STATE_STOPPING_ERROR:     14,
+	experimentv1.State_STATE_DELETED:            15,
+	experimentv1.State_STATE_DELETING:           16,
+	experimentv1.State_STATE_DELETE_FAILED:      17,
+}
+
+// MostProgressedExperimentState returns the more advanced active state
+// based on experimentStateIndex (Queued -> Pulling -> Starting -> Running).
+func MostProgressedExperimentState(
+	state1 experimentv1.State, state2 experimentv1.State,
+) experimentv1.State {
+	stateValue1 := experimentStateIndex[state1]
+	stateValue2 := experimentStateIndex[state2]
+	if stateValue1 > stateValue2 {
+		return state1
+	}
+	return state2
+}
+
+// CheckpointVersion describes the format in which some checkpoint metadata is saved.
+type CheckpointVersion int
+
+const (
+	// CheckpointVersionV1 was the original way checkpoints were stored, in a trial-attached
+	// checkpoint table.
+	CheckpointVersionV1 = 1
+	// CheckpointVersionV2 changed checkpoints to be non-trial-attached and generic.
+	CheckpointVersionV2 = 2
+	// CurrentCheckpointVersion is the current way checkpoints are stored.
+	CurrentCheckpointVersion = CheckpointVersionV2
+
+	// StepsCompletedMetadataKey is the key within metadata to find steps completed now, if it exists.
+	StepsCompletedMetadataKey = "steps_completed"
+)
+
+// CheckpointV1 represents a row from the `raw_checkpoints` table.
+type CheckpointV1 struct {
+	bun.BaseModel     `bun:"table:raw_checkpoints"`
+	ID                int        `db:"id" json:"id" bun:"id,pk,autoincrement"`
 	TrialID           int        `db:"trial_id" json:"trial_id"`
 	TrialRunID        int        `db:"trial_run_id" json:"-"`
 	TotalBatches      int        `db:"total_batches" json:"total_batches"`
@@ -420,6 +538,52 @@ type Checkpoint struct {
 	Framework         string     `db:"framework" json:"framework"`
 	Format            string     `db:"format" json:"format"`
 	DeterminedVersion string     `db:"determined_version" json:"determined_version"`
+	Size              int64      `db:"size"`
+}
+
+// CheckpointV2 represents a row from the `checkpoints_v2` table.
+type CheckpointV2 struct {
+	bun.BaseModel `bun:"table:checkpoints_v2"`
+	ID            int                    `db:"id" bun:"id,pk,autoincrement"`
+	UUID          uuid.UUID              `db:"uuid"`
+	TaskID        TaskID                 `db:"task_id"`
+	AllocationID  AllocationID           `db:"allocation_id"`
+	ReportTime    time.Time              `db:"report_time"`
+	State         State                  `db:"state"`
+	Resources     map[string]int64       `db:"resources"`
+	Metadata      map[string]interface{} `db:"metadata"`
+	Size          int64                  `db:"size"`
+}
+
+// CheckpointTrainingMetadata is a substruct of checkpoints encapsulating training specific
+// information.
+type CheckpointTrainingMetadata struct {
+	TrialID           int      `db:"trial_id"`
+	ExperimentID      int      `db:"experiment_id"`
+	ExperimentConfig  JSONObj  `db:"experiment_config"`
+	HParams           JSONObj  `db:"hparams"`
+	TrainingMetrics   JSONObj  `db:"training_metrics"`
+	ValidationMetrics JSONObj  `db:"validation_metrics"`
+	SearcherMetric    *float64 `db:"searcher_metric"`
+	StepsCompleted    int      `db:"steps_completed"`
+}
+
+// Checkpoint represents a row from the `checkpoints_view` view.
+type Checkpoint struct {
+	ID int `db:"id"`
+
+	UUID         *uuid.UUID    `db:"uuid"`
+	TaskID       *TaskID       `db:"task_id"`
+	AllocationID *AllocationID `db:"allocation_id"`
+	ReportTime   time.Time     `db:"report_time"`
+	State        State         `db:"state"`
+	Resources    JSONObj       `db:"resources"`
+	Metadata     JSONObj       `db:"metadata"`
+	Size         int64         `db:"size"`
+
+	CheckpointTrainingMetadata
+
+	CheckpointVersion CheckpointVersion `db:"checkpoint_version"`
 }
 
 // TrialLog represents a row from the `trial_logs` table.
@@ -449,7 +613,15 @@ type TrialLog struct {
 
 // Proto converts a trial log to its protobuf representation.
 func (t TrialLog) Proto() (*apiv1.TrialLogsResponse, error) {
-	resp := &apiv1.TrialLogsResponse{Message: t.Message}
+	resp := &apiv1.TrialLogsResponse{
+		TrialId:     int32(t.TrialID),
+		Message:     t.Message,
+		AgentId:     t.AgentID,
+		ContainerId: t.ContainerID,
+		Log:         t.Log,
+		Source:      t.Source,
+		Stdtype:     t.StdType,
+	}
 
 	switch {
 	case t.ID != nil:
@@ -474,7 +646,7 @@ func (t TrialLog) Proto() (*apiv1.TrialLogsResponse, error) {
 			resp.Level = logv1.LogLevel_LOG_LEVEL_DEBUG
 		case LogLevelInfo:
 			resp.Level = logv1.LogLevel_LOG_LEVEL_INFO
-		case LogLevelWarn:
+		case LogLevelWarning:
 			resp.Level = logv1.LogLevel_LOG_LEVEL_WARNING
 		case LogLevelError:
 			resp.Level = logv1.LogLevel_LOG_LEVEL_ERROR
@@ -483,6 +655,11 @@ func (t TrialLog) Proto() (*apiv1.TrialLogsResponse, error) {
 		default:
 			resp.Level = logv1.LogLevel_LOG_LEVEL_UNSPECIFIED
 		}
+	}
+
+	if t.RankID != nil {
+		id := int32(*t.RankID)
+		resp.RankId = &id
 	}
 
 	return resp, nil
@@ -615,70 +792,15 @@ const (
 	ValidationMetric MetricType = iota
 )
 
-// HPImportanceTrialData is the input to the hyperparameter importance algorithm.
-type HPImportanceTrialData struct {
-	TrialID int                    `db:"trial_id"`
-	Hparams map[string]interface{} `db:"hparams"`
-	Metric  float64                `db:"metric"`
-}
-
-// ExperimentHPImportance is hyperparameter importance for an experiment, and consists of
-// independent measurements of importance for any of the metrics recorded by the experiment.
-type ExperimentHPImportance struct {
-	Partial           bool                          `json:"partial"`
-	TrainingMetrics   map[string]MetricHPImportance `json:"training_metrics"`
-	ValidationMetrics map[string]MetricHPImportance `json:"validation_metrics"`
-}
-
-// MetricHPImportance is hyperparameter importance with respect to a specific metric.
-type MetricHPImportance struct {
-	Error              string             `json:"error"`
-	Pending            bool               `json:"pending"`
-	InProgress         bool               `json:"in_progress"`
-	ExperimentProgress float64            `json:"experiment_progress"`
-	HpImportance       map[string]float64 `json:"hp_importance"`
-}
-
-// SetMetricHPImportance is a convenience function when modifying results for a specific metric.
-func (hpi *ExperimentHPImportance) SetMetricHPImportance(metricHpi MetricHPImportance,
-	metricName string, metricType MetricType) *ExperimentHPImportance {
-	switch metricType {
-	case TrainingMetric:
-		hpi.TrainingMetrics[metricName] = metricHpi
-	case ValidationMetric:
-		hpi.ValidationMetrics[metricName] = metricHpi
-	default:
-		panic("Invalid metric type!")
-	}
-	return hpi
-}
-
-// GetMetricHPImportance is a convenience function when working with results for a specific metric.
-func (hpi *ExperimentHPImportance) GetMetricHPImportance(metricName string, metricType MetricType,
-) MetricHPImportance {
-	switch metricType {
-	case TrainingMetric:
-		if metricHpi, ok := hpi.TrainingMetrics[metricName]; ok {
-			return metricHpi
-		}
-		return MetricHPImportance{}
-	case ValidationMetric:
-		if metricHpi, ok := hpi.ValidationMetrics[metricName]; ok {
-			return metricHpi
-		}
-		return MetricHPImportance{}
-	default:
-		panic("Invalid metric type!")
-	}
-}
-
 // ExitedReason defines why a workload exited early.
 type ExitedReason string
 
 const (
 	// Errored signals the searcher that the workload errored out.
 	Errored ExitedReason = "ERRORED"
-	// UserCanceled signals the searcher that the user requested a cancelation.
+	// UserRequestedStop signals the searcher that the user requested a cancelation, from code.
+	UserRequestedStop ExitedReason = "USER_REQUESTED_STOP"
+	// UserCanceled signals the searcher that the user requested a cancelation, from the CLI or UI.
 	UserCanceled ExitedReason = "USER_CANCELED"
 	// InvalidHP signals the searcher that the user raised an InvalidHP exception.
 	InvalidHP ExitedReason = "INVALID_HP"
@@ -694,10 +816,24 @@ func ExitedReasonFromProto(r trialv1.TrialEarlyExit_ExitedReason) ExitedReason {
 		return Errored
 	case trialv1.TrialEarlyExit_EXITED_REASON_INVALID_HP:
 		return InvalidHP
-	case trialv1.TrialEarlyExit_EXITED_REASON_USER_REQUESTED_STOP:
-		return UserCanceled
 	case trialv1.TrialEarlyExit_EXITED_REASON_INIT_INVALID_HP:
 		return InitInvalidHP
+	default:
+		panic(fmt.Errorf("unexpected exited reason: %v", r))
+	}
+}
+
+// ToSearcherProto converts an ExitedReason to its protobuf representation for searcher purposes.
+func (r ExitedReason) ToSearcherProto() experimentv1.TrialExitedEarly_ExitedReason {
+	switch r {
+	case Errored:
+		return experimentv1.TrialExitedEarly_EXITED_REASON_UNSPECIFIED
+	case InvalidHP:
+		return experimentv1.TrialExitedEarly_EXITED_REASON_INVALID_HP
+	case UserRequestedStop:
+		return experimentv1.TrialExitedEarly_EXITED_REASON_USER_REQUESTED_STOP
+	case UserCanceled:
+		return experimentv1.TrialExitedEarly_EXITED_REASON_USER_CANCELED
 	default:
 		panic(fmt.Errorf("unexpected exited reason: %v", r))
 	}

@@ -45,6 +45,8 @@ message GetModelsRequest {
     SORT_BY_LAST_UPDATED_TIME = 5;
     // Returns models sorted by number of version.
     SORT_BY_NUM_VERSIONS = 6;
+    // Returns models sorted by workspace name.
+    SORT_BY_WORKSPACE = 7;
   }
 
   // Sort the models by the given field.
@@ -72,11 +74,17 @@ message GetModelsRequest {
   // Limit the models to those made by the users with the following usernames.
   repeated string users = 9;
 
+  // Limit models to those that belong to the following workspace names.
+  repeated string workspace_names = 12;
+
   // Limit the models to those made by the users with the following userIds.
   repeated int32 user_ids = 11;
 
   // Limit the models to this model id.
   int32 id = 10;
+
+  // Limit models to those that belong to the following workspace ids.
+  repeated int32 workspace_ids = 13;
 }
 
 // Response to GetModelsRequest.
@@ -91,7 +99,10 @@ message GetModelsResponse {
 }
 
 // Get a list of model labels.
-message GetModelLabelsRequest {}
+message GetModelLabelsRequest {
+  // Optional workspace ID to limit query for model tags.
+  optional int32 workspace_id = 1;
+}
 
 // Response to GetModelLabelsRequest.
 message GetModelLabelsResponse {
@@ -116,6 +127,10 @@ message PostModelRequest {
   google.protobuf.Struct metadata = 3;
   // Labels associated with this model.
   repeated string labels = 4;
+  // The name of the workspace associated with this model.
+  optional string workspace_name = 5;
+  // The id of the workspace associated with this model.
+  optional int32 workspace_id = 7;
   // Notes associated with this model.
   string notes = 6;
 }
@@ -178,6 +193,21 @@ message UnarchiveModelRequest {
 // Response to UnarchiveModelRequest
 message UnarchiveModelResponse {}
 
+// Request to move a model to a workspace.
+message MoveModelRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "model_name", "destination_workspace_id" ] }
+  };
+
+  // The target model name.
+  string model_name = 1;
+  // The workspace id that the model will be stored.
+  int32 destination_workspace_id = 2;
+}
+
+// Response to MoveModelRequest
+message MoveModelResponse {}
+
 // Request for deleting a model in the registry.
 message DeleteModelRequest {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
@@ -194,13 +224,13 @@ message DeleteModelResponse {}
 // Request for a version of a model in the registry.
 message GetModelVersionRequest {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "model_name", "model_version" ] }
+    json_schema: { required: [ "model_name", "model_version_num" ] }
   };
 
   // The name of the model.
   string model_name = 3;
-  // The version number.
-  int32 model_version = 2;
+  // Sequential model version number.
+  int32 model_version_num = 2;
 }
 
 // Response for GetModelVersionRequest.
@@ -297,10 +327,10 @@ message PatchModelVersionRequest {
 
   // The name of the model being updated.
   string model_name = 4;
-  // The model version being updated.
+  // Patch payload.
   determined.model.v1.PatchModelVersion model_version = 2;
-  // The id of the model version being updated.
-  int32 model_version_id = 3;
+  // The model version number being updated.
+  int32 model_version_num = 3;
 }
 
 // Response to PatchModelVersionRequest.
@@ -316,13 +346,13 @@ message PatchModelVersionResponse {
 // Request for deleting a model version in the registry.
 message DeleteModelVersionRequest {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "model_name", "model_version_id" ] }
+    json_schema: { required: [ "model_name", "model_version_num" ] }
   };
 
   // The name of the model associated with the model version.
   string model_name = 3;
-  // The id of the model version to delete.
-  int32 model_version_id = 2;
+  // Sequential model version number.
+  int32 model_version_num = 2;
 }
 
 // Response to DeleteModelVersionRequest

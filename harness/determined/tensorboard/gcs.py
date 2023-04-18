@@ -1,8 +1,15 @@
 import logging
-from typing import Any
+import os
+import pathlib
+from typing import Any, List, Optional, no_type_check
 
-from determined.common import util
+import requests.exceptions
+import urllib3.exceptions
+
+from determined.common.storage.s3 import normalize_prefix
 from determined.tensorboard import base
+
+logger = logging.getLogger("determined.tensorboard")
 
 
 class GCSTensorboardManager(base.TensorboardManager):
@@ -16,21 +23,41 @@ class GCSTensorboardManager(base.TensorboardManager):
     checkpoints will be stored (this only works when running in GCE).
     """
 
-    def __init__(self, bucket: str, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, bucket: str, prefix: Optional[str], *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         import google.cloud.storage
 
         self.client = google.cloud.storage.Client()
         self.bucket = self.client.bucket(bucket)
+        self.prefix = normalize_prefix(prefix)
 
-    @util.preserve_random_state
-    def sync(self) -> None:
-        for path in self.to_sync():
-            blob_name = str(self.sync_path.joinpath(path.relative_to(self.base_path)))
-            blob = self.bucket.blob(blob_name)
-            logging.debug(f"Uploading to GCS: {blob_name}")
+    def get_storage_prefix(self, storage_id: pathlib.Path) -> str:
+        return os.path.join(self.prefix, storage_id)
 
-            blob.upload_from_filename(str(path))
+    @no_type_check
+    def _sync_impl(self, path_info_list: List[base.PathUploadInfo]) -> None:
+        for path_info in path_info_list:
+            path = path_info.path
+            mangled_relative_path = path_info.mangled_relative_path
+            mangled_path = self.sync_path.joinpath(mangled_relative_path)
+            to_path = self.get_storage_prefix(mangled_path)
+
+            from google.api_core import exceptions, retry
+
+            retry_network_errors = retry.Retry(
+                retry.if_exception_type(
+                    ConnectionError,
+                    exceptions.ServerError,
+                    urllib3.exceptions.ProtocolError,
+                    requests.exceptions.ConnectionError,
+                )
+            )
+
+            blob = self.bucket.blob(to_path)
+
+            logger.debug(f"Uploading {path} to GCS: {to_path}")
+            retry_network_errors(blob.upload_from_filename)(str(path))
 
     def delete(self) -> None:
-        self.bucket.delete_blobs(blobs=list(self.bucket.list_blobs(prefix=self.sync_path)))
+        prefix_path = self.get_storage_prefix(self.sync_path)
+        self.bucket.delete_blobs(blobs=list(self.bucket.list_blobs(prefix=prefix_path)))

@@ -4,26 +4,31 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ColorLegend from 'components/ColorLegend';
 import GalleryModal from 'components/GalleryModal';
 import Grid, { GridMode } from 'components/Grid';
-import Message, { MessageType } from 'components/Message';
 import MetricBadgeTag from 'components/MetricBadgeTag';
 import Section from 'components/Section';
-import Spinner from 'components/Spinner';
 import { FacetedData, UPlotScatterProps } from 'components/UPlot/types';
 import UPlotScatter from 'components/UPlot/UPlotScatter';
 import { terminalRunStates } from 'constants/states';
-import { useStore } from 'contexts/Store';
 import useResize from 'hooks/useResize';
 import { V1TrialsSnapshotResponse } from 'services/api-ts-sdk';
 import { detApi } from 'services/apiConfig';
-import { consumeStream } from 'services/utils';
+import { readStream } from 'services/utils';
+import Message, { MessageType } from 'shared/components/Message';
+import Spinner from 'shared/components/Spinner/Spinner';
+import useUI from 'shared/contexts/stores/UI';
+import { Primitive, Range, ValueOf } from 'shared/types';
+import { rgba2str, str2rgba } from 'shared/utils/color';
+import { clone, flattenObject, isBoolean, isObject, isString } from 'shared/utils/data';
 import {
-  ExperimentBase, HyperparameterType, MetricName, MetricType,
-  metricTypeParamMap, Primitive, Range,
+  ExperimentBase,
+  HyperparameterType,
+  Metric,
+  MetricType,
+  metricTypeParamMap,
+  Scale,
 } from 'types';
 import { getColorScale } from 'utils/chart';
-import { rgba2str, str2rgba } from 'utils/color';
-import { clone, flattenObject, isBoolean, isObject, isString } from 'utils/data';
-import { metricNameToStr } from 'utils/metric';
+import { metricToStr } from 'utils/metric';
 
 import css from './HpHeatMaps.module.scss';
 
@@ -34,7 +39,8 @@ interface Props {
   selectedBatch: number;
   selectedBatchMargin: number;
   selectedHParams: string[];
-  selectedMetric: MetricName;
+  selectedMetric: Metric | null;
+  selectedScale: Scale;
   selectedView: ViewType;
 }
 
@@ -44,24 +50,26 @@ interface HpData {
   hpLabelValues: Record<string, number[]>;
   hpLabels: Record<string, string[]>;
   hpLogScales: Record<string, boolean>;
-  hpMetrics: Record<string, number[]>;
+  hpMetrics: Record<string, (number | null)[]>;
   hpValues: HpValue;
   metricRange: Range<number>;
   trialIds: number[];
 }
 
-enum ViewType {
-  Grid = 'grid',
-  List = 'list',
-}
+const ViewType = {
+  Grid: 'grid',
+  List: 'list',
+} as const;
+
+type ViewType = ValueOf<typeof ViewType>;
 
 const generateHpKey = (hParam1: string, hParam2: string): string => {
   return `${hParam1}:${hParam2}`;
 };
 
-const parseHpKey = (key: string): [ hParam1: string, hParam2: string ] => {
+const parseHpKey = (key: string): [hParam1: string, hParam2: string] => {
   const parts = key.split(':');
-  return [ parts[0], parts[1] ];
+  return [parts[0], parts[1]];
 };
 
 const HpHeatMaps: React.FC<Props> = ({
@@ -73,33 +81,37 @@ const HpHeatMaps: React.FC<Props> = ({
   selectedHParams,
   selectedMetric,
   selectedView,
+  selectedScale,
 }: Props) => {
-  const { ui } = useStore();
+  const { ui } = useUI();
   const baseRef = useRef<HTMLDivElement>(null);
   const resize = useResize(baseRef);
-  const [ hasLoaded, setHasLoaded ] = useState(false);
-  const [ chartData, setChartData ] = useState<HpData>();
-  const [ pageError, setPageError ] = useState<Error>();
-  const [ activeHParam, setActiveHParam ] = useState<string>();
-  const [ galleryHeight, setGalleryHeight ] = useState<number>(450);
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const [chartData, setChartData] = useState<HpData>();
+  const [pageError, setPageError] = useState<Error>();
+  const [activeHParam, setActiveHParam] = useState<string>();
+  const [galleryHeight, setGalleryHeight] = useState<number>(450);
 
   const isExperimentTerminal = terminalRunStates.has(experiment.state);
   const isListView = selectedView === ViewType.List;
 
   const smallerIsBetter = useMemo(() => {
-    if (selectedMetric.type === MetricType.Validation &&
-        selectedMetric.name === experiment.config.searcher.metric) {
+    if (
+      selectedMetric &&
+      selectedMetric.type === MetricType.Validation &&
+      selectedMetric.name === experiment.config.searcher.metric
+    ) {
       return experiment.config.searcher.smallerIsBetter;
     }
     return undefined;
-  }, [ experiment.config.searcher, selectedMetric ]);
+  }, [experiment.config.searcher, selectedMetric]);
 
   const colorScale = useMemo(() => {
-    return getColorScale(chartData?.metricRange, smallerIsBetter);
-  }, [ chartData, smallerIsBetter ]);
+    return getColorScale(ui.theme, chartData?.metricRange, smallerIsBetter);
+  }, [chartData, smallerIsBetter, ui.theme]);
 
   const chartProps = useMemo(() => {
-    if (!chartData) return undefined;
+    if (!chartData || !selectedMetric) return undefined;
 
     const props: Record<string, UPlotScatterProps> = {};
     const rgbaStroke0 = str2rgba(colorScale[0].color);
@@ -108,11 +120,11 @@ const HpHeatMaps: React.FC<Props> = ({
     const rgbaFill1 = clone(rgbaStroke1);
     rgbaFill0.a = 0.3;
     rgbaFill1.a = 0.3;
-    const fill = [ rgba2str(rgbaFill0), rgba2str(rgbaFill1) ].join(' ');
-    const stroke = [ rgba2str(rgbaStroke0), rgba2str(rgbaStroke1) ].join(' ');
+    const fill = [rgba2str(rgbaFill0), rgba2str(rgbaFill1)].join(' ');
+    const stroke = [rgba2str(rgbaStroke0), rgba2str(rgbaStroke1)].join(' ');
 
-    selectedHParams.forEach(hParam1 => {
-      selectedHParams.forEach(hParam2 => {
+    selectedHParams.forEach((hParam1) => {
+      selectedHParams.forEach((hParam2) => {
         const key = generateHpKey(hParam1, hParam2);
         const xLabel = hParam2;
         const yLabel = hParam1;
@@ -123,12 +135,14 @@ const HpHeatMaps: React.FC<Props> = ({
         const isYLogarithmic = chartData?.hpLogScales[hParam1];
         const isXCategorical = xHpLabels?.length !== 0;
         const isYCategorical = yHpLabels?.length !== 0;
-        const xScaleKey = isXCategorical ? 'xCategorical' : (isXLogarithmic ? 'xLog' : 'x');
-        const yScaleKey = isYCategorical ? 'yCategorical' : (isYLogarithmic ? 'yLog' : 'y');
+        const xScaleKey = isXCategorical ? 'xCategorical' : isXLogarithmic ? 'xLog' : 'x';
+        const yScaleKey = isYCategorical ? 'yCategorical' : isYLogarithmic ? 'yLog' : 'y';
         const xSplits = isXCategorical
-          ? new Array(xHpLabels.length).fill(0).map((x, i) => i) : undefined;
+          ? new Array(xHpLabels.length).fill(0).map((x, i) => i)
+          : undefined;
         const ySplits = isYCategorical
-          ? new Array(yHpLabels.length).fill(0).map((x, i) => i) : undefined;
+          ? new Array(yHpLabels.length).fill(0).map((x, i) => i)
+          : undefined;
         const xValues = isXCategorical ? xHpLabels : undefined;
         const yValues = isYCategorical ? yHpLabels : undefined;
 
@@ -150,23 +164,16 @@ const HpHeatMaps: React.FC<Props> = ({
               { scale: yScaleKey, splits: ySplits, values: yValues },
             ],
             cursor: { drag: { setScale: false, x: false, y: false } },
-            series: [ {}, { fill, stroke } ],
+            series: [{}, { fill, stroke }],
             title,
           },
-          tooltipLabels: [
-            xLabel,
-            yLabel,
-            null,
-            metricNameToStr(selectedMetric),
-            null,
-            'trial ID',
-          ],
+          tooltipLabels: [xLabel, yLabel, null, metricToStr(selectedMetric), null, 'trial ID'],
         };
       });
     });
 
     return props;
-  }, [ chartData, colorScale, selectedHParams, selectedMetric ]);
+  }, [chartData, colorScale, selectedHParams, selectedMetric]);
 
   const handleChartClick = useCallback((hParam1: string, hParam2: string) => {
     setActiveHParam(generateHpKey(hParam1, hParam2));
@@ -175,9 +182,9 @@ const HpHeatMaps: React.FC<Props> = ({
   const handleGalleryClose = useCallback(() => setActiveHParam(undefined), []);
 
   const handleGalleryNext = useCallback(() => {
-    setActiveHParam(prev => {
+    setActiveHParam((prev) => {
       if (!prev) return prev;
-      const [ hParam1, hParam2 ] = parseHpKey(prev);
+      const [hParam1, hParam2] = parseHpKey(prev);
       const index0 = selectedHParams.indexOf(hParam1);
       const index1 = selectedHParams.indexOf(hParam2);
       if (index0 === -1 || index1 === -1) return prev;
@@ -189,12 +196,12 @@ const HpHeatMaps: React.FC<Props> = ({
         return generateHpKey(selectedHParams[index0], selectedHParams[index1 + 1]);
       }
     });
-  }, [ selectedHParams ]);
+  }, [selectedHParams]);
 
   const handleGalleryPrevious = useCallback(() => {
-    setActiveHParam(prev => {
+    setActiveHParam((prev) => {
       if (!prev) return prev;
-      const [ hParam1, hParam2 ] = parseHpKey(prev);
+      const [hParam1, hParam2] = parseHpKey(prev);
       const index0 = selectedHParams.indexOf(hParam1);
       const index1 = selectedHParams.indexOf(hParam2);
       if (index0 === -1 || index1 === -1) return prev;
@@ -206,21 +213,21 @@ const HpHeatMaps: React.FC<Props> = ({
         return generateHpKey(selectedHParams[index0], selectedHParams[index1 - 1]);
       }
     });
-  }, [ selectedHParams ]);
+  }, [selectedHParams]);
 
   useEffect(() => {
-    if (ui.isPageHidden) return;
+    if (ui.isPageHidden || !selectedMetric) return;
 
     const canceler = new AbortController();
     const trialIds: number[] = [];
-    const hpMetricMap: Record<number, Record<string, number>> = {};
+    const hpMetricMap: Record<number, Record<string, number | null>> = {};
     const hpValueMap: Record<number, Record<string, Primitive>> = {};
     const hpLabelMap: Record<string, string[]> = {};
     const hpLabelValueMap: Record<string, number[]> = {};
 
     setHasLoaded(false);
 
-    consumeStream<V1TrialsSnapshotResponse>(
+    readStream<V1TrialsSnapshotResponse>(
       detApi.StreamingInternal.trialsSnapshot(
         experiment.id,
         selectedMetric.name,
@@ -230,47 +237,53 @@ const HpHeatMaps: React.FC<Props> = ({
         undefined,
         { signal: canceler.signal },
       ),
-      event => {
-        if (!event || !event.trials || !Array.isArray(event.trials)) return;
+      (event) => {
+        if (!event?.trials || !Array.isArray(event.trials)) return;
 
         const hpLogScaleMap: Record<string, boolean> = {};
-        const hpMetrics: Record<string, number[]> = {};
+        const hpMetrics: Record<string, (number | null)[]> = {};
         const hpValues: HpValue = {};
-        const metricRange: Range<number> = [ Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY ];
+        const metricRange: Range<number> = [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
 
-        event.trials.forEach(trial => {
+        event.trials.forEach((trial) => {
           if (!isObject(trial.hparams)) return;
 
           const trialId = trial.trialId;
           const flatHParams = flattenObject(trial.hparams);
           const trialHParams = Object.keys(flatHParams)
-            .filter(hParam => fullHParams.includes(hParam))
+            .filter((hParam) => fullHParams.includes(hParam))
             .sort((a, b) => a.localeCompare(b, 'en'));
+
+          /**
+           * TODO: filtering NaN, +/- Infinity for now, but handle it later with
+           * dynamic min/max ranges via uPlot.Scales.
+           */
+          const trialMetric = Number.isFinite(trial.metric) ? trial.metric : null;
 
           trialIds.push(trialId);
           hpMetricMap[trialId] = hpMetricMap[trialId] || {};
           hpValueMap[trialId] = hpValueMap[trialId] || {};
-          trialHParams.forEach(hParam1 => {
+          trialHParams.forEach((hParam1) => {
             hpValueMap[trialId][hParam1] = flatHParams[hParam1];
-            trialHParams.forEach(hParam2 => {
+            trialHParams.forEach((hParam2) => {
               const key = generateHpKey(hParam1, hParam2);
-              hpMetricMap[trialId][key] = trial.metric;
+              hpMetricMap[trialId][key] = trialMetric;
             });
           });
 
-          if (trial.metric < metricRange[0]) metricRange[0] = trial.metric;
-          if (trial.metric > metricRange[1]) metricRange[1] = trial.metric;
+          if (trialMetric !== null && trialMetric < metricRange[0]) metricRange[0] = trialMetric;
+          if (trialMetric !== null && trialMetric > metricRange[1]) metricRange[1] = trialMetric;
         });
 
-        fullHParams.forEach(hParam1 => {
-          const hp = (experiment.hyperparameters || {})[hParam1];
+        fullHParams.forEach((hParam1) => {
+          const hp = experiment.hyperparameters?.[hParam1];
           if (hp.type === HyperparameterType.Log) hpLogScaleMap[hParam1] = true;
 
           hpLabelMap[hParam1] = [];
           hpLabelValueMap[hParam1] = [];
           hpValues[hParam1] = [];
 
-          trialIds.forEach(trialId => {
+          trialIds.forEach((trialId) => {
             const hpRawValue = hpValueMap[trialId][hParam1];
             const hpValue = isBoolean(hpRawValue) ? hpRawValue.toString() : hpRawValue;
 
@@ -289,9 +302,9 @@ const HpHeatMaps: React.FC<Props> = ({
             }
           });
 
-          fullHParams.forEach(hParam2 => {
+          fullHParams.forEach((hParam2) => {
             const key = generateHpKey(hParam1, hParam2);
-            hpMetrics[key] = trialIds.map(trialId => hpMetricMap[trialId][key]);
+            hpMetrics[key] = trialIds.map((trialId) => hpMetricMap[trialId][key]);
           });
         });
 
@@ -306,10 +319,11 @@ const HpHeatMaps: React.FC<Props> = ({
         });
         setHasLoaded(true);
       },
-    ).catch(e => {
-      setPageError(e);
-      setHasLoaded(true);
-    });
+      (e) => {
+        setPageError(e);
+        setHasLoaded(true);
+      },
+    );
 
     return () => canceler.abort();
   }, [
@@ -321,11 +335,11 @@ const HpHeatMaps: React.FC<Props> = ({
     ui.isPageHidden,
   ]);
 
-  useEffect(() => setGalleryHeight(resize.height), [ resize ]);
+  useEffect(() => setGalleryHeight(resize.height), [resize]);
 
   if (pageError) {
     return <Message title={pageError.message} />;
-  } else if (hasLoaded && !chartData) {
+  } else if ((hasLoaded && !chartData) || !selectedMetric) {
     return isExperimentTerminal ? (
       <Message title="No data to plot." type={MessageType.Empty} />
     ) : (
@@ -341,12 +355,7 @@ const HpHeatMaps: React.FC<Props> = ({
 
   return (
     <div className={css.base} ref={baseRef}>
-      <Section
-        bodyBorder
-        bodyNoPadding
-        bodyScroll
-        filters={filters}
-        loading={!hasLoaded}>
+      <Section bodyBorder bodyNoPadding bodyScroll filters={filters} loading={!hasLoaded}>
         <div className={css.container}>
           {chartProps ? (
             <>
@@ -361,18 +370,21 @@ const HpHeatMaps: React.FC<Props> = ({
                   border={true}
                   minItemWidth={resize.width > 320 ? 350 : 270}
                   mode={!isListView ? selectedHParams.length : GridMode.AutoFill}>
-                  {selectedHParams.map(hParam1 => selectedHParams.map(hParam2 => {
-                    const key = generateHpKey(hParam1, hParam2);
-                    return (
-                      <div key={key} onClick={() => handleChartClick(hParam1, hParam2)}>
-                        <UPlotScatter
-                          data={chartProps[key].data}
-                          options={chartProps[key].options}
-                          tooltipLabels={chartProps[key].tooltipLabels}
-                        />
-                      </div>
-                    );
-                  }))}
+                  {selectedHParams.map((hParam1) =>
+                    selectedHParams.map((hParam2) => {
+                      const key = generateHpKey(hParam1, hParam2);
+                      return (
+                        <div key={key} onClick={() => handleChartClick(hParam1, hParam2)}>
+                          <UPlotScatter
+                            colorScaleDistribution={selectedScale}
+                            data={chartProps[key].data}
+                            options={chartProps[key].options}
+                            tooltipLabels={chartProps[key].tooltipLabels}
+                          />
+                        </div>
+                      );
+                    }),
+                  )}
                 </Grid>
               </div>
             </>
@@ -383,12 +395,13 @@ const HpHeatMaps: React.FC<Props> = ({
       </Section>
       <GalleryModal
         height={galleryHeight}
-        visible={!!activeHParam}
+        open={!!activeHParam}
         onCancel={handleGalleryClose}
         onNext={handleGalleryNext}
         onPrevious={handleGalleryPrevious}>
         {chartProps && activeHParam && (
           <UPlotScatter
+            colorScaleDistribution={selectedScale}
             data={chartProps[activeHParam].data}
             options={{
               ...chartProps[activeHParam].options,

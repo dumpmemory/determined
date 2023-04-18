@@ -1,16 +1,20 @@
 import base64
 import json
 import re
-from argparse import Namespace
+from argparse import ArgumentError, Namespace
 from collections import OrderedDict, namedtuple
 from pathlib import Path
 from typing import IO, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from termcolor import colored
 
+from determined import cli
 from determined.cli import render
 from determined.common import api, context, util, yaml
 from determined.common.api import authentication
+
+yaml = yaml.YAML(typ="safe", pure=True)  # type: ignore
+
 
 CONFIG_DESC = """
 Additional configuration arguments for setting up a command.
@@ -20,11 +24,19 @@ List values can be specified by comma-separated values.
 """
 
 CONTEXT_DESC = """
-The filepath to a directory that contains the set of files used to
-execute the command. All files under this directory will be packaged,
-maintaining the existing directory structure. The total byte contents
-of the directory must not exceed 96 MB. By default, the context
-directory will be empty.
+A directory whose contents should be copied into the task container.
+Unlike --include, the directory itself will not appear in the task
+container, only its contents.  The total bytes copied into the container
+must not exceed 96 MB.  By default, no files are copied.  See also:
+--include, which preserves the root directory name.
+"""
+
+INCLUDE_DESC = """
+A file or directory to copy into the task container.  May be provided more
+than once.   Unlike --context, --include will preserve the top-level
+directory name during the copy.  The total bytes copied into the
+container must not exceed 96 MB.  By default, no files are copied.  See
+also: --context, when a task should run inside a directory.
 """
 
 VOLUME_DESC = """
@@ -38,8 +50,8 @@ _CONFIG_PATHS_COERCE_TO_LIST = {
     "bind_mounts",
 }
 
-UUID_REGEX = re.compile(
-    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+TASK_ID_REGEX = re.compile(
+    r"^(?:[0-9]+\.)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 
 CommandTableHeader = OrderedDict(
@@ -50,6 +62,7 @@ CommandTableHeader = OrderedDict(
         ("state", "state"),
         ("exitStatus", "exitStatus"),
         ("resourcePool", "resourcePool"),
+        ("workspaceName", "workspaceName"),
     ]
 )
 
@@ -63,6 +76,7 @@ TensorboardTableHeader = OrderedDict(
         ("trialIds", "trialIds"),
         ("exitStatus", "exitStatus"),
         ("resourcePool", "resourcePool"),
+        ("workspaceName", "workspaceName"),
     ]
 )
 
@@ -99,7 +113,7 @@ RemoteTaskOldAPIs = {
     TaskTypeTensorBoard: "tensorboard",
 }
 
-RemoteTaskListTableHeaders = {
+RemoteTaskListTableHeaders: Dict[str, Dict[str, str]] = {
     "notebook": CommandTableHeader,
     "command cmd": CommandTableHeader,
     "shell": CommandTableHeader,
@@ -142,14 +156,18 @@ def expand_uuid_prefixes(
         prefixes = [prefixes]
 
     # Avoid making a network request if everything is already a full UUID.
-    if not all(UUID_REGEX.match(p) for p in prefixes):
+    if not all(TASK_ID_REGEX.match(p) for p in prefixes):
+        if args._command not in RemoteTaskNewAPIs:
+            raise api.errors.BadRequestException(
+                f"partial UUIDs not supported for 'det {args._command} {args._subcommand}'"
+            )
         api_path = RemoteTaskNewAPIs[args._command]
         api_full_path = "api/v1/{}".format(api_path)
         res = api.get(args.master, api_full_path).json()[api_path]
         all_ids: List[str] = [x["id"] for x in res]
 
         def expand(prefix: str) -> str:
-            if UUID_REGEX.match(prefix):
+            if TASK_ID_REGEX.match(prefix):
                 return prefix
 
             # Could do better algorithmically than repeated linear scans, but let's not complicate
@@ -174,10 +192,19 @@ def list_tasks(args: Namespace) -> None:
     api_full_path = "api/v1/{}".format(api_path)
     table_header = RemoteTaskListTableHeaders[args._command]
 
-    if args.all:
-        params = {}  # type: Dict[str, Any]
-    else:
-        params = {"users": [authentication.must_cli_auth().get_session_user()]}
+    params: Dict[str, Any] = {}
+
+    if "workspace_name" in args and args.workspace_name is not None:
+        workspace = cli.workspace.get_workspace_by_name(
+            cli.setup_session(args), args.workspace_name
+        )
+        if workspace is None:
+            raise ArgumentError(None, f'Workspace "{args.workspace_name}" not found.')
+
+        params["workspaceId"] = workspace.id
+
+    if not args.all:
+        params["users"] = [authentication.must_cli_auth().get_session_user()]
 
     res = api.get(args.master, api_full_path, params=params).json()[api_path]
 
@@ -186,9 +213,17 @@ def list_tasks(args: Namespace) -> None:
             print(command["id"])
         return
 
+    # swap workspace_id for workspace name.
+    w_names = cli.workspace.get_workspace_names(cli.setup_session(args))
+
     for item in res:
         if item["state"].startswith("STATE_"):
             item["state"] = item["state"][6:]
+        if "workspaceId" in item:
+            wId = item["workspaceId"]
+            item["workspaceName"] = (
+                w_names[wId] if wId in w_names else f"missing workspace id {wId}"
+            )
 
     if getattr(args, "json", None):
         print(json.dumps(res, indent=4))
@@ -262,12 +297,12 @@ def parse_config_overrides(config: Dict[str, Any], overrides: Iterable[str]) -> 
 
         key, value = config_arg.split("=", maxsplit=1)  # type: Tuple[str, Any]
 
-        # Separate values if a comma exists. Use yaml.safe_load() to cast
+        # Separate values if a comma exists. Use yaml.load() to cast
         # the value(s) to the type YAML would use, e.g., "4" -> 4.
         if "," in value:
-            value = [yaml.safe_load(v) for v in value.split(",")]
+            value = [yaml.load(v) for v in value.split(",")]
         else:
-            value = yaml.safe_load(value)
+            value = yaml.load(value)
 
             # Certain configurations keys are expected to have list values.
             # Convert a single value to a singleton list if needed.
@@ -317,13 +352,13 @@ def launch_command(
     config: Dict[str, Any],
     template: str,
     context_path: Optional[Path] = None,
+    includes: Iterable[Path] = (),
     data: Optional[Dict[str, Any]] = None,
+    workspace_id: Optional[int] = None,
     preview: Optional[bool] = False,
     default_body: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    user_files = []  # type: List[Dict[str, Any]]
-    if context_path:
-        user_files, _ = context.read_context(context_path)
+    user_files = context.read_legacy_context(context_path, includes)
 
     body = {}  # type: Dict[str, Any]
     if default_body:
@@ -345,6 +380,9 @@ def launch_command(
     if preview:
         body["preview"] = preview
 
+    if workspace_id is not None:
+        body["workspaceId"] = workspace_id
+
     return api.post(
         master,
         endpoint,
@@ -360,8 +398,8 @@ def render_event_stream(event: Any) -> None:
         )
     elif event["assigned_event"] is not None:
         print(colored("{} was assigned to an agent...".format(description), "green"))
-    elif event["container_started_event"] is not None:
-        print(colored("Container of {} has started...".format(description), "green"))
+    elif event["resources_started_event"] is not None:
+        print(colored("Resources for {} has started...".format(description), "green"))
     elif event["service_ready_event"] is not None:
         pass  # Ignore this message.
     elif event["terminate_request_event"] is not None:

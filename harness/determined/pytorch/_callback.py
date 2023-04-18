@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 class PyTorchCallback:
     """
     Abstract base class used to define a callback that should execute during
-    the lifetime of a PyTorchTrial.
+    the lifetime of a PyTorchTrial or DeepSpeedTrial.
 
     .. warning::
         If you are defining a stateful callback (e.g., it mutates a ``self``
@@ -13,10 +13,10 @@ class PyTorchCallback:
         over checkpoints.
 
     .. warning::
-        If distributed training is enabled, every GPU will execute a copy of this callback
-        (except for :meth:`on_validation_end`, :meth:`on_validation_step_end` and
-        :meth:`on_checkpoint_end`). To configure a callback implementation to execute on a subset of
-        GPUs, please condition your implementation on ``trial.context.distributed.get_rank()``.
+        If distributed training is enabled, every GPU will execute a copy of this callback (except
+        for :meth:`on_checkpoint_write_end` during PyTorchTrial training, which is only called on
+        the chief). To configure a callback implementation to execute on a subset of GPUs, please
+        condition your implementation on ``trial.context.distributed.get_rank()``.
     """
 
     def on_trial_startup(self, first_batch_idx: int, checkpoint_uuid: Optional[str]) -> None:
@@ -27,7 +27,7 @@ class PyTorchCallback:
             first_batch_idx (int):  The first batch index to be trained.  If the trial has already
                 completed some amount of training in a previous allocation on the cluster, this will
                 be nonzero.
-            checkpoint_uuid (str or None):  The checkpoint from which weight, optimizer state, etc
+            checkpoint_uuid (str or None):  The checkpoint from which weight, optimizer state, etc.
                 will be loaded.  When ``first_batch_idx > 0`` this will contain the uuid of the
                 most recent checkpoint saved by this trial.  Otherwise, it will contain the uuid of
                 the checkpoint from which this trial was configured to warm start from (via
@@ -57,27 +57,7 @@ class PyTorchCallback:
     def on_validation_end(self, metrics: Dict[str, Any]) -> None:
         """
         Run after every validation ends.
-
-        .. warning::
-            This callback only executes on the chief GPU when doing distributed training.
         """
-        pass
-
-    def on_validation_step_start(self) -> None:
-        """
-        Run before every validation step begins.
-        """
-        # TODO(DET-3555): remove this once it has been deprecated long enough.
-        pass
-
-    def on_validation_step_end(self, metrics: Dict[str, Any]) -> None:
-        """
-        Run after every validation step ends.
-
-        .. warning::
-            This callback only executes on the chief GPU when doing distributed training.
-        """
-        # TODO(DET-3555): remove this once it has been deprecated long enough.
         pass
 
     def on_checkpoint_load_start(self, checkpoint: Dict[str, Any]) -> None:
@@ -94,10 +74,28 @@ class PyTorchCallback:
 
     def on_checkpoint_end(self, checkpoint_dir: str) -> None:
         """
-        Run after every checkpoint.
+        Deprecated. Please use :meth:`on_checkpoint_write_end` instead.
 
         .. warning::
-            This callback only executes on the chief GPU when doing distributed training.
+            This callback only executes on the chief GPU when doing distributed training with
+            PyTorchTrial.
+        """
+        # TODO(DET-7912): remove this once it has been deprecated long enough.
+        pass
+
+    def on_checkpoint_write_end(self, checkpoint_dir: str) -> None:
+        """
+        Run after every checkpoint finishes writing to checkpoint_dir.
+
+        .. warning::
+            This callback only executes on the chief GPU when doing distributed training with
+            PyTorchTrial.
+        """
+        pass
+
+    def on_checkpoint_upload_end(self, uuid: str) -> None:
+        """
+        Run after every checkpoint finishes uploading.
         """
         pass
 
@@ -129,6 +127,16 @@ class PyTorchCallback:
     def on_training_epoch_end(self, epoch_idx: int) -> None:
         """
         Run on end of a training epoch
+        """
+        pass
+
+    def on_training_workload_end(
+        self, avg_metrics: Dict[str, Any], batch_metrics: Dict[str, Any]
+    ) -> None:
+        """
+        Run on end of a training workload. Workloads can contain varying numbers of batches. In the
+        current implementation of PyTorchTrial and DeepSpeedTrial, the maximum number of batches in
+        a workload is equal to the ``scheduling_unit`` field defined in the experiment config.
         """
         pass
 

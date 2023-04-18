@@ -7,12 +7,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"math"
 	"math/rand"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,14 +20,15 @@ import (
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/determined-ai/determined/proto/pkg/commonv1"
 	"github.com/determined-ai/determined/proto/pkg/trialv1"
 
 	"github.com/determined-ai/determined/master/internal"
 	"github.com/determined-ai/determined/master/internal/db"
+	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 
 	"github.com/determined-ai/determined/master/test/testutils"
 
-	"github.com/golang/protobuf/ptypes"
 	"gotest.tools/assert"
 
 	"github.com/determined-ai/determined/master/pkg/model"
@@ -42,7 +41,7 @@ func TestTrialDetail(t *testing.T) {
 	defer cancel()
 	assert.NilError(t, err, "failed to start master")
 
-	trialDetailAPITests(t, creds, cl, pgDB)
+	trialDetailAPITests(creds, t, cl, pgDB)
 }
 
 func TestTrialProfilerMetrics(t *testing.T) {
@@ -51,7 +50,7 @@ func TestTrialProfilerMetrics(t *testing.T) {
 	defer cancel()
 	assert.NilError(t, err, "failed to start master")
 
-	trialProfilerMetricsTests(t, creds, cl, pgDB)
+	trialProfilerMetricsTests(creds, t, cl, pgDB)
 }
 
 func TestTrialProfilerMetricsAvailableSeries(t *testing.T) {
@@ -60,11 +59,11 @@ func TestTrialProfilerMetricsAvailableSeries(t *testing.T) {
 	defer cancel()
 	assert.NilError(t, err, "failed to start master")
 
-	trialProfilerMetricsAvailableSeriesTests(t, creds, cl, pgDB)
+	trialProfilerMetricsAvailableSeriesTests(creds, t, cl, pgDB)
 }
 
 func trialDetailAPITests(
-	t *testing.T, creds context.Context, cl apiv1.DeterminedClient, db *db.PgDB,
+	creds context.Context, t *testing.T, cl apiv1.DeterminedClient, pgDB *db.PgDB,
 ) {
 	type testCase struct {
 		name    string
@@ -101,18 +100,11 @@ func trialDetailAPITests(
 
 	runTestCase := func(t *testing.T, tc testCase, id int) {
 		t.Run(tc.name, func(t *testing.T) {
-			experiment := model.ExperimentModel()
-			err := db.AddExperiment(experiment)
-			assert.NilError(t, err, "failed to insert experiment")
-
-			trial := model.TrialModel(
-				experiment.ID, experiment.JobID, model.WithTrialState(model.ActiveState))
-			err = db.AddTrial(trial)
-			assert.NilError(t, err, "failed to insert trial")
+			_, activeConfig, trial := setupTrial(t, pgDB)
 
 			metrics := trialv1.TrialMetrics{
-				TrialId:     int32(trial.ID),
-				LatestBatch: int32(id * experiment.Config.SchedulingUnit()),
+				TrialId:        int32(trial.ID),
+				StepsCompleted: int32(id * activeConfig.SchedulingUnit()),
 			}
 
 			m := structpb.Struct{}
@@ -120,42 +112,106 @@ func trialDetailAPITests(
 			assert.NilError(t, err, "failed to marshal metrics")
 			err = protojson.Unmarshal(b, &m)
 			assert.NilError(t, err, "failed to unmarshal metrics")
-			metrics.Metrics = &m
+			metrics.Metrics = &commonv1.Metrics{
+				AvgMetrics: &m,
+			}
 
-			err = db.AddTrainingMetrics(context.Background(), &metrics)
+			err = pgDB.AddTrainingMetrics(context.Background(), &metrics)
 			assert.NilError(t, err, "failed to insert step")
 
-			ctx, _ := context.WithTimeout(creds, 10*time.Second)
+			ctx, cancel := context.WithTimeout(creds, 10*time.Second)
+			defer cancel()
 			req := apiv1.GetTrialRequest{TrialId: int32(trial.ID)}
 
-			tlCl, err := cl.GetTrial(ctx, &req)
+			_, err = cl.GetTrial(ctx, &req)
 			assert.NilError(t, err, "failed to fetch api details")
-			assert.Equal(t, len(tlCl.Workloads), 1, "mismatching workload length")
 		})
 	}
 
 	for idx, tc := range testCases {
 		runTestCase(t, tc, idx)
 	}
+}
 
+func TestTrialWorkloadsHugeMetrics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	_, _, cl, creds, err := testutils.RunMaster(ctx, nil)
+	defer cancel()
+	assert.NilError(t, err, "failed to start master")
+
+	trialWorkloadsAPIHugeMetrics(creds, t, cl, pgDB)
+}
+
+func makeMetrics() *structpb.Struct {
+	return &structpb.Struct{
+		Fields: map[string]*structpb.Value{
+			"loss1": {
+				Kind: &structpb.Value_NumberValue{
+					NumberValue: rand.Float64(), //nolint: gosec
+				},
+			},
+			"loss2": {
+				Kind: &structpb.Value_NumberValue{
+					NumberValue: rand.Float64(), //nolint: gosec
+				},
+			},
+		},
+	}
+}
+
+func trialWorkloadsAPIHugeMetrics(
+	creds context.Context, t *testing.T, cl apiv1.DeterminedClient, pgDB *db.PgDB,
+) {
+	_, _, trial := setupTrial(t, pgDB)
+
+	batchMetrics := []*structpb.Struct{}
+	const stepSize = 1
+	for j := 0; j < stepSize; j++ {
+		batchMetrics = append(batchMetrics, makeMetrics())
+	}
+
+	metrics := trialv1.TrialMetrics{
+		TrialId:        int32(trial.ID),
+		StepsCompleted: stepSize,
+		Metrics: &commonv1.Metrics{
+			AvgMetrics:   makeMetrics(),
+			BatchMetrics: batchMetrics,
+		},
+	}
+
+	err := pgDB.AddTrainingMetrics(context.Background(), &metrics)
+	assert.NilError(t, err, "failed to insert step")
+
+	_, err = pgDB.RawQuery("test_insert_huge_metrics", trial.ID, 100000)
+	assert.NilError(t, err, "failed to insert huge amount of metrics")
+
+	req := apiv1.GetTrialWorkloadsRequest{
+		TrialId:             int32(trial.ID),
+		IncludeBatchMetrics: true,
+		Limit:               1,
+	}
+	ctx, cancel := context.WithTimeout(creds, 30*time.Second)
+	defer cancel()
+	resp, err := cl.GetTrialWorkloads(ctx, &req)
+	assert.NilError(t, err, "failed to fetch trial workloads")
+
+	for _, workloadContainer := range resp.Workloads {
+		training := workloadContainer.GetTraining()
+		if training == nil {
+			continue
+		}
+		assert.Equal(t, len(training.Metrics.BatchMetrics) > 0, true)
+	}
 }
 
 func trialProfilerMetricsTests(
-	t *testing.T, creds context.Context, cl apiv1.DeterminedClient, db *db.PgDB,
+	creds context.Context, t *testing.T, cl apiv1.DeterminedClient, pgDB *db.PgDB,
 ) {
-	// Given an experiment.
-	experiment := model.ExperimentModel()
-	err := db.AddExperiment(experiment)
-	assert.NilError(t, err, "failed to insert experiment")
-
-	// With a trial.
-	trial := model.TrialModel(
-		experiment.ID, experiment.JobID, model.WithTrialState(model.ActiveState))
-	err = db.AddTrial(trial)
-	assert.NilError(t, err, "failed to insert trial")
+	_, _, trial := setupTrial(t, pgDB)
 
 	// If we begin to stream for metrics.
-	ctx, _ := context.WithTimeout(creds, time.Minute)
+	ctx, cancel := context.WithTimeout(creds, time.Minute)
+	defer cancel()
 	tlCl, err := cl.GetTrialProfilerMetrics(ctx, &apiv1.GetTrialProfilerMetricsRequest{
 		Labels: &trialv1.TrialProfilerMetricLabels{
 			TrialId:    int32(trial.ID),
@@ -170,7 +226,7 @@ func trialProfilerMetricsTests(
 	for i := 0; i < 10; i++ {
 		// When we add some metrics that match our stream.
 		match := randTrialProfilerSystemMetrics(trial.ID, "gpu_util", "brad's agent", "1")
-		_, err := cl.PostTrialProfilerMetricsBatch(creds, &apiv1.PostTrialProfilerMetricsBatchRequest{
+		_, err = cl.PostTrialProfilerMetricsBatch(creds, &apiv1.PostTrialProfilerMetricsBatchRequest{
 			Batches: []*trialv1.TrialProfilerMetricsBatch{
 				match,
 			},
@@ -187,8 +243,8 @@ func trialProfilerMetricsTests(
 		assert.NilError(t, err, "failed to insert mocked unmatched trial profiler metrics")
 
 		// Then when we receive the metrics, they should be the metrics we expect.
-		recvMetricsBatch, err := tlCl.Recv()
-		assert.NilError(t, err, "failed to stream metrics")
+		recvMetricsBatch, metricErr := tlCl.Recv()
+		assert.NilError(t, metricErr, "failed to stream metrics")
 
 		// Just nil the values since the floats and timestamps lose a little precision getting thrown
 		// around so much.
@@ -197,11 +253,11 @@ func trialProfilerMetricsTests(
 		recvMetricsBatch.Batch.Values = nil
 		recvMetricsBatch.Batch.Timestamps = nil
 
-		bOrig, err := protojson.Marshal(match)
-		assert.NilError(t, err, "failed marshal original metrics")
+		bOrig, b0Err := protojson.Marshal(match)
+		assert.NilError(t, b0Err, "failed marshal original metrics")
 
-		bRecv, err := protojson.Marshal(recvMetricsBatch.Batch)
-		assert.NilError(t, err, "failed marshal received metrics")
+		bRecv, bRecvErr := protojson.Marshal(recvMetricsBatch.Batch)
+		assert.NilError(t, bRecvErr, "failed marshal received metrics")
 
 		origEqRecv := bytes.Equal(bOrig, bRecv)
 		assert.Assert(t, origEqRecv, "received:\nt\t%s\noriginal:\n\t%s", bRecv, bOrig)
@@ -217,18 +273,12 @@ func trialProfilerMetricsTests(
 }
 
 func trialProfilerMetricsAvailableSeriesTests(
-	t *testing.T, creds context.Context, cl apiv1.DeterminedClient, db *db.PgDB,
+	creds context.Context, t *testing.T, cl apiv1.DeterminedClient, pgDB *db.PgDB,
 ) {
-	experiment := model.ExperimentModel()
-	err := db.AddExperiment(experiment)
-	assert.NilError(t, err, "failed to insert experiment")
+	_, _, trial := setupTrial(t, pgDB)
 
-	trial := model.TrialModel(
-		experiment.ID, experiment.JobID, model.WithTrialState(model.ActiveState))
-	err = db.AddTrial(trial)
-	assert.NilError(t, err, "failed to insert trial")
-
-	ctx, _ := context.WithTimeout(creds, time.Minute)
+	ctx, cancel := context.WithTimeout(creds, time.Minute)
+	defer cancel()
 	tlCl, err := cl.GetTrialProfilerAvailableSeries(ctx, &apiv1.GetTrialProfilerAvailableSeriesRequest{
 		TrialId: int32(trial.ID),
 		Follow:  true,
@@ -255,11 +305,13 @@ func trialProfilerMetricsAvailableSeriesTests(
 		})
 		assert.NilError(t, err, "failed to insert mocked trial profiler metrics")
 
-		// This may need 2 or more attempts; gRPC streaming does not provide any backpressure mechanism, if the client
-		// is not ready to receive a message when it is sent to the stream server side, the server will buffer it and
-		// any calls to Send will return, allowing the code to chug along merrily and Send more and more data while the
-		// client doesn't consume it. Because of this, we give the test a chance to read out stale entries before
-		// marking the attempt as a failure. For more detail, see https://github.com/grpc/grpc-go/issues/2159.
+		// This may need 2 or more attempts; gRPC streaming does not provide any backpressure
+		// mechanism, if the client is not ready to receive a message when it is sent to the
+		// stream server side, the server will buffer it and any calls to Send will return,
+		// allowing the code to chug along merrily and Send more and more data while the
+		// client doesn't consume it. Because of this, we give the test a chance to read
+		// out stale entries before marking the attempt as a failure. For more detail, see
+		// https://github.com/grpc/grpc-go/issues/2159.
 		shots := 5
 		var resp *apiv1.GetTrialProfilerAvailableSeriesResponse
 		for i := 1; i <= shots; i++ {
@@ -287,23 +339,6 @@ func trialProfilerMetricsAvailableSeriesTests(
 	}
 }
 
-func assertStringContains(t *testing.T, actual, expected string) {
-	assert.Assert(t, strings.Contains(actual, expected),
-		fmt.Sprintf("%s not in %s", expected, actual))
-}
-
-// stringWithPrefix is a convenience function that returns a pointer.
-func stringWithPrefix(p, s string) *string {
-	x := p + s
-	return &x
-}
-
-// timePlusDuration is a convenience function that returns a pointer.
-func timePlusDuration(t time.Time, d time.Duration) *time.Time {
-	t2 := t.Add(d)
-	return &t2
-}
-
 func sequentialIntSlice(start, n int) []int32 {
 	fs := make([]int32, n)
 	for i := 0; i < n; i++ {
@@ -315,7 +350,7 @@ func sequentialIntSlice(start, n int) []int32 {
 func randFloatSlice(n int) []float32 {
 	fs := make([]float32, n)
 	for i := 0; i < n; i++ {
-		fs[i] = rand.Float32()
+		fs[i] = rand.Float32() //nolint: gosec
 	}
 	return fs
 }
@@ -323,9 +358,10 @@ func randFloatSlice(n int) []float32 {
 func pbTimestampSlice(n int) []*timestamppb.Timestamp {
 	ts := make([]*timestamppb.Timestamp, n)
 	for i := 0; i < n; i++ {
-		ts[i] = ptypes.TimestampNow()
+		ts[i] = timestamppb.Now()
 		// Round off to millis.
-		ts[i].Nanos = int32(math.Round(float64(ts[i].Nanos)/float64(time.Millisecond)) * float64(time.Millisecond))
+		ts[i].Nanos = int32(math.Floor(float64(ts[i].Nanos)/float64(time.Millisecond)) *
+			float64(time.Millisecond))
 	}
 	return ts
 }
@@ -345,4 +381,25 @@ func randTrialProfilerSystemMetrics(
 			MetricType: trialv1.TrialProfilerMetricLabels_PROFILER_METRIC_TYPE_SYSTEM,
 		},
 	}
+}
+
+func setupTrial(t *testing.T, pgDB *db.PgDB) (
+	*model.Experiment, expconf.ExperimentConfig, *model.Trial,
+) {
+	experiment, activeConfig := model.ExperimentModel()
+	err := pgDB.AddExperiment(experiment, activeConfig)
+	assert.NilError(t, err, "failed to insert experiment")
+
+	task := db.RequireMockTask(t, pgDB, experiment.OwnerID)
+	trial := &model.Trial{
+		TaskID:       task.TaskID,
+		JobID:        experiment.JobID,
+		ExperimentID: experiment.ID,
+		State:        model.ActiveState,
+		StartTime:    time.Now(),
+	}
+
+	err = pgDB.AddTrial(trial)
+	assert.NilError(t, err, "failed to insert trial")
+	return experiment, activeConfig, trial
 }

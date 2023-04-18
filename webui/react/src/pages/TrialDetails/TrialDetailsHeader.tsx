@@ -1,25 +1,25 @@
 import React, { useCallback, useMemo, useState } from 'react';
 
-import Icon from 'components/Icon';
+import BreadcrumbBar from 'components/BreadcrumbBar';
+import ExperimentCreateModalComponent, {
+  CreateExperimentType,
+} from 'components/ExperimentCreateModal';
+import { useModal } from 'components/kit/Modal';
 import PageHeaderFoldable, { Option } from 'components/PageHeaderFoldable';
 import { terminalRunStates } from 'constants/states';
-import useCreateExperimentModal, {
-  CreateExperimentType,
-} from 'hooks/useModal/useModalExperimentCreate';
+import useModalHyperparameterSearch from 'hooks/useModal/HyperparameterSearch/useModalHyperparameterSearch';
 import TrialHeaderLeft from 'pages/TrialDetails/Header/TrialHeaderLeft';
-import { openOrCreateTensorBoard } from 'services/api';
-import { getStateColorCssVar } from 'themes';
-import { ExperimentAction as Action, ExperimentBase, TrialDetails } from 'types';
-import { getWorkload, isMetricsWorkload } from 'utils/workload';
-import { openCommand } from 'wait';
-
-export const trialWillNeverHaveData = (trial: TrialDetails): boolean => {
-  const isTerminal = terminalRunStates.has(trial.state);
-  const workloadsWithSomeMetric = trial.workloads
-    .map(getWorkload)
-    .filter(workload => isMetricsWorkload(workload) && !!workload.metrics);
-  return isTerminal && workloadsWithSomeMetric.length === 0;
-};
+import { getTrialWorkloads, openOrCreateTensorBoard } from 'services/api';
+import Icon from 'shared/components/Icon/Icon';
+import {
+  ExperimentAction as Action,
+  ExperimentAction,
+  ExperimentBase,
+  TrialDetails,
+  TrialWorkloadFilter,
+} from 'types';
+import { canActionExperiment } from 'utils/experiment';
+import { openCommandResponse } from 'utils/wait';
 
 interface Props {
   experiment: ExperimentBase;
@@ -27,25 +27,40 @@ interface Props {
   trial: TrialDetails;
 }
 
-const TrialDetailsHeader: React.FC<Props> = ({
-  experiment,
-  fetchTrialDetails,
-  trial,
-}: Props) => {
-  const [ isRunningTensorBoard, setIsRunningTensorBoard ] = useState<boolean>(false);
+const TrialDetailsHeader: React.FC<Props> = ({ experiment, fetchTrialDetails, trial }: Props) => {
+  const [isRunningTensorBoard, setIsRunningTensorBoard] = useState<boolean>(false);
+  const [trialNeverData, setTrialNeverData] = useState<boolean>(false);
 
-  const handleModalClose = useCallback(() => fetchTrialDetails(), [ fetchTrialDetails ]);
+  const handleModalClose = useCallback(() => fetchTrialDetails(), [fetchTrialDetails]);
 
-  const { modalOpen } = useCreateExperimentModal({ onClose: handleModalClose });
+  const ExperimentCreateModal = useModal(ExperimentCreateModalComponent);
 
-  const handleContinueTrial = useCallback(() => {
-    modalOpen({ experiment, trial, type: CreateExperimentType.ContinueTrial });
-  }, [ experiment, modalOpen, trial ]);
+  const {
+    contextHolder: modalHyperparameterSearchContextHolder,
+    modalOpen: openModalHyperparameterSearch,
+  } = useModalHyperparameterSearch({ experiment, trial });
+
+  const handleHyperparameterSearch = useCallback(() => {
+    openModalHyperparameterSearch();
+  }, [openModalHyperparameterSearch]);
+
+  useMemo(async () => {
+    if (!terminalRunStates.has(trial.state)) {
+      setTrialNeverData(false);
+    } else {
+      const wl = await getTrialWorkloads({
+        filter: TrialWorkloadFilter.All,
+        id: trial.id,
+        limit: 1,
+      });
+      setTrialNeverData(wl.workloads.length === 0);
+    }
+  }, [trial]);
 
   const headerOptions = useMemo<Option[]>(() => {
     const options: Option[] = [];
 
-    if (!trialWillNeverHaveData(trial)) {
+    if (!trialNeverData) {
       options.push({
         icon: <Icon name="tensor-board" size="small" />,
         isLoading: isRunningTensorBoard,
@@ -53,44 +68,69 @@ const TrialDetailsHeader: React.FC<Props> = ({
         label: 'TensorBoard',
         onClick: async () => {
           setIsRunningTensorBoard(true);
-          const tensorboard = await openOrCreateTensorBoard({ trialIds: [ trial.id ] });
-          openCommand(tensorboard);
+          const commandResponse = await openOrCreateTensorBoard({
+            trialIds: [trial.id],
+            workspaceId: experiment.workspaceId,
+          });
+          openCommandResponse(commandResponse);
           await fetchTrialDetails();
           setIsRunningTensorBoard(false);
         },
       });
     }
 
-    if (trial.bestAvailableCheckpoint !== undefined) {
+    if (canActionExperiment(ExperimentAction.ContinueTrial, experiment, trial)) {
+      if (trial.bestAvailableCheckpoint !== undefined) {
+        options.push({
+          icon: <Icon name="fork" size="small" />,
+          key: Action.ContinueTrial,
+          label: 'Continue Trial',
+          onClick: ExperimentCreateModal.open,
+        });
+      } else {
+        options.push({
+          icon: <Icon name="fork" size="small" />,
+          key: Action.ContinueTrial,
+          label: 'Continue Trial',
+          tooltip: 'No checkpoints found. Cannot continue trial',
+        });
+      }
+    }
+
+    if (canActionExperiment(ExperimentAction.HyperparameterSearch, experiment, trial)) {
       options.push({
-        icon: <Icon name="fork" size="small" />,
-        key: Action.ContinueTrial,
-        label: 'Continue Trial',
-        onClick: handleContinueTrial,
-      });
-    } else {
-      options.push({
-        icon: <Icon name="fork" size="small" />,
-        key: Action.ContinueTrial,
-        label: 'Continue Trial',
-        tooltip: 'No checkpoints found. Cannot continue trial',
+        key: Action.HyperparameterSearch,
+        label: 'Hyperparameter Search',
+        onClick: handleHyperparameterSearch,
       });
     }
 
     return options;
   }, [
+    experiment,
     fetchTrialDetails,
-    handleContinueTrial,
+    ExperimentCreateModal,
+    handleHyperparameterSearch,
     isRunningTensorBoard,
     trial,
+    trialNeverData,
   ]);
 
   return (
-    <PageHeaderFoldable
-      leftContent={<TrialHeaderLeft experiment={experiment} trial={trial} />}
-      options={headerOptions}
-      style={{ backgroundColor: getStateColorCssVar(trial.state) }}
-    />
+    <>
+      <BreadcrumbBar experiment={experiment} id={trial.id} trial={trial} type="trial" />
+      <PageHeaderFoldable
+        leftContent={<TrialHeaderLeft experiment={experiment} trial={trial} />}
+        options={headerOptions}
+      />
+      <ExperimentCreateModal.Component
+        experiment={experiment}
+        trial={trial}
+        type={CreateExperimentType.ContinueTrial}
+        onClose={handleModalClose}
+      />
+      {modalHyperparameterSearchContextHolder}
+    </>
   );
 };
 

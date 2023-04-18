@@ -1,15 +1,20 @@
-import { Form, FormInstance, Input, List, Modal, Select, Typography } from 'antd';
-import React, { ReactNode, useCallback, useMemo, useRef, useState } from 'react';
+import { List, Modal, Select, Typography } from 'antd';
+import React, { ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 
 import Badge, { BadgeType } from 'components/Badge';
-import { useStore } from 'contexts/Store';
+import Form from 'components/kit/Form';
+import Input from 'components/kit/Input';
 import { columns } from 'pages/JobQueue/JobQueue.table';
-import { updateJobQueue } from 'services/api';
+import { getJobQ, updateJobQueue } from 'services/api';
 import * as api from 'services/api-ts-sdk';
+import { ErrorType } from 'shared/utils/error';
+import { floatToPercent, truncate } from 'shared/utils/string';
+import clusterStore from 'stores/cluster';
 import { Job, JobType, RPStats } from 'types';
-import handleError, { ErrorType } from 'utils/error';
+import handleError from 'utils/error';
 import { moveJobToPositionUpdate, orderedSchedulers, unsupportedQPosSchedulers } from 'utils/job';
-import { floatToPercent, truncate } from 'utils/string';
+import { Loadable } from 'utils/loadable';
+import { useObservable } from 'utils/observable';
 
 import css from './ManageJob.module.scss';
 const { Option } = Select;
@@ -17,7 +22,8 @@ const { Option } = Select;
 interface Props {
   initialPool: string;
   job: Job;
-  jobs: Job[];
+  /** total number of jobs */
+  jobCount: number;
   onFinish?: () => void;
   rpStats: RPStats[];
   schedulerType: api.V1SchedulerType;
@@ -37,11 +43,10 @@ interface FormValues {
   weight?: string;
 }
 
-const formValuesToUpdate = (
+const formValuesToUpdate = async (
   values: FormValues,
   job: Job,
-  jobs: Job[],
-): api.V1QueueControl | undefined => {
+): Promise<api.V1QueueControl | undefined> => {
   const { position, resourcePool } = {
     position: parseInt(values.position, 10),
     resourcePool: values.resourcePool,
@@ -52,7 +57,8 @@ const formValuesToUpdate = (
     return { ...update, resourcePool };
   }
   if (position !== job.summary.jobsAhead + 1) {
-    return moveJobToPositionUpdate(jobs, job.jobId, position);
+    const allJobs = await getJobQ({ resourcePool }, {});
+    return moveJobToPositionUpdate(allJobs.jobs, job.jobId, position);
   }
   if (values.priority !== undefined) {
     const priority = parseInt(values.priority, 10);
@@ -68,32 +74,31 @@ const formValuesToUpdate = (
   }
 };
 
-const ManageJob: React.FC<Props> = (
-  { onFinish, rpStats, job, jobs, schedulerType, initialPool },
-) => {
-  const formRef = useRef <FormInstance<FormValues>>(null);
+const ManageJob: React.FC<Props> = ({
+  onFinish,
+  rpStats,
+  job,
+  schedulerType,
+  initialPool,
+  jobCount,
+}) => {
+  const [form] = Form.useForm();
   const isOrderedQ = orderedSchedulers.has(schedulerType);
-  const { resourcePools } = useStore();
-  const [ selectedPoolName, setSelectedPoolName ] = useState(initialPool);
+  const resourcePools = Loadable.getOrElse([], useObservable(clusterStore.resourcePools)); // TODO show spinner when this is loading
+  const [selectedPoolName, setSelectedPoolName] = useState(initialPool);
 
   const details = useMemo(() => {
     interface Item {
       label: ReactNode;
       value: ReactNode;
     }
-    const tableKeys = [
-      'user',
-      'slots',
-      'submitted',
-      'type',
-      'name',
-    ];
+    const tableKeys = ['user', 'slots', 'submitted', 'type', 'name'];
     const tableDetails: Record<string, Item> = {};
 
-    tableKeys.forEach(td => {
-      const col = columns.find(col => col.key === td);
-      if (!col || !col.render) return;
-      tableDetails[td] = { label: col.title, value: col.render(undefined, job, 0) };
+    tableKeys.forEach((td) => {
+      const col = columns.find((col) => col.key === td);
+      if (!col?.render) return;
+      tableDetails[td] = { label: <>{col.title}</>, value: <>{col.render(undefined, job, 0)}</> };
     });
 
     const items = [
@@ -107,8 +112,7 @@ const ManageJob: React.FC<Props> = (
       },
       {
         label: 'Progress',
-        value: job.progress ?
-          floatToPercent(job.progress, 1) : undefined,
+        value: job.progress ? floatToPercent(job.progress, 1) : undefined,
       },
       tableDetails.slots,
       { label: 'Is Preemtible', value: job.isPreemptible ? 'Yes' : 'No' },
@@ -119,75 +123,74 @@ const ManageJob: React.FC<Props> = (
       tableDetails.user,
     ];
 
-    return items.filter(item => !!item && item.value !== undefined) as Item[];
-
-  }, [ job, isOrderedQ ]);
+    return items.filter((item) => !!item && item.value !== undefined) as Item[];
+  }, [job, isOrderedQ]);
 
   const currentPool = useMemo(() => {
-    return resourcePools.find(rp => rp.name === selectedPoolName);
-  }, [ resourcePools, selectedPoolName ]);
+    return resourcePools.find((rp) => rp.name === selectedPoolName);
+  }, [resourcePools, selectedPoolName]);
 
   const currentPoolStats = useMemo(() => {
-    return rpStats.find(rp => rp.resourcePool === selectedPoolName);
-  }, [ rpStats, selectedPoolName ]);
+    return rpStats.find((rp) => rp.resourcePool === selectedPoolName);
+  }, [rpStats, selectedPoolName]);
 
   const poolDetails = useMemo(() => {
     return (
       <div>
-        <p>Current slot allocation:{' '}
-          {currentPool?.slotsUsed} / {currentPool?.slotsAvailable} (used / total)
+        <p>
+          Current slot allocation: {currentPool?.slotsUsed} / {currentPool?.slotsAvailable} (used /
+          total)
           <br />
           Jobs in queue:
           {(currentPoolStats?.stats.queuedCount ?? 0) +
-          (currentPoolStats?.stats.scheduledCount ?? 0)}
+            (currentPoolStats?.stats.scheduledCount ?? 0)}
           <br />
           Spot instance pool: {!!currentPool?.details.aws?.spotEnabled + ''}
         </p>
       </div>
     );
-  }, [ currentPool, currentPoolStats ]);
+  }, [currentPool, currentPoolStats]);
 
-  const handleUpdateResourcePool = useCallback((changedValues) => {
+  useEffect(() => clusterStore.startPolling(), []);
+
+  // eslint-disable-next-line  @typescript-eslint/no-explicit-any
+  const handleUpdateResourcePool = useCallback((changedValues: any) => {
     if (changedValues.resourcePool) setSelectedPoolName(changedValues.resourcePool);
   }, []);
 
-  const onOk = useCallback(
-    async () => {
-      try{
-        const update = formRef.current &&
-          formValuesToUpdate(formRef.current.getFieldsValue(), job, jobs);
-        if (update) await updateJobQueue({ updates: [ update ] });
-      } catch (e) {
-        handleError(e, {
-          isUserTriggered: true,
-          publicSubject: 'Failed to update the job.',
-          silent: false,
-          type: ErrorType.Api,
-        });
-      }
-      onFinish?.();
-    },
-    [ formRef, onFinish, job, jobs ],
-  );
+  const onOk = useCallback(async () => {
+    try {
+      const update = form && (await formValuesToUpdate(form.getFieldsValue(), job));
+      if (update) await updateJobQueue({ updates: [update] });
+    } catch (e) {
+      handleError(e, {
+        isUserTriggered: true,
+        publicSubject: 'Failed to update the job.',
+        silent: false,
+        type: ErrorType.Api,
+      });
+    }
+    onFinish?.();
+  }, [form, onFinish, job]);
 
   const isSingular = job.summary && job.summary.jobsAhead === 1;
 
   return (
     <Modal
       mask
+      open={true}
       title={'Manage Job ' + truncate(job.jobId, 6, '')}
-      visible={true}
       onCancel={onFinish}
       onOk={onOk}>
       {isOrderedQ && (
-        <p>There {isSingular ? 'is' : 'are'} {job.summary?.jobsAhead || 'no'} job
+        <p>
+          There {isSingular ? 'is' : 'are'} {job.summary?.jobsAhead || 'no'} job
           {isSingular ? '' : 's'} ahead of this job.
         </p>
       )}
-      <h6>
-        Queue Settings
-      </h6>
-      <Form<FormValues>
+      <h6>Queue Settings</h6>
+      <Form
+        form={form}
         initialValues={{
           position: job.summary.jobsAhead + 1,
           priority: job.priority,
@@ -196,7 +199,6 @@ const ManageJob: React.FC<Props> = (
         }}
         labelCol={{ span: 6 }}
         name="form basic"
-        ref={formRef}
         onValuesChange={handleUpdateResourcePool}>
         <Form.Item
           extra="Priority is a whole number from 1 to 99 with 1 being the highest priority."
@@ -206,7 +208,8 @@ const ManageJob: React.FC<Props> = (
           <Input addonAfter="out of 99" max={99} min={1} type="number" />
         </Form.Item>
         <Form.Item
-          extra="Priority is a whole number from 1 to 99 with 1 being the lowest priority."
+          extra="Priority is a whole number from 1 to 99 with 1 being the lowest priority.
+          Adjusting the priority will cancel and resubmit the job to update its priority."
           hidden={schedulerType !== api.V1SchedulerType.KUBERNETES}
           label="Priority"
           name="priority">
@@ -216,12 +219,7 @@ const ManageJob: React.FC<Props> = (
           hidden={unsupportedQPosSchedulers.has(schedulerType)}
           label="Position in Queue"
           name="position">
-          <Input
-            addonAfter={`out of ${jobs.length}`}
-            max={jobs.length}
-            min={1}
-            type="number"
-          />
+          <Input addonAfter={`out of ${jobCount}`} max={jobCount} min={1} type="number" />
         </Form.Item>
         <Form.Item
           hidden={schedulerType !== api.V1SchedulerType.FAIRSHARE}
@@ -235,23 +233,21 @@ const ManageJob: React.FC<Props> = (
           label="Resource Pool"
           name="resourcePool">
           <Select disabled={job.type !== JobType.EXPERIMENT}>
-            {resourcePools.map(rp => (
-              <Option key={rp.name} value={rp.name}>{rp.name}</Option>
+            {resourcePools.map((rp) => (
+              <Option key={rp.name} value={rp.name}>
+                {rp.name}
+              </Option>
             ))}
           </Select>
         </Form.Item>
       </Form>
-      <h6>
-        Job Details
-      </h6>
+      <h6>Job Details</h6>
       <List
         dataSource={details}
-        renderItem={item => (
+        renderItem={(item) => (
           <List.Item className={css.item}>
             <Typography.Text className={css.key}>{item.label}</Typography.Text>
-            <div className={css.value}>
-              {item.value}
-            </div>
+            <div className={css.value}>{item.value}</div>
           </List.Item>
         )}
         size="small"

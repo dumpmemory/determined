@@ -41,21 +41,47 @@ def test_parse_config() -> None:
     }
 
 
+# mock_experiment was derived from a real v1Experiment.to_json(), with none of the optional fields.
+mock_experiment = {
+    "archived": False,
+    "config": {},
+    "id": 1,
+    "jobId": "c659255d-7f8c-408e-aad6-08bee6915b08",
+    "name": "mock-experiment",
+    "numTrials": 1,
+    "originalConfig": "",
+    "projectId": 1,
+    "projectOwnerId": 1,
+    "searcherType": "single",
+    "startTime": "2022-12-07T21:27:21.985656Z",
+    "state": "STATE_ACTIVE",
+    "username": "determined",
+}
+
+
 def test_create_with_model_def(requests_mock: requests_mock.Mocker, tmp_path: Path) -> None:
     requests_mock.get("/info", status_code=200, json={"version": "1.0"})
 
     requests_mock.get(
-        "/users/me", status_code=200, json={"username": constants.DEFAULT_DETERMINED_USER}
+        "/api/v1/me", status_code=200, json={"username": constants.DEFAULT_DETERMINED_USER}
     )
 
-    requests_mock.post("/login", status_code=200, json={"token": "fake-token"})
+    fake_user = {"username": "fakeuser", "admin": True, "active": True}
+    requests_mock.post(
+        "/api/v1/auth/login", status_code=200, json={"token": "fake-token", "user": fake_user}
+    )
 
     requests_mock.post(
-        "/experiments", status_code=requests.codes.created, headers={"Location": "/experiments/1"}
+        "/api/v1/experiments",
+        status_code=requests.codes.ok,
+        headers={"Location": "/experiments/1"},
+        json={
+            "experiment": mock_experiment,
+            "config": mock_experiment["config"],
+            "jobSummary": None,
+        },
     )
 
-    tempfile.mkstemp(dir=str(tmp_path))
-    tempfile.mkstemp(dir=str(tmp_path))
     tempfile.mkstemp(dir=str(tmp_path))
 
     with FileTree(tmp_path, {"config.yaml": MINIMAL_CONFIG}) as tree:
@@ -76,7 +102,12 @@ def test_uuid_prefix(requests_mock: requests_mock.Mocker) -> None:
 
     requests_mock.get("/info", status_code=200, json={"version": "1.0"})
     requests_mock.get(
-        "/users/me", status_code=200, json={"username": constants.DEFAULT_DETERMINED_USER}
+        "/api/v1/me", status_code=200, json={"username": constants.DEFAULT_DETERMINED_USER}
+    )
+
+    fake_user = {"username": "fakeuser", "admin": True, "active": True}
+    requests_mock.post(
+        "/api/v1/auth/login", status_code=200, json={"token": "fake-token", "user": fake_user}
     )
 
     requests_mock.get(
@@ -103,12 +134,11 @@ def test_uuid_prefix(requests_mock: requests_mock.Mocker) -> None:
         cli.main(["shell", "config", "x"])
 
 
-@pytest.mark.slow
 def test_create_reject_large_model_def(requests_mock: requests_mock.Mocker, tmp_path: Path) -> None:
     requests_mock.get("/info", status_code=200, json={"version": "1.0"})
 
     requests_mock.get(
-        "/users/me", status_code=200, json={"username": constants.DEFAULT_DETERMINED_USER}
+        "/api/v1/me", status_code=200, json={"username": constants.DEFAULT_DETERMINED_USER}
     )
 
     requests_mock.post(
@@ -125,21 +155,21 @@ def test_create_reject_large_model_def(requests_mock: requests_mock.Mocker, tmp_
 
 def test_read_context(tmp_path: Path) -> None:
     with FileTree(tmp_path, {"A.py": "", "B.py": "", "C.py": ""}) as tree:
-        model_def, _ = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"A.py", "B.py", "C.py"}
 
 
 def test_read_context_with_detignore(tmp_path: Path) -> None:
     with FileTree(tmp_path, {"A.py": "", "B.py": "", "C.py": ""}) as tree:
-        model_def, _ = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"A.py", "B.py", "C.py"}
 
     with FileTree(tmp_path, {"A.py": "", "B.py": "", "C.py": "", ".detignore": "\nA.py\n"}) as tree:
-        model_def, size = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"B.py", "C.py"}
 
     with FileTree(tmp_path, {"A.py": "", "B.py": "", "C.py": "", ".detignore": "\n*.py\n"}) as tree:
-        model_def, size = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert model_def == []
 
 
@@ -153,7 +183,7 @@ def test_read_context_with_detignore_subdirs(tmp_path: Path) -> None:
             Path("subdir").joinpath("B.py"): "",
         },
     ) as tree:
-        model_def, _ = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {
             "A.py",
             "B.py",
@@ -172,7 +202,7 @@ def test_read_context_with_detignore_subdirs(tmp_path: Path) -> None:
             Path("subdir").joinpath("B.py"): "",
         },
     ) as tree:
-        model_def, size = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"B.py", "subdir", "subdir/B.py"}
 
     with FileTree(
@@ -185,7 +215,7 @@ def test_read_context_with_detignore_subdirs(tmp_path: Path) -> None:
             ".detignore": "\nsubdir/A.py\n",
         },
     ) as tree:
-        model_def, size = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"A.py", "B.py", "subdir", "subdir/B.py"}
 
     with FileTree(
@@ -198,14 +228,14 @@ def test_read_context_with_detignore_subdirs(tmp_path: Path) -> None:
             ".detignore": "\n*.py\n",
         },
     ) as tree:
-        model_def, size = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert len(model_def) == 1
 
     with FileTree(
         tmp_path,
         {"A.py": "", "B.py": "", "subdir/A.py": "", "subdir/B.py": "", ".detignore": "\nsubdir\n"},
     ) as tree:
-        model_def, size = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"A.py", "B.py"}
 
     with FileTree(
@@ -218,8 +248,62 @@ def test_read_context_with_detignore_subdirs(tmp_path: Path) -> None:
             ".detignore": "\nsubdir/\n",
         },
     ) as tree:
-        model_def, size = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"A.py", "B.py"}
+
+
+def test_read_context_with_detignore_wildcard(tmp_path: Path) -> None:
+    with FileTree(
+        tmp_path,
+        {
+            "dir/file.py": "",
+            "dir/subdir/A.py": "",
+            "dir/subdir/B.py": "",
+            "dir/subdir/subdir/subdir/C.py": "",
+            ".detignore": "\ndir/sub*/\n",
+        },
+    ) as tree:
+        model_def = context.read_legacy_context(tree)
+        assert {f["path"] for f in model_def} == {"dir", "dir/file.py"}
+
+    with FileTree(
+        tmp_path,
+        {
+            "dir/file.py": "",
+            "dir/subdir/A.py": "",
+            "dir/subdir/B.py": "",
+            "dir/subdir/subdir/subdir/C.py": "",
+            ".detignore": "\ndir/sub*\n",
+        },
+    ) as tree:
+        model_def = context.read_legacy_context(tree)
+        assert {f["path"] for f in model_def} == {"dir", "dir/file.py"}
+
+    with FileTree(
+        tmp_path,
+        {
+            "dir/file.py": "",
+            "dir/subdir/A.py": "",
+            "dir/subdir/B.py": "",
+            "dir/subdir/subdir/subdir/C.py": "",
+            ".detignore": "\ndir/*/\n",
+        },
+    ) as tree:
+        model_def = context.read_legacy_context(tree)
+        assert {f["path"] for f in model_def} == {"dir", "dir/file.py"}
+
+    with FileTree(
+        tmp_path,
+        {
+            "dir/file.py": "",
+            "dir/subdir/A.py": "",
+            "dir/subdir/B.py": "",
+            "dir/subdir/subdir/subdir/C.py": "",
+            ".detignore": "\ndir/*\n",
+        },
+    ) as tree:
+        model_def = context.read_legacy_context(tree)
+        assert {f["path"] for f in model_def} == {"dir"}
 
 
 def test_read_context_ignore_pycaches(tmp_path: Path) -> None:
@@ -232,8 +316,44 @@ def test_read_context_ignore_pycaches(tmp_path: Path) -> None:
             "subdir/__pycache__/A.cpython-37.pyc": "",
         },
     ) as tree:
-        model_def, _ = context.read_context(tree)
+        model_def = context.read_legacy_context(tree)
         assert {f["path"] for f in model_def} == {"A.py", "subdir", "subdir/A.py"}
+
+
+def test_includes(tmp_path: Path) -> None:
+    with FileTree(
+        tmp_path,
+        {
+            "A.py": "",
+            "dir/B.py": "",
+            "context/C.py": "",
+        },
+    ) as tree:
+        # Directory name is stripped for contexts, preserved for includes.
+        model_def = context.read_legacy_context(
+            context_root=tree / "context",
+            includes=[tree / "A.py", tree / "dir"],
+        )
+        assert {f["path"] for f in model_def} == {"A.py", "dir", "dir/B.py", "C.py"}
+
+        # Includes without a context is supported.
+        model_def = context.read_legacy_context(
+            context_root=None,
+            includes=[tree / "A.py", tree / "dir"],
+        )
+        assert {f["path"] for f in model_def} == {"A.py", "dir", "dir/B.py"}
+
+        # Disallow context-include conflicts.
+        with pytest.raises(ValueError):
+            context.read_legacy_context(context_root=tree, includes=[tree / "A.py"])
+        with pytest.raises(ValueError):
+            context.read_legacy_context(context_root=tree, includes=[tree / "dir"])
+
+        # Disallow include-include conflicts.
+        with pytest.raises(ValueError):
+            context.read_legacy_context(context_root=None, includes=[tree / "A.py", tree / "A.py"])
+        with pytest.raises(ValueError):
+            context.read_legacy_context(context_root=None, includes=[tree / "dir", tree / "dir"])
 
 
 def test_cli_args_exist() -> None:

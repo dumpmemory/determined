@@ -4,8 +4,7 @@ import os
 from typing import Any, Optional, Type
 
 import determined as det
-from determined import profiler, workload
-from determined.common import check
+from determined import profiler, tensorboard, workload
 
 
 class _DistributedBackend:
@@ -16,9 +15,13 @@ class _DistributedBackend:
 
     HOROVOD = "USE_HOROVOD"
     DEEPSPEED = "USE_DEEPSPEED"
+    TORCH = "USE_TORCH_DISTRIBUTED"
 
     def use_horovod(self) -> bool:
         return bool(os.environ.get(self.HOROVOD, None))
+
+    def use_torch(self) -> bool:
+        return bool(os.environ.get(self.TORCH, None))
 
     def use_deepspeed(self) -> bool:
         return bool(os.environ.get(self.DEEPSPEED, None))
@@ -49,7 +52,7 @@ class TrialController(metaclass=abc.ABCMeta):
 
         distributed_backend = _DistributedBackend()
         self.use_horovod = distributed_backend.use_horovod()
-        self._check_if_trial_supports_configurations(env)
+        self.use_torch = distributed_backend.use_torch()
 
         self.scheduling_unit = self.env.experiment_config.scheduling_unit()
 
@@ -68,7 +71,7 @@ class TrialController(metaclass=abc.ABCMeta):
     ) -> Any:
         """
         Certain things must be initialized before either running user code (in the Native API case)
-        or intializing user code (in the Trial API case).
+        or initializing user code (in the Trial API case).
         """
         pass
 
@@ -97,16 +100,11 @@ class TrialController(metaclass=abc.ABCMeta):
     def supports_mixed_precision(cls: Type["TrialController"]) -> bool:
         return False
 
-    @classmethod
-    def supports_averaging_training_metrics(cls: Type["TrialController"]) -> bool:
-        return False
-
-    def initialize_wrapper(self) -> None:
-        pass
-
-    def _check_if_trial_supports_configurations(self, env: det.EnvContext) -> None:
-        if env.experiment_config.averaging_training_metrics_enabled():
-            check.true(self.supports_averaging_training_metrics())
-
     def close(self) -> None:
         self.context.close()
+
+    def upload_tb_files(self) -> None:
+        self.context._core.train.upload_tensorboard_files(
+            (lambda _: True) if self.is_chief else (lambda p: not p.match("*tfevents*")),
+            tensorboard.util.get_rank_aware_path,
+        )

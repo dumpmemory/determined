@@ -17,18 +17,27 @@ from tensorflow.keras.models import Model
 from tensorflow.python.framework.ops import EagerTensor
 
 import determined as det
-from determined import keras, layers, util, workload
+from determined import keras, layers, tensorboard, util, workload
 from determined._tf_rng import get_rng_state, set_rng_state
 from determined.common import check
 from determined.horovod import hvd
+from determined.tensorboard.metric_writers import tensorflow
 
 # In TF 2.6, we have to import some keras internals directly from `keras`.
 if version.parse(tf.__version__) >= version.parse("2.6.0"):
     from keras.callbacks import CallbackList, make_logs, set_callback_parameters
-    from keras.saving.hdf5_format import (
-        load_optimizer_weights_from_hdf5_group,
-        save_optimizer_weights_to_hdf5_group,
-    )
+
+    # TODO MLG-444 Migrate from legacy Keras hdf5 saving methods
+    if version.parse(tf.__version__) >= version.parse("2.11.0"):
+        from keras.saving.legacy.hdf5_format import (
+            load_optimizer_weights_from_hdf5_group,
+            save_optimizer_weights_to_hdf5_group,
+        )
+    else:
+        from keras.saving.hdf5_format import (
+            load_optimizer_weights_from_hdf5_group,
+            save_optimizer_weights_to_hdf5_group,
+        )
     from keras.utils.mode_keys import ModeKeys
 else:
     from tensorflow.python.keras.callbacks import CallbackList, make_logs, set_callback_parameters
@@ -162,9 +171,9 @@ class TrialControllerMultiplexer(keras.callbacks._MultiplexerBase):
 
 
 class TFKerasTrialController(det.TrialController):
-    @classmethod
-    def supports_averaging_training_metrics(cls: Type["TFKerasTrialController"]) -> bool:
-        return True
+    def _create_metric_writer(self) -> tensorboard.BatchMetricWriter:
+        writer = tensorflow.TFWriter()
+        return tensorboard.BatchMetricWriter(writer)
 
     @classmethod
     def pre_execute_hook(
@@ -181,11 +190,6 @@ class TFKerasTrialController(det.TrialController):
         tf.compat.v1.reset_default_graph()
 
         cls._set_random_seeds(env.trial_seed)
-
-        # For the Native API we must configure the Session before running user code.
-        if env.experiment_config.native_enabled():
-            session_config = tf.compat.v1.ConfigProto(allow_soft_placement=True)
-            cls._configure_session(env, session_config, distributed_backend.use_horovod())
 
     @classmethod
     def _set_random_seeds(cls: Type["TFKerasTrialController"], seed: int) -> None:
@@ -322,6 +326,8 @@ class TFKerasTrialController(det.TrialController):
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        self.metric_writer = self._create_metric_writer()
+
         self.model = model
         self.session = session
         self.trial = trial
@@ -357,8 +363,8 @@ class TFKerasTrialController(det.TrialController):
                 "doing distributed training"
             )
 
-        self._check_training_data()
-        self._check_validation_data()
+        self._check_wrap_dataset(self.training_data)
+        self._check_wrap_dataset(self.validation_data)
 
         self.enqueuers = []  # type: List[keras._Enqueuer]
 
@@ -388,62 +394,15 @@ class TFKerasTrialController(det.TrialController):
         self.train_workload_len = 0
         self.test_inputs = 0
 
-        self.latest_batch = self.env.latest_batch
+        self.steps_completed = self.env.steps_completed
 
-    def _check_training_data(self) -> None:
-        cacheable_used = self.context.experimental.get_train_cacheable().is_decorator_used()
-        wrap_used = self.context.dataset_initialized
-
-        # Non-tf.data.Datasets should not have used the data layer.
-        if not isinstance(self.training_data, tf.data.Dataset):
-            if cacheable_used:
-                raise det.errors.InvalidExperimentException(
-                    "Pass in a tf.data.Dataset object for training data if using "
-                    "context.experimental.cache_train_dataset().",
-                )
+    def _check_wrap_dataset(self, ds: Any) -> None:
+        # Ignore non-tf.data.Datasets.
+        if not isinstance(ds, tf.data.Dataset):
             return
-
-        # You can't use data layer and the wrap_dataset.
-        if cacheable_used and wrap_used:
+        if not self.context.dataset_initialized:
             raise det.errors.InvalidExperimentException(
-                "Please do not use: context.wrap_dataset(dataset) if using "
-                "context.experimental.cache_train_dataset() and "
-                "context.experimental.cache_validation_dataset().",
-            )
-
-        # You must use either data layer or wrap_dataset.
-        if not cacheable_used and not wrap_used:
-            raise det.errors.InvalidExperimentException(
-                "Please use either context.wrap_dataset(dataset) or "
-                "context.experimental.cache_train_dataset() for tf.data.dataset inputs"
-            )
-
-    def _check_validation_data(self) -> None:
-        cacheable_used = self.context.experimental.get_validation_cacheable().is_decorator_used()
-        wrap_used = self.context.dataset_initialized
-
-        # Non-tf.data.Datasets should not have used the data layer.
-        if not isinstance(self.validation_data, tf.data.Dataset):
-            if cacheable_used:
-                raise det.errors.InvalidExperimentException(
-                    "Pass in a tf.data.Dataset object for validation data if using "
-                    "context.experimental.cache_validation_dataset().",
-                )
-            return
-
-        # You can't use data layer and the wrap_dataset.
-        if cacheable_used and wrap_used:
-            raise det.errors.InvalidExperimentException(
-                "Please do not use: context.wrap_dataset(dataset) if using "
-                "context.experimental.cache_train_dataset() and "
-                "context.experimental.cache_validation_dataset().",
-            )
-
-        # You must use either data layer or wrap_dataset.
-        if not cacheable_used and not wrap_used:
-            raise det.errors.InvalidExperimentException(
-                "Please use either context.wrap_dataset(dataset) or "
-                "context.experimental.cache_validation_dataset() for tf.data.dataset inputs"
+                "Please use either context.wrap_dataset(dataset) for tf.data.dataset inputs"
             )
 
     def _configure_callbacks(self, user_callbacks: Optional[List]) -> None:
@@ -692,7 +651,7 @@ class TFKerasTrialController(det.TrialController):
                 repeat=True,
                 shuffle=self.context._fit_shuffle,
                 shuffle_seed=self.context.get_trial_seed(),
-                prior_batches_trained=self.env.latest_batch,
+                prior_batches_trained=self.env.steps_completed,
             )
             enqueuer.start()
             self.enqueuers.append(enqueuer)
@@ -824,7 +783,8 @@ class TFKerasTrialController(det.TrialController):
                     action = "checkpointing"
                     if self.is_chief:
                         metadata = {
-                            "latest_batch": self.latest_batch,
+                            "determined_version": det.__version__,
+                            "steps_completed": self.steps_completed,
                             "framework": f"tensorflow-{tf.__version__}",
                             "format": "saved_weights",
                         }
@@ -844,6 +804,7 @@ class TFKerasTrialController(det.TrialController):
                 logging.info(f"Invalid hyperparameter exception during {action}: {e}")
                 response = workload.InvalidHP()
             response_func(response)
+            self.upload_tb_files()
 
         # End-of-training.
         self.multiplexer._corrected_train_end()
@@ -895,7 +856,7 @@ class TFKerasTrialController(det.TrialController):
                 if k not in {"batch", "size"}
             }
         )
-        self.latest_batch += 1
+        self.steps_completed += 1
         self.train_workload_inputs += num_inputs
         self.train_workload_batches += 1
         if self.train_workload_batches != self.train_workload_len:
@@ -916,7 +877,7 @@ class TFKerasTrialController(det.TrialController):
         # Return only the latest metrics, which is the running average for all trained batches in
         # the step (Keras does not report individual logs, only running averages at any point).
         final_metrics = self.train_workload_metrics[-1]
-        if self.env.experiment_config.averaging_training_metrics_enabled():
+        if self.env.experiment_config.average_training_metrics_enabled():
             final_metrics = self._allreduce_logs(final_metrics)
 
         self.multiplexer._train_workload_end(final_metrics)
@@ -942,11 +903,18 @@ class TFKerasTrialController(det.TrialController):
                 },
                 "stop_requested": self.context.get_stop_requested(),
             }  # type: workload.Response
+            self.metric_writer.on_train_step_end(
+                steps_completed=self.steps_completed,
+                metrics=final_metrics,
+                batch_metrics=self.train_workload_metrics,
+            )
         else:
             response = {}
 
         self.train_response_func(response)
         self.train_response_func = None
+
+        self.upload_tb_files()
 
         self._control_loop()
 
@@ -983,6 +951,8 @@ class TFKerasTrialController(det.TrialController):
         step_duration = time.time() - validation_start_time
         logging.info(det.util.make_timing_log("validated", step_duration, num_inputs, num_batches))
 
+        self.metric_writer.on_validation_step_end(self.steps_completed, metrics)
+        self.upload_tb_files()
         return {"num_inputs": num_inputs, "validation_metrics": metrics}
 
     def _stop_training_check(self) -> None:
@@ -1011,7 +981,7 @@ class TFKerasTrial(det.Trial):
     legacy TensorFlow 1.x, specify a TensorFlow 1.x image in the
     :ref:`environment.image <exp-environment-image>` field of the experiment
     configuration (e.g.,
-    ``determinedai/environments:cuda-10.2-pytorch-1.7-tf-1.15-gpu-0.17.15``).
+    ``determinedai/environments:cuda-10.2-pytorch-1.7-tf-1.15-gpu-0.21.2``).
 
     Trials default to using eager execution with TensorFlow 2.x but not with
     TensorFlow 1.x. To override the default behavior, call the appropriate

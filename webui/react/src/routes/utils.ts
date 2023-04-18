@@ -1,34 +1,43 @@
 import { pathToRegexp } from 'path-to-regexp';
 import queryString from 'query-string';
-import React from 'react';
 
 import { globalStorage } from 'globalStorage';
-import history from 'routes/history';
 import { ClusterApi, Configuration } from 'services/api-ts-sdk';
+import { RouteConfig } from 'shared/types';
+import {
+  AnyMouseEvent,
+  AnyMouseEventHandler,
+  isAbsolutePath,
+  isFullPath,
+  isNewTabClickEvent,
+  openBlank,
+  reactHostAddress,
+  routeToExternalUrl,
+  routeToReactUrl,
+} from 'shared/utils/routes';
+import { BrandingType } from 'stores/determinedInfo';
 import { CommandTask } from 'types';
-import { clone } from 'utils/data';
+import { waitPageUrl } from 'utils/wait';
 
 import routes from './routes';
-import { RouteConfig } from './types';
 
 // serverAddress returns determined cluster (master) address.
-export const serverAddress = (path = ''): string => {
+export function serverAddress(path = ''): string {
   if (!!path && isFullPath(path)) return path;
 
   // Prioritize dynamically set address.
-  const customServer = globalStorage.serverAddress
-    || process.env.SERVER_ADDRESS as string;
+  const customServer = globalStorage.serverAddress || (process.env.SERVER_ADDRESS as string);
 
   return (customServer || reactHostAddress()) + path;
-};
+}
 
-// checks to see if the provided address resolves to a live Determeind server or not.
+// checks to see if the provided address resolves to a live Determined server or not.
 export const checkServerAlive = async (address?: string): Promise<boolean> => {
   address = address || serverAddress();
   try {
     const clusterApi = new ClusterApi(new Configuration({ basePath: address }));
     const data = await clusterApi.getMaster();
-    const attrs = [ 'version', 'masterId', 'clusterId' ];
+    const attrs = ['version', 'masterId', 'clusterId'];
     for (const attr of attrs) {
       // The server doesn't look like a determined server.
       if (!(attr in data)) return false;
@@ -36,133 +45,6 @@ export const checkServerAlive = async (address?: string): Promise<boolean> => {
     return true;
   } catch (_) {
     return false;
-  }
-};
-
-// Returns the address to the server hosting react assets
-// excluding the path to the subdirectory if any.
-export const reactHostAddress = (): string => {
-  return `${window.location.protocol}//${window.location.host}`;
-};
-
-export const isFullPath = (url: string): boolean => url.startsWith('http');
-
-// whether the input is pathed from / or not.
-export const isAbsolutePath = (url: string): boolean => url.startsWith('/');
-
-export const ensureAbsolutePath = (url: string): string => isAbsolutePath(url) ? url : '/' + url;
-
-export const parseUrl = (url: string): URL => {
-  let cleanUrl = url;
-  if (!isFullPath(url)) {
-    cleanUrl = ensureAbsolutePath(url);
-    cleanUrl = window.location.origin + url;
-  }
-  return new window.URL(cleanUrl);
-};
-
-export const locationToPath = (location?: Location): string | null => {
-  if (!location || !location.pathname) return null;
-  return location.pathname + location.search + location.hash;
-};
-
-export const windowOpenFeatures = [ 'noopener', 'noreferrer' ];
-
-export const openBlank = (url: string): void => {
-  window.open(url, '_blank', windowOpenFeatures.join(','));
-};
-
-export type AnyMouseEvent = MouseEvent | React.MouseEvent;
-export type AnyMouseEventHandler = (event: AnyMouseEvent) => void;
-export const isMouseEvent = (
-  ev: AnyMouseEvent | React.KeyboardEvent,
-): ev is AnyMouseEvent => {
-  return 'button' in ev;
-};
-export const isNewTabClickEvent = (event: AnyMouseEvent): boolean => {
-  return event.button === 1 || event.metaKey || event.ctrlKey;
-};
-
-export const handlePath = (
-  event: AnyMouseEvent,
-  options: {
-    external?: boolean,
-    onClick?: AnyMouseEventHandler,
-    path?: string,
-    popout?: boolean,
-  } = {},
-): void => {
-  // FIXME As of v17, e.persist() doesn’t do anything because the SyntheticEvent is no longer
-  // pooled.
-  // event.persist();
-  event.preventDefault();
-
-  const href = options.path ? linkPath(options.path, options.external) : undefined;
-
-  if (options.onClick) {
-    options.onClick(event);
-  } else if (href) {
-    if (isNewTabClickEvent(event) || options.popout) {
-      openBlank(href);
-    } else {
-      routeAll(href);
-    }
-  }
-};
-
-// remove host and public_url.
-const stripUrl = (aUrl: string): string => {
-  const url = parseUrl(aUrl);
-  const rest = url.href.replace(url.origin, '');
-  if (rest.startsWith(process.env.PUBLIC_URL)) {
-    return rest.replace(process.env.PUBLIC_URL, '');
-  }
-  return rest;
-};
-
-export const findReactRoute = (url: string): RouteConfig | undefined => {
-  if (isFullPath(url)) {
-    if (!url.startsWith(reactHostAddress())) return undefined;
-    // Fit it into a relative path
-    url = url.replace(reactHostAddress(), '');
-  }
-  if (!url.startsWith(process.env.PUBLIC_URL)) {
-    return undefined;
-  }
-  // Check to see if the path matches any of the defined app routes.
-  const pathname = url.replace(process.env.PUBLIC_URL, '');
-  return routes
-    .filter(route => route.path !== '*')
-    .find(route => {
-      const routeRegex = pathToRegexp(route.path);
-      return routeRegex.test(pathname);
-    });
-};
-
-export const routeToExternalUrl = (path: string): void => {
-  window.location.assign(path);
-};
-export const routeToReactUrl = (path: string): void => {
-  history.push(stripUrl(path), { loginRedirect: filterOutLoginLocation(window.location) });
-};
-export const filterOutLoginLocation = (
-  location: { pathname: string },
-): { pathname: string } | undefined => {
-  return location.pathname.includes('login') ? undefined : clone(location);
-};
-
-/*
-  routeAll determines whether a path should be routed through internal React router or hanled
-  by the browser.
-  input `path` should include the PUBLIC_URL if there is one set. eg if react is being served
-  in a subdirectory.
-*/
-export const routeAll = (path: string): void => {
-  const matchingReactRoute = findReactRoute(path);
-  if (!matchingReactRoute) {
-    routeToExternalUrl(path);
-  } else {
-    routeToReactUrl(path);
   }
 };
 
@@ -187,8 +69,11 @@ const routeById: Record<string, RouteConfig> = routes.reduce((acc, cur) => {
 }, {} as Record<string, RouteConfig>);
 
 export const paths = {
+  admin: (tab = ''): string => {
+    return `/admin/${tab}`;
+  },
   cluster: (): string => {
-    return '/cluster';
+    return '/clusters';
   },
   clusterLogs: (): string => {
     return '/logs';
@@ -202,14 +87,33 @@ export const paths = {
   docs: (suffix?: string): string => {
     return `/docs${suffix || ''}`;
   },
+  experimentComparison: (experimentIds: string[]): string => {
+    return `/experiment-compare?id=${experimentIds.join('&id=')}`;
+  },
   experimentDetails: (experimentId: number | string): string => {
     return `/experiments/${experimentId}`;
+  },
+  experimentFileFromTree: (experimentId: number | string, filePath: string): string => {
+    return `/experiments/${experimentId}/file/download?path=${encodeURIComponent(filePath)}`;
   },
   experimentList: (): string => {
     return '/experiments';
   },
   experimentModelDef: (experimentId: number | string): string => {
     return `/experiments/${experimentId}/model_def`;
+  },
+  interactive: (command: CommandTask, maxSlotsExceeded = false): string => {
+    const path = [
+      'interactive',
+      command.id,
+      command.type,
+      command.name,
+      command.resourcePool,
+      waitPageUrl(command),
+    ]
+      .map(encodeURIComponent)
+      .join('/');
+    return `/${path}/?currentSlotsExceeded=${maxSlotsExceeded}`;
   },
   jobs: (): string => {
     return routeById.jobs.path;
@@ -220,23 +124,40 @@ export const paths = {
   logout: (): string => {
     return '/logout';
   },
-  modelDetails: (modelName: string): string => {
-    return `/models/${encodeURIComponent(modelName)}`;
+  modelDetails: (modelNameOrId: string): string => {
+    return `/models/${encodeURIComponent(modelNameOrId)}`;
   },
   modelList: (): string => {
     return '/models';
   },
-  modelVersionDetails: (modelName: string, versionId: number | string): string => {
-    return `/models/${encodeURIComponent(modelName)}/versions/${versionId}`;
+  modelVersionDetails: (modelNameOrId: string, versionNum: number | string): string => {
+    return `/models/${encodeURIComponent(modelNameOrId)}/versions/${versionNum}`;
+  },
+  projectDetails: (projectId: number | string): string => {
+    return `/projects/${projectId}/experiments`;
+  },
+  projectDetailsBasePath: (projectId: number | string): string => {
+    return `/projects/${projectId}`;
   },
   reload: (path: string): string => {
     return `/reload?${queryString.stringify({ path })}`;
   },
+  resourcePool: (name: string): string => {
+    return `/resourcepool/${name}`;
+  },
+  settings: (tab = ''): string => {
+    return `/settings/${tab}`;
+  },
+  submitProductFeedback: (branding: BrandingType): string => {
+    return branding === BrandingType.Determined
+      ? 'https://airtable.com/shr87rnMuHhiDTpLo'
+      : 'https://airtable.com/shrodYROolF0E1iYf';
+  },
   taskList: (): string => {
     return '/tasks';
   },
-  taskLogs: (task: CommandTask): string => {
-    return`/${task.type}/${task.id}/logs?id=${task.name}`;
+  taskLogs: (task: Pick<CommandTask, 'id' | 'name' | 'type'>): string => {
+    return `/${task.type}/${task.id}/logs?id=${task.name}`;
   },
   trialDetails: (trialId: number | string, experimentId?: number | string): string => {
     if (!experimentId) {
@@ -247,7 +168,77 @@ export const paths = {
   trialLogs: (trialId: number | string, experimentId: number | string): string => {
     return `/experiments/${experimentId}/trials/${trialId}/logs`;
   },
+  uncategorized: (): string => {
+    return '/projects/1/experiments';
+  },
   users: (): string => {
     return '/users';
   },
+  webhooks: (): string => {
+    return '/webhooks';
+  },
+  workspaceDetails: (workspaceId: number | string, tab = 'projects'): string => {
+    return `/workspaces/${workspaceId}/${tab}`;
+  },
+  workspaceList: (): string => {
+    return '/workspaces';
+  },
+};
+/*
+  routeAll determines whether a path should be routed through internal React router or hanled
+  by the browser.
+  input `path` should include the PUBLIC_URL if there is one set. eg if react is being served
+  in a subdirectory.
+*/
+export const routeAll = (path: string): void => {
+  const matchingReactRoute = findReactRoute(path);
+  if (!matchingReactRoute) {
+    routeToExternalUrl(path);
+  } else {
+    routeToReactUrl(path);
+  }
+};
+export const handlePath = (
+  event: AnyMouseEvent,
+  options: {
+    external?: boolean;
+    onClick?: AnyMouseEventHandler;
+    path?: string;
+    popout?: boolean;
+  } = {},
+): void => {
+  // FIXME As of v17, e.persist() doesn’t do anything because the SyntheticEvent is no longer
+  // pooled.
+  // event.persist();
+  event.preventDefault();
+
+  const href = options.path ? linkPath(options.path, options.external) : undefined;
+
+  if (options.onClick) {
+    options.onClick(event);
+  } else if (href) {
+    if (isNewTabClickEvent(event) || options.popout) {
+      openBlank(href);
+    } else {
+      routeAll(href);
+    }
+  }
+};
+export const findReactRoute = (url: string): RouteConfig | undefined => {
+  if (isFullPath(url)) {
+    if (!url.startsWith(reactHostAddress())) return undefined;
+    // Fit it into a relative path
+    url = url.replace(reactHostAddress(), '');
+  }
+  if (!url.startsWith(process.env.PUBLIC_URL)) {
+    return undefined;
+  }
+  // Check to see if the path matches any of the defined app routes.
+  const pathname = url.replace(process.env.PUBLIC_URL, '');
+  return routes
+    .filter((route) => route.path !== '*')
+    .find((route) => {
+      const routeRegex = pathToRegexp(route.path);
+      return routeRegex.test(pathname);
+    });
 };

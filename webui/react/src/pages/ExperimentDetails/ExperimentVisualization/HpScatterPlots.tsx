@@ -3,22 +3,21 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import GalleryModal from 'components/GalleryModal';
 import Grid, { GridMode } from 'components/Grid';
-import Message, { MessageType } from 'components/Message';
 import Section from 'components/Section';
-import Spinner from 'components/Spinner';
 import { FacetedData, UPlotScatterProps } from 'components/UPlot/types';
 import UPlotScatter from 'components/UPlot/UPlotScatter';
 import { terminalRunStates } from 'constants/states';
-import { useStore } from 'contexts/Store';
 import useResize from 'hooks/useResize';
 import { V1TrialsSnapshotResponse } from 'services/api-ts-sdk';
 import { detApi } from 'services/apiConfig';
-import { consumeStream } from 'services/utils';
-import {
-  ExperimentBase, HyperparameterType, MetricName, metricTypeParamMap, Primitive,
-} from 'types';
-import { flattenObject, isBoolean, isString } from 'utils/data';
-import { metricNameToStr } from 'utils/metric';
+import { readStream } from 'services/utils';
+import Message, { MessageType } from 'shared/components/Message';
+import Spinner from 'shared/components/Spinner/Spinner';
+import useUI from 'shared/contexts/stores/UI';
+import { Primitive } from 'shared/types';
+import { flattenObject, isBoolean, isString } from 'shared/utils/data';
+import { ExperimentBase, HyperparameterType, Metric, metricTypeParamMap, Scale } from 'types';
+import { metricToStr } from 'utils/metric';
 
 import css from './HpScatterPlots.module.scss';
 
@@ -29,14 +28,15 @@ interface Props {
   selectedBatch: number;
   selectedBatchMargin: number;
   selectedHParams: string[];
-  selectedMetric: MetricName;
+  selectedMetric: Metric | null;
+  selectedScale: Scale;
 }
 
 interface HpMetricData {
   hpLabels: Record<string, string[]>;
   hpLogScales: Record<string, boolean>;
   hpValues: Record<string, number[]>;
-  metricValues: Record<string, number[]>;
+  metricValues: Record<string, (number | null)[]>;
   trialIds: number[];
 }
 
@@ -48,31 +48,35 @@ const ScatterPlots: React.FC<Props> = ({
   selectedBatchMargin,
   selectedHParams,
   selectedMetric,
+  selectedScale,
 }: Props) => {
-  const { ui } = useStore();
+  const { ui } = useUI();
   const baseRef = useRef<HTMLDivElement>(null);
-  const [ hasLoaded, setHasLoaded ] = useState(false);
-  const [ chartData, setChartData ] = useState<HpMetricData>();
-  const [ pageError, setPageError ] = useState<Error>();
-  const [ activeHParam, setActiveHParam ] = useState<string>();
-  const [ galleryHeight, setGalleryHeight ] = useState<number>(450);
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const [chartData, setChartData] = useState<HpMetricData>();
+  const [pageError, setPageError] = useState<Error>();
+  const [activeHParam, setActiveHParam] = useState<string>();
+  const [galleryHeight, setGalleryHeight] = useState<number>(450);
+
+  const yScaleKey = selectedScale === Scale.Log ? 'yLog' : 'y';
 
   const resize = useResize(baseRef);
   const isExperimentTerminal = terminalRunStates.has(experiment.state);
 
   const chartProps = useMemo(() => {
-    if (!chartData) return undefined;
+    if (!chartData || !selectedMetric) return undefined;
 
     return selectedHParams.reduce((acc, hParam) => {
       const xLabel = hParam;
-      const yLabel = metricNameToStr(selectedMetric);
+      const yLabel = metricToStr(selectedMetric);
       const title = `${yLabel} (y) vs ${xLabel} (x)`;
       const hpLabels = chartData?.hpLabels[hParam];
       const isLogarithmic = chartData?.hpLogScales[hParam];
       const isCategorical = hpLabels?.length !== 0;
-      const xScaleKey = isCategorical ? 'xCategorical' : (isLogarithmic ? 'xLog' : 'x');
+      const xScaleKey = isCategorical ? 'xCategorical' : isLogarithmic ? 'xLog' : 'x';
       const xSplits = isCategorical
-        ? new Array(hpLabels.length).fill(0).map((x, i) => i) : undefined;
+        ? new Array(hpLabels.length).fill(0).map((x, i) => i)
+        : undefined;
       const xValues = isCategorical ? hpLabels : undefined;
       acc[hParam] = {
         data: [
@@ -93,51 +97,51 @@ const ScatterPlots: React.FC<Props> = ({
               splits: xSplits,
               values: xValues,
             },
-            { scale: 'y' },
+            { scale: yScaleKey },
           ],
           cursor: { drag: { setScale: false, x: false, y: false } },
           title,
         },
-        tooltipLabels: [ xLabel, yLabel, null, null, null, 'trial ID' ],
+        tooltipLabels: [xLabel, yLabel, null, null, null, 'trial ID'],
       };
       return acc;
     }, {} as Record<string, UPlotScatterProps>);
-  }, [ chartData, selectedHParams, selectedMetric ]);
+  }, [chartData, selectedHParams, selectedMetric, yScaleKey]);
 
   const handleChartClick = useCallback((hParam: string) => setActiveHParam(hParam), []);
 
   const handleGalleryClose = useCallback(() => setActiveHParam(undefined), []);
 
   const handleGalleryNext = useCallback(() => {
-    setActiveHParam(prev => {
+    setActiveHParam((prev) => {
       if (!prev) return prev;
       const index = selectedHParams.indexOf(prev);
       if (index === -1) return prev;
       const nextIndex = index === selectedHParams.length - 1 ? 0 : index + 1;
       return selectedHParams[nextIndex];
     });
-  }, [ selectedHParams ]);
+  }, [selectedHParams]);
 
   const handleGalleryPrevious = useCallback(() => {
-    setActiveHParam(prev => {
+    setActiveHParam((prev) => {
       if (!prev) return prev;
       const index = selectedHParams.indexOf(prev);
       if (index === -1) return prev;
       const prevIndex = index === 0 ? selectedHParams.length - 1 : index - 1;
       return selectedHParams[prevIndex];
     });
-  }, [ selectedHParams ]);
+  }, [selectedHParams]);
 
   useEffect(() => {
-    if (ui.isPageHidden) return;
+    if (ui.isPageHidden || !selectedMetric) return;
 
     const canceler = new AbortController();
     const trialIds: number[] = [];
-    const hpTrialMap: Record<string, Record<number, { hp: Primitive, metric: number }>> = {};
+    const hpTrialMap: Record<string, Record<number, { hp: Primitive; metric: number | null }>> = {};
 
     setHasLoaded(false);
 
-    consumeStream<V1TrialsSnapshotResponse>(
+    readStream<V1TrialsSnapshotResponse>(
       detApi.StreamingInternal.trialsSnapshot(
         experiment.id,
         selectedMetric.name,
@@ -147,38 +151,43 @@ const ScatterPlots: React.FC<Props> = ({
         undefined,
         { signal: canceler.signal },
       ),
-      event => {
-        if (!event || !event.trials || !Array.isArray(event.trials)) return;
+      (event) => {
+        if (!event?.trials || !Array.isArray(event.trials)) return;
 
-        const hpMetricMap: Record<string, number[]> = {};
+        const hpMetricMap: Record<string, (number | null)[]> = {};
         const hpValueMap: Record<string, number[]> = {};
         const hpLabelMap: Record<string, string[]> = {};
         const hpLogScaleMap: Record<string, boolean> = {};
 
-        event.trials.forEach(trial => {
+        event.trials.forEach((trial) => {
           const trialId = trial.trialId;
           trialIds.push(trialId);
 
           const flatHParams = flattenObject(trial.hparams);
-          fullHParams.forEach(hParam => {
+          fullHParams.forEach((hParam) => {
+            /**
+             * TODO: filtering NaN, +/- Infinity for now, but handle it later with
+             * dynamic min/max ranges via uPlot.Scales.
+             */
+            const trialMetric = Number.isFinite(trial.metric) ? trial.metric : null;
             hpTrialMap[hParam] = hpTrialMap[hParam] || {};
             hpTrialMap[hParam][trialId] = hpTrialMap[hParam][trialId] || {};
             hpTrialMap[hParam][trialId] = {
               hp: flatHParams[hParam],
-              metric: trial.metric,
+              metric: trialMetric,
             };
           });
         });
 
-        fullHParams.forEach(hParam => {
-          const hp = (experiment.hyperparameters || {})[hParam];
+        fullHParams.forEach((hParam) => {
+          const hp = experiment.hyperparameters?.[hParam];
           if (hp.type === HyperparameterType.Log) hpLogScaleMap[hParam] = true;
 
           hpMetricMap[hParam] = [];
           hpValueMap[hParam] = [];
           hpLabelMap[hParam] = [];
-          trialIds.forEach(trialId => {
-            const map = (hpTrialMap[hParam] || {})[trialId] || {};
+          trialIds.forEach((trialId) => {
+            const map = hpTrialMap[hParam]?.[trialId] || {};
             const hpValue = isBoolean(map.hp) ? map.hp.toString() : map.hp;
 
             if (isString(hpValue)) {
@@ -206,10 +215,11 @@ const ScatterPlots: React.FC<Props> = ({
         });
         setHasLoaded(true);
       },
-    ).catch(e => {
-      setPageError(e);
-      setHasLoaded(true);
-    });
+      (e) => {
+        setPageError(e);
+        setHasLoaded(true);
+      },
+    );
 
     return () => canceler.abort();
   }, [
@@ -221,7 +231,7 @@ const ScatterPlots: React.FC<Props> = ({
     ui.isPageHidden,
   ]);
 
-  useEffect(() => setGalleryHeight(resize.height), [ resize ]);
+  useEffect(() => setGalleryHeight(resize.height), [resize]);
 
   if (pageError) {
     return <Message title={pageError.message} />;
@@ -253,7 +263,7 @@ const ScatterPlots: React.FC<Props> = ({
               border={true}
               minItemWidth={resize.width > 320 ? 350 : 270}
               mode={GridMode.AutoFill}>
-              {selectedHParams.map(hParam => (
+              {selectedHParams.map((hParam) => (
                 <div key={hParam} onClick={() => handleChartClick(hParam)}>
                   <UPlotScatter
                     data={chartProps[hParam].data}
@@ -270,7 +280,7 @@ const ScatterPlots: React.FC<Props> = ({
       </Section>
       <GalleryModal
         height={galleryHeight}
-        visible={!!activeHParam}
+        open={!!activeHParam}
         onCancel={handleGalleryClose}
         onNext={handleGalleryNext}
         onPrevious={handleGalleryPrevious}>

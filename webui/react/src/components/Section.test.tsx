@@ -1,5 +1,4 @@
 import { render, screen } from '@testing-library/react';
-import React from 'react';
 
 import Section from './Section';
 
@@ -14,7 +13,7 @@ const setup = ({
   bodyNoPadding = false,
   divider = false,
 }) => {
-  const handleOnChange = jest.fn();
+  const handleOnChange = vi.fn();
   const view = render(
     <Section
       bodyBorder={bodyBorder}
@@ -32,7 +31,6 @@ const setup = ({
 };
 
 describe('Section', () => {
-
   it('Section with title', () => {
     setup({ title: 'title of section' });
     expect(screen.getByText('title of section')).toBeInTheDocument();
@@ -54,23 +52,26 @@ describe('Section', () => {
   });
 
   it('Section in loading state', () => {
-    const { view: { container } } = setup(
-      { filters: <div data-testid="section-filters" />, loading: true, title: 'section-title' },
-    );
+    const {
+      view: { container },
+    } = setup({
+      filters: <div data-testid="section-filters" />,
+      loading: true,
+      title: 'section-title',
+    });
     // Test that antd spinner is spinning
     expect(container.getElementsByClassName('ant-spin ant-spin-spinning')).toHaveLength(1);
     // Test that filter is not showing
-    expect(screen.queryAllByTestId('section-filters')).toHaveLength(0);
+    expect(screen.queryAllByTestId('section-filters')[0]).toBeEnabled();
   });
 
   it('Section with different styles', () => {
     setup({ bodyBorder: true, divider: true, maxHeight: true, title: 'section-title' });
     const section = screen.getByText('section-title') as HTMLElement;
     expect(section).toHaveStyle({ height: 100 });
-    expect(section).toHaveStyle(
-      { border: 'solid var(--theme-sizes-border-width) var(--theme-colors-monochrome-12)' },
-    );
-    expect(section).toHaveStyle({ borderTopWidth: 'var(--theme-sizes-border-width)' });
+    expect(section).toHaveStyle({
+      border: 'solid var(--theme-stroke-width) var(--theme-colors-monochrome-12)',
+    });
+    expect(section).toHaveStyle({ borderTopWidth: 'var(--theme-stroke-width)' });
   });
-
 });

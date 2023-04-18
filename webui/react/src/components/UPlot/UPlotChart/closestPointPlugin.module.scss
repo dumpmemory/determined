@@ -2,7 +2,7 @@ $tooltip-offset: 5px;
 
 .point {
   border-radius: 100%;
-  display: none;
+  display: none !important;
   position: absolute;
   transform: translate(-50%, -50%);
 }
@@ -13,12 +13,12 @@ $tooltip-offset: 5px;
   z-index: 99;
 
   .box {
-    background-color: var(--theme-colors-monochrome-17);
-    border: solid var(--theme-sizes-border-width) var(--theme-colors-monochrome-13);
-    border-radius: var(--theme-sizes-border-radius);
-    box-shadow: var(--theme-shadow);
+    background-color: var(--theme-float);
+    border: solid var(--theme-stroke-width) var(--theme-float-border);
+    border-radius: var(--theme-border-radius);
+    box-shadow: var(--theme-elevation-strong);
     left: $tooltip-offset;
-    padding: var(--theme-sizes-layout-medium);
+    padding: 8px;
     position: absolute;
     top: $tooltip-offset;
     white-space: nowrap;

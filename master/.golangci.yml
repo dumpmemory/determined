@@ -1,5 +1,5 @@
 run:
-  go: 1.18
+  go: 1.20
 
   # Deadline for individual linters to complete by.
   deadline: 1m
@@ -32,6 +32,7 @@ issues:
     # Exclude "gosec: Errors unhandled" because it duplicates errcheck.
     - G104
     - and that stutters
+    - declaration of "(err|ctx)" shadows declaration at
 
   # Independently from option `exclude` golangci-lint uses default exclude patterns.
   exclude-use-default: false
@@ -70,6 +71,10 @@ linters-settings:
   exhaustivestruct:
     struct-patterns:
       - 'github.com/determined-ai/determined/master/pkg/schemas/expconf.*Config*'
+  forbidigo:
+    forbid:
+      - 'fmt\.Print.*'
+      - 'metaV1.NamespaceAll' # Will error if someone has namespace restricted permissions.
 
 linters:
   enable-all: true
@@ -77,6 +82,7 @@ linters:
     - exhaustive
     - funlen
     - gochecknoglobals
+    - gochecknoinits
     - gocognit
     - gocyclo
     - godox
@@ -103,7 +109,6 @@ linters:
     - durationcheck
     - errname
     - errorlint
-    - forbidigo
     - forcetypeassert
     - gci
     - gomoddirectives
@@ -133,3 +138,17 @@ linters:
     - decorder
     - errchkjson
     - grouper
+
+    # Below here are new linters from upgrading to 1.51.1.
+    - nonamedreturns
+    - nosnakecase
+    - musttag
+    - interfacebloat
+    - gosimple 
+    - prealloc
+    - interfacer
+    - structcheck
+    - unused
+    - nolintlint
+    - usestdlibvars
+    - exhaustruct

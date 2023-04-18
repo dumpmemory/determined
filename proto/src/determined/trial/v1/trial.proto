@@ -5,6 +5,7 @@ option go_package = "github.com/determined-ai/determined/proto/pkg/trialv1";
 
 import "google/protobuf/struct.proto";
 import "determined/experiment/v1/experiment.proto";
+import "determined/common/v1/common.proto";
 import "determined/checkpoint/v1/checkpoint.proto";
 import "google/protobuf/timestamp.proto";
 import "protoc-gen-swagger/options/annotations.proto";
@@ -25,6 +26,32 @@ message CheckpointWorkload {
   map<string, int64> resources = 5;
   // Total number of batches as of this workload's completion.
   int32 total_batches = 8;
+  // User defined metadata associated with the checkpoint.
+  google.protobuf.Struct metadata = 9;
+}
+
+// The current state of the trial. see \dT+ trial_state in db
+enum State {
+  // The trial is in an unspecified state.
+  STATE_UNSPECIFIED = 0;
+  // The trial is in an active state.
+  STATE_ACTIVE = 1;
+  // The trial is in a paused state
+  STATE_PAUSED = 2;
+  // The trial is canceled and is shutting down.
+  STATE_STOPPING_CANCELED = 3;
+  // The trial is killed and is shutting down.
+  STATE_STOPPING_KILLED = 4;
+  // The trial is completed and is shutting down.
+  STATE_STOPPING_COMPLETED = 5;
+  // The trial is errored and is shutting down.
+  STATE_STOPPING_ERROR = 6;
+  // The trial is canceled and is shut down.
+  STATE_CANCELED = 7;
+  // The trial is completed and is shut down.
+  STATE_COMPLETED = 8;
+  // The trial is errored and is shut down.
+  STATE_ERROR = 9;
 }
 
 // MetricsWorkload is a workload generating metrics.
@@ -36,10 +63,8 @@ message MetricsWorkload {
   };
   // The time the workload finished or was stopped.
   google.protobuf.Timestamp end_time = 2;
-  // The current validation state.
-  determined.experiment.v1.State state = 3;
   // Metrics.
-  google.protobuf.Struct metrics = 4;
+  determined.common.v1.Metrics metrics = 40;
   // Number of inputs processed.
   int32 num_inputs = 5 [deprecated = true];
   // Total number of batches as of this workload's completion.
@@ -56,6 +81,7 @@ message Trial {
         "experimentId",
         "startTime",
         "state",
+        "restarts",
         "hparams",
         "totalBatchesProcessed"
       ]
@@ -71,6 +97,8 @@ message Trial {
   google.protobuf.Timestamp end_time = 4;
   // The current state of the trial.
   determined.experiment.v1.State state = 5;
+  // Number times the trial restarted.
+  int32 restarts = 17;
   // Trial hyperparameters.
   google.protobuf.Struct hparams = 6;
   // The current processed batches.
@@ -90,6 +118,10 @@ message Trial {
   string warm_start_checkpoint_uuid = 13;
   // Id of task associated with this trial.
   string task_id = 14;
+  // The sum of sizes of all resources in all checkpoints for the trial.
+  uint64 total_checkpoint_size = 15;
+  // The count of checkpoints.
+  int32 checkpoint_count = 18;
 }
 
 // TrialProfilerMetricLabels are the labels for a single series, where a series
@@ -152,8 +184,6 @@ message TrialEarlyExit {
     EXITED_REASON_UNSPECIFIED = 0;
     // Indicates the trial exited due to an invalid hyperparameter.
     EXITED_REASON_INVALID_HP = 1;
-    // Indicates the trial exited due to a user requested stop.
-    EXITED_REASON_USER_REQUESTED_STOP = 2;
     // Indicates the trial exited due to an invalid hyperparameter
     // in the trial init.
     EXITED_REASON_INIT_INVALID_HP = 3;
@@ -166,7 +196,7 @@ message TrialEarlyExit {
 message TrialMetrics {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
     json_schema: {
-      required: [ "trial_id", "trial_run_id", "latest_batch", "metrics" ]
+      required: [ "trial_id", "trial_run_id", "steps_completed", "metrics" ]
     }
   };
   // The trial associated with these metrics.
@@ -174,55 +204,24 @@ message TrialMetrics {
   // The trial run associated with these metrics.
   int32 trial_run_id = 2;
   // The number of batches trained on when these metrics were reported.
-  int32 latest_batch = 3;
-  // The metrics for this bit of training (reduced over the reporting period).
-  google.protobuf.Struct metrics = 7;
-  // The batch metrics for this bit of training.
-  repeated google.protobuf.Struct batch_metrics = 8;
-}
-
-// The checkpoint metadata for some trial checkpoint.
-message CheckpointMetadata {
-  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: {
-      required: [
-        "trial_id",
-        "trial_run_id",
-        "uuid",
-        "resources",
-        "framework",
-        "format",
-        "determined_version"
-      ]
-    }
-  };
-  // The ID of the trial associated with the checkpoint.
-  int32 trial_id = 1;
-  // The run of the trial associated with the checkpoint.
-  int32 trial_run_id = 2;
-  // UUID of the checkpoint.
-  string uuid = 3;
-  // Dictionary of file paths to file sizes in bytes of all files.
-  map<string, int64> resources = 4;
-  // The framework associated with the checkpoint.
-  string framework = 5;
-  // The format of the checkpoint.
-  string format = 6;
-  // The Determined version associated with the checkpoint.
-  string determined_version = 7;
-  // The number of batches trained on when these metrics were reported.
-  int32 latest_batch = 8;
+  int32 steps_completed = 3;  // TODO: rename to batches. batches_trained?
+  // The metrics for this bit of training, including:
+  // - avg_metrics: metrics reduced over the reporting period).
+  // - batch_metrics: (optional) per-batch metrics.
+  determined.common.v1.Metrics metrics = 9;
 }
 
 // The rendezvous info for the trial to rendezvous with sibling containers.
 message RendezvousInfo {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "addresses", "rank" ] }
+    json_schema: { required: [ "addresses", "rank", "slots" ] }
   };
   // The rendezvous addresses of the other containers.
   repeated string addresses = 1;
   // The container rank.
   int32 rank = 2;
+  // The slots for each address, respectively.
+  repeated int32 slots = 3;
 }
 
 // The metadata pertaining to the current running task for a trial.
@@ -232,4 +231,35 @@ message TrialRunnerMetadata {
   };
   // The state of the trial runner.
   string state = 1;
+}
+
+// Metrics report.
+message MetricsReport {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: {
+      required: [
+        "trial_id",
+        "end_time",
+        "metrics",
+        "total_batches",
+        "archived",
+        "id",
+        "trial_run_id"
+      ]
+    }
+  };
+  // ID of the trial.
+  int32 trial_id = 1;
+  // End time of when metric was reported.
+  google.protobuf.Timestamp end_time = 2;
+  // Struct of the reported metrics.
+  google.protobuf.Struct metrics = 3;
+  // Steps completed in the report.
+  int32 total_batches = 4;
+  // If metric is archived.
+  bool archived = 5;
+  // ID of metric in table.
+  int32 id = 6;
+  // Run ID of trial when metric was reported.
+  int32 trial_run_id = 7;
 }

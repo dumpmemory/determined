@@ -1,12 +1,12 @@
 import math
 import pathlib
 import pickle
-from typing import Any, Dict
+from typing import Any, Dict, Union
 
 import numpy as np
 
 import determined as det
-from determined import layers, util, workload
+from determined import layers, tensorboard, util, workload
 
 
 def structure_to_metrics(value: float, structure: Any) -> Any:
@@ -76,6 +76,14 @@ class MetricMakerTrialContext(det.TrialContext):
         return self._global_batch_size
 
 
+class DummyMetricWriter(tensorboard.MetricWriter):
+    def add_scalar(self, name: str, value: Union[int, float, "np.number"], step: int) -> None:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+
 class MetricMaker(det.TrialController):
     """
     MetricMaker is a class designed to test that metrics reported from a trial
@@ -104,7 +112,7 @@ class MetricMaker(det.TrialController):
                 self.context._core, self.env, self.context.get_global_batch_size()
             )
 
-        self.latest_batch = self.env.latest_batch
+        self.steps_completed = self.env.steps_completed
 
         if self.env.latest_checkpoint is not None:
             with self.context._core.checkpoint.restore_path(
@@ -120,6 +128,9 @@ class MetricMaker(det.TrialController):
     def pre_execute_hook(env: det.EnvContext, distributed_backend: det._DistributedBackend) -> None:
         pass
 
+    def create_metric_writer(self) -> tensorboard.BatchMetricWriter:
+        return tensorboard.BatchMetricWriter(DummyMetricWriter())
+
     def run(self) -> None:
         for w, response_func in self.workloads:
             if w.kind == workload.Workload.Kind.RUN_STEP:
@@ -127,7 +138,7 @@ class MetricMaker(det.TrialController):
             elif w.kind == workload.Workload.Kind.COMPUTE_VALIDATION_METRICS:
                 response = self.compute_validation_metrics(w.step_id)
             elif w.kind == workload.Workload.Kind.CHECKPOINT_MODEL:
-                metadata = {"latest_batch": self.latest_batch}
+                metadata = {"steps_completed": self.steps_completed}
                 if self.is_chief:
                     with self.context._core.checkpoint.store_path(metadata) as (
                         path,
@@ -152,7 +163,7 @@ class MetricMaker(det.TrialController):
         # Update the overall base value for the trial.
         self.value += self.gain_per_batch * num_batches
 
-        self.latest_batch += num_batches
+        self.steps_completed += num_batches
 
         return {
             "metrics": det.util.make_metrics(num_batches, batch_metrics),

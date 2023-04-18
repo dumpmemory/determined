@@ -1,25 +1,31 @@
-import React from 'react';
-import ReactDOM from 'react-dom';
-import { Router } from 'react-router-dom';
-
-import history from 'routes/history';
+import 'micro-observables/batchingForReactDom';
+import { createRoot } from 'react-dom/client';
+import { RouterProvider } from 'react-router-dom';
 
 /* Import the styles first to allow components to override styles. */
-import 'styles/index.scss';
 import 'uplot/dist/uPlot.min.css';
 
-import App from './App';
+import App from 'App';
+import router from 'router';
+
 import * as serviceWorker from './serviceWorker';
-import 'prototypes';
+
+import 'shared/prototypes';
 import 'dev';
 
-ReactDOM.render(
-  <React.StrictMode>
-    <Router history={history}>
-      <App />
-    </Router>
-  </React.StrictMode>,
-  document.getElementById('root'),
+// redirect to basename if needed
+if (process.env.PUBLIC_URL && window.location.pathname === '/') {
+  window.history.replaceState({}, '', process.env.PUBLIC_URL);
+}
+router.initRouter(<App />);
+const container = document.getElementById('root');
+// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+const root = createRoot(container!);
+
+root.render(
+  // <React.StrictMode>
+  <RouterProvider router={router.getRouter()} />,
+  // </React.StrictMode>,
 );
 
 /*

@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
@@ -10,7 +11,7 @@ from determined import pytorch, util
 def _process_combined_metrics_and_batches(
     combined_metrics_and_batches: List[Any],
 ) -> Tuple[Dict[str, Any], List[int]]:
-    # Remove entries with 0 num batches. These are from ranks that do not repoort metrics.
+    # Remove entries with 0 num batches. These are from ranks that do not report metrics.
     combined_metrics_and_batches = [a for a in combined_metrics_and_batches if a[1]]
 
     # Reshape so e.g. all_metrics = [metrics, metrics, ...].
@@ -58,7 +59,7 @@ def _average_training_metrics(
 
 
 def _combine_metrics_across_processes(
-    context: det._core.DistributedContext, metrics: Dict[str, Any], num_batches: int
+    context: det.core.DistributedContext, metrics: Dict[str, Any], num_batches: int
 ) -> Tuple[Optional[Dict[str, Any]], Optional[List[int]]]:
     # The chief receives the metric from every other training process.
     assert (
@@ -77,7 +78,7 @@ def _combine_metrics_across_processes(
 
 
 def _combine_and_average_training_metrics(
-    context: det._core.DistributedContext, per_batch_metrics: List[Dict[str, Any]]
+    context: det.core.DistributedContext, per_batch_metrics: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     assert context.size > 1, "Can only average training metrics in multi-GPU training."
     metrics_timeseries = util._list_to_dict(per_batch_metrics)
@@ -132,7 +133,7 @@ def _convert_metrics_to_numpy(metrics: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _reduce_metrics(
-    context: det._core.DistributedContext,
+    context: det.core.DistributedContext,
     batch_metrics: List,
     keys: Any,
     metrics_reducers: Dict[str, pytorch.Reducer],
@@ -171,3 +172,39 @@ def _reduce_metrics(
             return {}
 
     return metrics
+
+
+def _log_tb_metrics(
+    writer: Any,
+    metric_type: str,
+    steps_completed: int,
+    metrics: Dict[str, Any],
+    batch_metrics: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+
+    if metric_type == "val":
+        logging.debug("Write validation metrics for TensorBoard")
+    elif metric_type == "train":
+        logging.debug("Write training metrics for TensorBoard")
+    else:
+        logging.warning("Unrecognized tensorboard metric type: " + metric_type, stacklevel=2)
+
+    metrics_seen = set()
+
+    # Log all batch metrics.
+    if batch_metrics:
+        for batch_idx, batch in enumerate(batch_metrics):
+            batches_seen = steps_completed - len(batch_metrics) + batch_idx
+            for name, value in batch.items():
+                if util.is_numerical_scalar(value):
+                    writer.add_scalar("Determined/" + name, value, batches_seen)
+                metrics_seen.add(name)
+
+    # Log avg metrics which were calculated by a custom reducer and are not in batch metrics.
+    for name, value in metrics.items():
+        if name in metrics_seen:
+            continue
+        if metric_type == "val" and not name.startswith("val"):
+            name = "val_" + name
+        if util.is_numerical_scalar(value):
+            writer.add_scalar("Determined/" + name, value, steps_completed)

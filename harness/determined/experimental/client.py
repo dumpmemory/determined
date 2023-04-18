@@ -44,23 +44,34 @@ See :ref:`use-trained-models` for more ideas on what to do next.
 """
 
 import functools
+import logging
 import pathlib
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
 
-from determined.common.experimental.checkpoint import Checkpoint
+from determined.common.api import Session  # noqa: F401
+from determined.common.experimental.checkpoint import (  # noqa: F401
+    Checkpoint,
+    CheckpointState,
+    DownloadMode,
+)
 from determined.common.experimental.determined import Determined
 from determined.common.experimental.experiment import (  # noqa: F401
     ExperimentReference,
     ExperimentState,
 )
 from determined.common.experimental.model import Model, ModelOrderBy, ModelSortBy
-from determined.common.experimental.session import Session  # noqa: F401
+from determined.common.experimental.oauth2_scim_client import Oauth2ScimClient
 from determined.common.experimental.trial import (  # noqa: F401
+    CheckpointOrderBy,
+    CheckpointSortBy,
+    TrainingMetrics,
     TrialOrderBy,
     TrialReference,
     TrialSortBy,
+    ValidationMetrics,
 )
+from determined.common.experimental.user import User
 
 _determined = None  # type: Optional[Determined]
 
@@ -139,18 +150,21 @@ def login(
 def create_experiment(
     config: Union[str, pathlib.Path, Dict],
     model_dir: str,
+    includes: Optional[Iterable[Union[str, pathlib.Path]]] = None,
 ) -> ExperimentReference:
     """
     Creates an experiment with config parameters and model directory. The function
     returns an :class:`~determined.experimental.client.ExperimentReference` of the experiment.
 
     Arguments:
-        config (string, pathlib.Path, dictionary): Experiment config filename (.yaml)
+        config (str, pathlib.Path, dictionary): Experiment config filename (.yaml)
             or a dict.
-        model_dir (string): Directory containing model definition.
+        model_dir (str): Directory containing model definition.
+        iterables (Iterable[Union[str, pathlib.Path]], optional): Additional files or directories to
+            include in the model definition.  (default: ``None``)
     """
     assert _determined is not None
-    return _determined.create_experiment(config, model_dir)
+    return _determined.create_experiment(config, model_dir, includes)
 
 
 @_require_singleton
@@ -164,6 +178,94 @@ def get_experiment(experiment_id: int) -> ExperimentReference:
     """
     assert _determined is not None
     return _determined.get_experiment(experiment_id)
+
+
+@_require_singleton
+def create_user(
+    username: str, admin: bool, password: Optional[str] = None, remote: bool = False
+) -> User:
+    """
+    Creates an user with username and password, admin. The function returns a
+    :class:`~determined.experimental.client.User` of the User.
+
+    Arguments:
+        username (string): username of the user.
+        password (string): password of the user.
+        admin (bool): indicates whether the user is an admin.
+    """
+    assert _determined is not None
+    return _determined.create_user(username, admin, password, remote)
+
+
+@_require_singleton
+def get_user_by_id(user_id: int) -> User:
+    """
+    Get the :class:`~determined.experimental.client.User` representing the
+    User with the provided user id.
+
+    Arguments:
+        user_id (int): The user ID.
+    """
+    assert _determined is not None
+    return _determined.get_user_by_id(user_id)
+
+
+@_require_singleton
+def get_user_by_name(user_name: str) -> User:
+    """
+    Get the :class:`~determined.experimental.client.User` representing the
+    User with the provided user name.
+
+    Arguments:
+        user_name (string): The user name.
+    """
+    assert _determined is not None
+    return _determined.get_user_by_name(user_name)
+
+
+@_require_singleton
+def get_session_username() -> str:
+    """
+    Get the username of the currently signed in user.
+    """
+    assert _determined is not None
+    return _determined.get_session_username()
+
+
+@_require_singleton
+def whoami() -> User:
+    """
+    Get the :class:`~determined.experimental.client.User` representing the
+    current user.
+    """
+    assert _determined is not None
+    return _determined.whoami()
+
+
+# DOES NOT REQUIRE SINGLETON (don't force a login in order to log out).
+def logout() -> None:
+    """
+    Get the :class:`~determined.experimental.client.User` representing the
+    current user.
+    """
+    if _determined is not None:
+        return _determined.logout()
+
+    logging.warning(
+        "client has not been logged in, either explicitly by client.login() or implicitly by any "
+        "other client.* function, so client.logout() has no session to log out of and is a no-op. "
+        "If you would like to log out of the default active session, try "
+        "client.Determined().logout() instead."
+    )
+
+
+@_require_singleton
+def list_users() -> Sequence[User]:
+    """
+    Get the list :class:`~determined.experimental.client.User` of all Users.
+    """
+    assert _determined is not None
+    return _determined.list_users()
 
 
 @_require_singleton
@@ -241,11 +343,12 @@ def get_model_by_id(model_id: int) -> Model:
        an integer-type model ID.
     """
     warnings.warn(
-        "client.get_model_by_id() has been deprecated and will be removed"
+        "client.get_model_by_id() has been deprecated and will be removed "
         "in a future version.\n"
-        "Please call client.get_model() with either a string-type name or"
+        "Please call client.get_model() with either a string-type name or "
         "an integer-type model ID.",
         FutureWarning,
+        stacklevel=2,
     )
     assert _determined is not None
     return _determined.get_model(model_id)
@@ -281,3 +384,58 @@ def get_model_labels() -> List[str]:
     """
     assert _determined is not None
     return _determined.get_model_labels()
+
+
+@_require_singleton
+def list_oauth_clients() -> Sequence[Oauth2ScimClient]:
+    """
+    Get a list of Oauth2 Scim clients.
+    """
+    assert _determined is not None
+    return _determined.list_oauth_clients()
+
+
+def add_oauth_client(domain: str, name: str) -> Oauth2ScimClient:
+    """
+    Add an oauth client.
+    Arguments:
+        domain: Domain of OAuth client.
+        name: Name of OAuth client.
+    """
+    assert _determined is not None
+    return _determined.add_oauth_client(domain, name)
+
+
+def remove_oauth_client(client_id: str) -> None:
+    """
+    Arguments:
+       client_id: Client id of OAuth client.
+    """
+    assert _determined is not None
+    return _determined.remove_oauth_client(client_id)
+
+
+@_require_singleton
+def stream_trials_training_metrics(trial_ids: List[int]) -> Iterable[TrainingMetrics]:
+    """
+    Streams training metrics for one or more trials sorted by
+    trial_id, trial_run_id and steps_completed.
+
+    Arguments:
+        trial_ids: List of trial IDs to get metrics for.
+    """
+    assert _determined is not None
+    return _determined.stream_trials_training_metrics(trial_ids)
+
+
+@_require_singleton
+def stream_trials_validation_metrics(trial_ids: List[int]) -> Iterable[ValidationMetrics]:
+    """
+    Streams validation metrics for one or more trials sorted by
+    trial_id, trial_run_id and steps_completed.
+
+    Arguments:
+        trial_ids: List of trial IDs to get metrics for.
+    """
+    assert _determined is not None
+    return _determined.stream_trials_validation_metrics(trial_ids)

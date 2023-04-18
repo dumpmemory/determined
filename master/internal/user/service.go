@@ -1,23 +1,75 @@
 package user
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/pkg/errors"
 
 	"github.com/determined-ai/determined/master/internal/api"
-	"github.com/determined-ai/determined/master/internal/context"
+	detContext "github.com/determined-ai/determined/master/internal/context"
 	"github.com/determined-ai/determined/master/internal/db"
 	"github.com/determined-ai/determined/master/internal/telemetry"
 	"github.com/determined-ai/determined/master/pkg/actor"
 	"github.com/determined-ai/determined/master/pkg/model"
 )
+
+var (
+	once        sync.Once
+	userService *Service
+)
+
+var externalSessionsError = echo.NewHTTPError(
+	http.StatusForbidden,
+	"not enabled with external sessions")
+
+var forbiddenError = echo.NewHTTPError(
+	http.StatusForbidden,
+	"user not authorized")
+
+const (
+	// authNone indicates a request needs no authentication.
+	authNone int = 0
+	// authStandard indicates a request needs authentication.
+	authStandard = 1
+	// authAdmin indicates a request needs admin authentication.
+	authAdmin = 2
+)
+
+// unauthenticatedPointsList contains URIs and paths that are exempted from authentication.
+var unauthenticatedPointsList = []string{
+	"/",
+	"/docs/.*",
+	"/info",
+	"/task-logs",
+	"/agents",
+	"/det",
+	"/det/.*",
+	"/login",
+	"/api/v1/.*",
+	"/proxy/:service/.*",
+	"/agents\\?id=.*",
+}
+
+// adminAuthPointsList contains the paths that require admin authentication.
+var adminAuthPointsList = []string{
+	"/config",
+	"/agents/.*/slots/.*",
+}
+
+var unauthenticatedPointsPattern = regexp.MustCompile("^" +
+	strings.Join(unauthenticatedPointsList, "$|^") + "$")
+
+var adminAuthPointsPattern = regexp.MustCompile("^" +
+	strings.Join(adminAuthPointsList, "$|^") + "$")
 
 type agentUserGroup struct {
 	UID   *int   `json:"uid,omitempty"`
@@ -53,16 +105,26 @@ type Service struct {
 	extConfig *model.ExternalSessions
 }
 
-// New creates a new user service.
-func New(db *db.PgDB, system *actor.System, extConfig *model.ExternalSessions) (*Service, error) {
-	return &Service{db, system, extConfig}, nil
+// InitService creates the user service singleton.
+func InitService(db *db.PgDB, system *actor.System, extConfig *model.ExternalSessions) {
+	once.Do(func() {
+		userService = &Service{db, system, extConfig}
+	})
+}
+
+// GetService returns a reference to the user service singleton.
+func GetService() *Service {
+	if userService == nil {
+		panic("Singleton UserService is not yet initialized.")
+	}
+	return userService
 }
 
 // The middleware looks for a token in two places (in this order):
 // 1. The HTTP Authorization header.
 // 2. A cookie named "auth".
-func (s *Service) extractToken(c echo.Context) (string, error) {
-	authRaw := c.Request().Header.Get("Authorization")
+func (s *Service) extractToken(r *http.Request) (string, error) {
+	authRaw := r.Header.Get("Authorization")
 	if authRaw != "" {
 		// We attempt to parse out the token, which should be
 		// transmitted as a Bearer authentication token.
@@ -70,34 +132,66 @@ func (s *Service) extractToken(c echo.Context) (string, error) {
 			return "", echo.ErrUnauthorized
 		}
 		return strings.TrimPrefix(authRaw, "Bearer "), nil
-	} else if cookie, err := c.Cookie("auth"); err == nil {
+	} else if cookie, err := r.Cookie("auth"); err == nil {
 		return cookie.Value, nil
 	}
 	// If we found no token, then abort the request with an HTTP 401.
 	return "", echo.NewHTTPError(http.StatusUnauthorized)
 }
 
+// UserAndSessionFromRequest gets the user and session corresponding to the given request.
+func (s *Service) UserAndSessionFromRequest(
+	r *http.Request,
+) (*model.User, *model.UserSession, error) {
+	token, err := s.extractToken(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	return UserByToken(token, s.extConfig)
+}
+
+// getAuthLevel returns what level of authentication a request needs.
+func (s *Service) getAuthLevel(c echo.Context) int {
+	switch {
+	case adminAuthPointsPattern.MatchString(c.Request().RequestURI):
+		return authAdmin
+	case unauthenticatedPointsPattern.MatchString(c.Path()):
+		return authNone
+	case unauthenticatedPointsPattern.MatchString(c.Request().RequestURI):
+		return authNone
+	default:
+		return authStandard
+	}
+}
+
 // ProcessAuthentication is a middleware processing function that attempts
 // to authenticate incoming HTTP requests.
 func (s *Service) ProcessAuthentication(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		token, err := s.extractToken(c)
-		if err != nil {
-			return err
+		var adminOnly bool
+		switch s.getAuthLevel(c) {
+		case authNone:
+			return next(c)
+		case authStandard:
+			adminOnly = false
+		case authAdmin:
+			adminOnly = true
 		}
 
-		var user *model.User
-		var session *model.UserSession
-		user, session, err = s.db.UserByToken(token, s.extConfig)
+		user, session, err := s.UserAndSessionFromRequest(c.Request())
 		switch err {
 		case nil:
 			if !user.Active {
 				return echo.NewHTTPError(http.StatusForbidden, "user not active")
 			}
+			if adminOnly && !user.Admin {
+				return echo.NewHTTPError(http.StatusForbidden, "user not admin")
+			}
+
 			// Set data on the request context that might be useful to
 			// event handlers.
-			c.(*context.DetContext).SetUser(*user)
-			c.(*context.DetContext).SetUserSession(*session)
+			c.(*detContext.DetContext).SetUser(*user)
+			c.(*detContext.DetContext).SetUserSession(*session)
 			return next(c)
 		case db.ErrNotFound:
 			return echo.NewHTTPError(http.StatusUnauthorized)
@@ -116,7 +210,7 @@ func (s *Service) postLogout(c echo.Context) (interface{}, error) {
 	}
 
 	// Delete the user session information from the database.
-	sess := c.(*context.DetContext).MustGetUserSession()
+	sess := c.(*detContext.DetContext).MustGetUserSession()
 
 	if err := s.db.DeleteUserSessionByID(sess.ID); err != nil {
 		return nil, err
@@ -152,7 +246,7 @@ func (s *Service) postLogin(c echo.Context) (interface{}, error) {
 	}
 
 	// Get the user from the database.
-	user, err := s.db.UserByUsername(params.Username)
+	user, err := UserByUsername(params.Username)
 	switch err {
 	case nil:
 	case db.ErrNotFound:
@@ -179,11 +273,7 @@ func (s *Service) postLogin(c echo.Context) (interface{}, error) {
 	// The caller of this REST endpoint can request that the master set a cookie.
 	// This is used by the WebUI for persistence of sessions.
 	if c.QueryParam("cookie") == "true" {
-		cookie := new(http.Cookie)
-		cookie.Name = "auth"
-		cookie.Value = token
-		cookie.Expires = time.Now().Add(db.SessionDuration)
-		c.SetCookie(cookie)
+		c.SetCookie(NewCookieFromToken(token))
 	}
 
 	return response{
@@ -191,18 +281,60 @@ func (s *Service) postLogin(c echo.Context) (interface{}, error) {
 	}, nil
 }
 
+// NewCookieFromToken creates a new cookie from the given token.
+func NewCookieFromToken(token string) *http.Cookie {
+	cookie := new(http.Cookie)
+	cookie.Name = "auth"
+	cookie.Value = token
+	cookie.Path = "/"
+	cookie.Expires = time.Now().Add(db.SessionDuration)
+	return cookie
+}
+
 // getMe returns information about the current authenticated user.
 func (s *Service) getMe(c echo.Context) (interface{}, error) {
-	me := c.(*context.DetContext).MustGetUser()
-
-	return s.db.UserByID(me.ID)
+	me := c.(*detContext.DetContext).MustGetUser()
+	return UserByID(me.ID)
 }
 
 func (s *Service) getUsers(c echo.Context) (interface{}, error) {
-	return s.db.UserList()
+	userList, err := s.db.UserList()
+	if err != nil {
+		return nil, err
+	}
+
+	var ctx context.Context
+	if c.Request() == nil || c.Request().Context() == nil {
+		ctx = context.TODO()
+	} else {
+		ctx = c.Request().Context()
+	}
+
+	return AuthZProvider.Get().FilterUserList(ctx,
+		c.(*detContext.DetContext).MustGetUser(), userList)
+}
+
+func canViewUserErrorHandle(currUser, user model.User, actionErr, notFoundErr error) error {
+	ctx := context.TODO()
+	if ok, err := AuthZProvider.Get().CanGetUser(ctx, currUser, user); err != nil {
+		return err
+	} else if !ok {
+		return notFoundErr
+	}
+	return actionErr
 }
 
 func (s *Service) patchUser(c echo.Context) (interface{}, error) {
+	if s.extConfig.Enabled() {
+		return nil, externalSessionsError
+	}
+	var ctx context.Context
+	if c.Request() == nil || c.Request().Context() == nil {
+		ctx = context.TODO()
+	} else {
+		ctx = c.Request().Context()
+	}
+
 	type (
 		request struct {
 			Password *string `json:"password,omitempty"`
@@ -234,31 +366,25 @@ func (s *Service) patchUser(c echo.Context) (interface{}, error) {
 		return nil, malformedRequestError
 	}
 
-	forbiddenError := echo.NewHTTPError(
-		http.StatusForbidden,
-		"user not authorized")
-
-	authenticatedUser := c.(*context.DetContext).MustGetUser()
-	user, err := s.db.UserByUsername(args.Username)
+	userNotFoundErr := echo.NewHTTPError(http.StatusBadRequest,
+		fmt.Sprintf("failed to get user '%s'", args.Username))
+	currUser := c.(*detContext.DetContext).MustGetUser()
+	user, err := UserByUsername(args.Username)
 	switch err {
 	case nil:
 	case db.ErrNotFound:
-		if authenticatedUser.Admin {
-			return nil, echo.NewHTTPError(
-				http.StatusBadRequest,
-				fmt.Sprintf("failed to get user '%s'", args.Username))
-		}
-		return nil, echo.NewHTTPError(http.StatusForbidden, "user not found")
+		return nil, userNotFoundErr
 	default:
 		return nil, err
 	}
 
 	var toUpdate []string
-
 	if params.Password != nil {
-		if !user.PasswordCanBeModifiedBy(authenticatedUser) {
-			return nil, forbiddenError
+		if err = AuthZProvider.Get().CanSetUsersPassword(ctx, currUser, *user); err != nil {
+			return nil, canViewUserErrorHandle(currUser, *user,
+				errors.Wrap(forbiddenError, err.Error()), userNotFoundErr)
 		}
+
 		if err = user.UpdatePasswordHash(*params.Password); err != nil {
 			return nil, err
 		}
@@ -266,35 +392,40 @@ func (s *Service) patchUser(c echo.Context) (interface{}, error) {
 	}
 
 	if params.Active != nil {
-		if !user.ActiveCanBeModifiedBy(authenticatedUser) {
-			return nil, forbiddenError
+		if err = AuthZProvider.Get().CanSetUsersActive(ctx, currUser, *user, *params.Active); err != nil {
+			return nil, canViewUserErrorHandle(currUser, *user,
+				errors.Wrap(forbiddenError, err.Error()), userNotFoundErr)
 		}
+
 		user.Active = *params.Active
 		toUpdate = append(toUpdate, "active")
 	}
 
 	if params.Admin != nil {
-		if !user.AdminCanBeModifiedBy(authenticatedUser) {
-			return nil, forbiddenError
+		if err = AuthZProvider.Get().CanSetUsersAdmin(ctx, currUser, *user, *params.Admin); err != nil {
+			return nil, canViewUserErrorHandle(currUser, *user,
+				errors.Wrap(forbiddenError, err.Error()), userNotFoundErr)
 		}
+
 		user.Admin = *params.Admin
 		toUpdate = append(toUpdate, "admin")
 	}
 
 	var ug *model.AgentUserGroup
 	if pug := params.AgentUserGroup; pug != nil {
-		if !user.AdminCanBeModifiedBy(authenticatedUser) {
-			return nil, forbiddenError
-		}
-
 		u, pErr := pug.Validate()
 		if pErr != nil {
 			return nil, echo.NewHTTPError(http.StatusBadRequest, pErr.Error())
 		}
 		ug = u
+
+		if err := AuthZProvider.Get().CanSetUsersAgentUserGroup(ctx, currUser, *user, *ug); err != nil {
+			return nil, canViewUserErrorHandle(currUser, *user,
+				errors.Wrap(forbiddenError, err.Error()), userNotFoundErr)
+		}
 	}
 
-	if err = s.db.UpdateUser(user, toUpdate, ug); err != nil {
+	if err := s.db.UpdateUser(user, toUpdate, ug); err != nil {
 		return nil, err
 	}
 
@@ -304,6 +435,9 @@ func (s *Service) patchUser(c echo.Context) (interface{}, error) {
 }
 
 func (s *Service) patchUsername(c echo.Context) (interface{}, error) {
+	if s.extConfig.Enabled() {
+		return nil, externalSessionsError
+	}
 	type (
 		request struct {
 			NewUsername *string `json:"username,omitempty"`
@@ -331,16 +465,24 @@ func (s *Service) patchUsername(c echo.Context) (interface{}, error) {
 		return nil, malformedRequestError
 	}
 
-	forbiddenError := echo.NewHTTPError(http.StatusForbidden,
-		"user not authorized")
-	authenticatedUser := c.(*context.DetContext).MustGetUser()
-	if !authenticatedUser.Admin {
-		return nil, forbiddenError
-	}
-
-	user, err := s.db.UserByUsername(args.Username)
+	user, err := UserByUsername(args.Username)
 	if err != nil {
 		return nil, err
+	}
+
+	currUser := c.(*detContext.DetContext).MustGetUser()
+
+	var ctx context.Context
+
+	if c.Request() == nil || c.Request().Context() == nil {
+		ctx = context.TODO()
+	} else {
+		ctx = c.Request().Context()
+	}
+	if err = AuthZProvider.Get().CanSetUsersUsername(ctx, currUser,
+		*user); err != nil {
+		return nil, canViewUserErrorHandle(currUser, *user,
+			errors.Wrap(forbiddenError, err.Error()), db.ErrNotFound)
 	}
 
 	if params.NewUsername == nil {
@@ -348,7 +490,7 @@ func (s *Service) patchUsername(c echo.Context) (interface{}, error) {
 		return nil, malformedRequestError
 	}
 
-	switch u, uErr := s.db.UserByUsername(*params.NewUsername); {
+	switch u, uErr := UserByUsername(*params.NewUsername); {
 	case uErr == db.ErrNotFound:
 	case uErr != nil:
 		return nil, uErr
@@ -366,6 +508,9 @@ func (s *Service) patchUsername(c echo.Context) (interface{}, error) {
 }
 
 func (s *Service) postUser(c echo.Context) (interface{}, error) {
+	if s.extConfig.Enabled() {
+		return nil, externalSessionsError
+	}
 	type (
 		request struct {
 			Username string `json:"username"`
@@ -390,14 +535,6 @@ func (s *Service) postUser(c echo.Context) (interface{}, error) {
 		return nil, malformedRequestError
 	}
 
-	currUser := c.(*context.DetContext).MustGetUser()
-	if !currUser.CanCreateUser() {
-		insufficientPermissionsError := echo.NewHTTPError(
-			http.StatusForbidden,
-			"insufficient permissions")
-		return nil, insufficientPermissionsError
-	}
-
 	var ug *model.AgentUserGroup
 	if pug := params.AgentUserGroup; pug != nil {
 		u, pErr := pug.Validate()
@@ -406,14 +543,27 @@ func (s *Service) postUser(c echo.Context) (interface{}, error) {
 		}
 		ug = u
 	}
-
 	params.Username = strings.ToLower(params.Username)
-	err = s.db.AddUser(&model.User{
+
+	userToAdd := model.User{
 		Username: params.Username,
 		Admin:    params.Admin,
 		Active:   params.Active,
-	}, ug)
+	}
+	currUser := c.(*detContext.DetContext).MustGetUser()
 
+	var ctx context.Context
+	if c.Request() == nil || c.Request().Context() == nil {
+		ctx = context.TODO()
+	} else {
+		ctx = c.Request().Context()
+	}
+	if err = AuthZProvider.Get().CanCreateUser(ctx, currUser, userToAdd,
+		ug); err != nil {
+		return nil, errors.Wrap(forbiddenError, err.Error())
+	}
+
+	_, err = s.db.AddUser(&userToAdd, ug)
 	switch {
 	case err == db.ErrDuplicateRecord:
 		return nil, echo.NewHTTPError(http.StatusBadRequest, "user already exists")
@@ -426,4 +576,36 @@ func (s *Service) postUser(c echo.Context) (interface{}, error) {
 	return response{
 		message: fmt.Sprintf("successfully created user: %s", params.Username),
 	}, nil
+}
+
+func (s *Service) getUserImage(c echo.Context) (interface{}, error) {
+	args := struct {
+		Username string `path:"username"`
+	}{}
+	if err := api.BindArgs(&args, c); err != nil {
+		return nil, err
+	}
+
+	user, err := UserByUsername(args.Username)
+	if err != nil {
+		return nil, err
+	}
+	currUser := c.(*detContext.DetContext).MustGetUser()
+
+	var ctx context.Context
+
+	if c.Request() == nil || c.Request().Context() == nil {
+		ctx = context.TODO()
+	} else {
+		ctx = c.Request().Context()
+	}
+	if err := AuthZProvider.Get().CanGetUsersImage(ctx, currUser,
+		*user); err != nil {
+		return nil, canViewUserErrorHandle(currUser, *user,
+			errors.Wrap(forbiddenError, err.Error()), db.ErrNotFound)
+	}
+
+	c.Response().Header().Set("cache-control", "public, max-age=3600")
+
+	return s.db.UserImage(args.Username)
 }

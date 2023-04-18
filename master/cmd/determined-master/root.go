@@ -34,6 +34,7 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(newMigrateCmd())
+	cmd.AddCommand(newPopulateCmd())
 	return cmd
 }
 
@@ -54,6 +55,12 @@ func runRoot() error {
 		return err
 	}
 	log.Infof("master configuration: %s", printableConfig)
+
+	err = os.MkdirAll(config.Cache.CacheDir, 0o700)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to make cache directory (%s)", config.Cache.CacheDir)
+		return err
+	}
 
 	m := internal.New(logStore, config)
 	return m.Run(context.TODO())
@@ -89,6 +96,11 @@ func initializeConfig() error {
 	}
 
 	config.SetMasterConfig(conf)
+
+	for _, deprecation := range conf.Deprecations() {
+		log.Warn(deprecation.Error())
+	}
+
 	return nil
 }
 

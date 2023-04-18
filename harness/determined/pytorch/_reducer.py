@@ -5,8 +5,6 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar, Union, overload
 
 import numpy as np
 
-import determined.common.check as check
-
 
 class Reducer(enum.Enum):
     """
@@ -28,18 +26,22 @@ class Reducer(enum.Enum):
 
 
 def _simple_reduce_metrics(
-    reducer: Reducer, metrics: np.array, num_batches: Optional[List[int]] = None
-) -> np.float:
+    reducer: Reducer, metrics: np.ndarray, num_batches: Optional[List[int]] = None
+) -> np.float64:
     if reducer == Reducer.AVG:
         if num_batches:
-            check.check_eq(len(metrics), len(num_batches))
-        return np.average(metrics, weights=num_batches)
+            if len(metrics) != len(num_batches):
+                raise RuntimeError(
+                    "Lengths of metrics and num_batches are not equal: "
+                    f"{len(metrics)} != {len(num_batches)}."
+                )
+        return np.average(metrics, weights=num_batches)  # type: ignore
     elif reducer == Reducer.SUM:
-        return np.sum(metrics)
+        return np.sum(metrics)  # type: ignore
     elif reducer == Reducer.MAX:
-        return np.max(metrics)
+        return np.max(metrics)  # type: ignore
     elif reducer == Reducer.MIN:
-        return np.min(metrics)
+        return np.min(metrics)  # type: ignore
     else:
         raise NotImplementedError
 
@@ -155,7 +157,7 @@ class MetricReducer(metaclass=abc.ABCMeta):
 
         The return value should either be:
            -  A dict mapping string metric names to metric values, if the call to
-              context.wrap_reducer() omitted the `name` parameter, or
+              context.wrap_reducer() omitted the ``name`` parameter, or
            -  A non-dict metric value if the call to context.wrap_reducer() had name set to a string
               (an error will be raised if a dict-type metric is returned but name was set).
 
@@ -208,7 +210,7 @@ class _SimpleReducer(MetricReducer):
 
 def default_allgather_fn(metrics: Any) -> List:
     """
-    A noop allgather implementation to ensure that custom reducers work outside of Determined.
+    A noop allgather implementation to ensure that custom reducers work outside Determined.
     """
     return [metrics]
 

@@ -23,6 +23,7 @@
   case:
     - host_path: /asdf
       container_path: /asdf
+    - "/qwer:/qwer"
   merge_src:
     - host_path: /zxcv
       container_path: /zxcv
@@ -31,6 +32,9 @@
   merged:
     - host_path: /asdf
       container_path: /asdf
+      mode:
+    - host_path: /qwer
+      container_path: /qwer
       mode:
     - host_path: /zxcv
       container_path: /zxcv
@@ -52,6 +56,7 @@
     save_experiment_best: 3
     save_trial_best: 10
     save_trial_latest: 10
+    prefix:
 
 - name: partially-filled searcher is allowed and merges correctly
   merge_as: http://determined.ai/schemas/expconf/v0/searcher.json
@@ -104,10 +109,10 @@
       task: language-modeling
   merged:
     transformer:
-      backbone: 
+      backbone:
         type: const
         val: bert
-      task: 
+      task:
         type: const
         val: language-modeling
 
@@ -121,7 +126,7 @@
   merged:
     transformer:
       type: const
-      val: 
+      val:
 
 - name: checkpoint storage merges only allow one union type
   merge_as: http://determined.ai/schemas/expconf/v0/checkpoint-storage.json
@@ -172,30 +177,6 @@
     smaller_is_better: true
     source_trial_id: null
     source_checkpoint_uuid: "asdf"
-
-- name: data layer merges only allow one union type
-  merge_as: http://determined.ai/schemas/expconf/v0/data-layer.json
-  case:
-    type: s3
-    bucket: asdf
-    bucket_directory_path: /asdf/asdf
-    local_cache_container_path: /asdf/asdf
-    local_cache_host_path: /asdf/asdf
-    endpoint_url: s3://s3.com
-    access_key: s3
-    secret_key: s3s3s3
-  merge_src:
-    type: gcs
-    bucket: zxcv
-  merged:
-    type: s3
-    bucket: asdf
-    bucket_directory_path: /asdf/asdf
-    local_cache_container_path: /asdf/asdf
-    local_cache_host_path: /asdf/asdf
-    endpoint_url: s3://s3.com
-    access_key: s3
-    secret_key: s3s3s3
 
 - name: azure config works when merged
   merge_as: http://determined.ai/schemas/expconf/v0/checkpoint-storage.json

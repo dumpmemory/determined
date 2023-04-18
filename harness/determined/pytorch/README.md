@@ -3,7 +3,6 @@
 "Most of PyTorchTrial is simple.  But the Horovod / AMP / Gradient Aggregation
 combo is not."
 
-
 ## Basics of PyTorch
 
 ### The forward pass
@@ -23,7 +22,6 @@ left in-place on the tensors to which they apply.
 Gather up all of the gradents for the tensors this optimizer is responsible for
 tuning, and apply the `gradient * learning_rate` to each weight.  Now you have
 new weights, congratulations!
-
 
 ## Horovod optimizer
 
@@ -75,7 +73,6 @@ This is not AMP, and it does not behave like the GradScaler.  It just blindly
 casts gradient update tensors to fp16 for network communication and blindly
 casts them back to fp32 afterwards.
 
-
 ## Gradient Aggregation:
 
 Gradient aggregation by a factor of N is just like multiplying the batch size
@@ -87,16 +84,15 @@ such as with batch norm).
 
 The only operation required for gradient aggregation are:
 
- * do N forward/backward passes before doing anything with the gradients that
-   result from those backward passes.  Those in-place gradients will add
-   together naturally.
+* do N forward/backward passes before doing anything with the gradients that
+  result from those backward passes.  Those in-place gradients will add
+  together naturally.
 
- * Divide the gradients by N to match the behavior of an N-times-larger batch
-   size.
+* Divide the gradients by N to match the behavior of an N-times-larger batch
+  size.
 
- * Call optimizer.step() after every N batches to act on the aggregated
-   gradients.
-
+* Call optimizer.step() after every N batches to act on the aggregated
+  gradients.
 
 ## PyTorch-Native AMP:
 
@@ -131,6 +127,9 @@ step the optimizer.
 Call the dumb control loop: if there was an overflow, decrease the scale
 factor.  If there was an underflow, increase it.
 
+Note that the `GradScaler` is designed to be one-per-training loop.  If there
+are multiple optimizers involved, there should only be one `scaler.update()`
+call after all `scaler.step(opt)` calls are made for a given batch.
 
 ## Nvidia apex AMP
 
@@ -200,14 +199,14 @@ limitations (needing to know the optimizer when calling `scale_loss`).
     the loss by N before each backward pass)
   * set `hvd_optimizer.backward_passes_per_step` to N (aggregation frequency)
   * only synchronize/step optimizer every N batches
-  * always call scaler.scale(loss) with the same scale factor for each batch in
-    a grouping of N batches (only call scaler.update() every N batches); this
+  * always call `scaler.scale(loss)` with the same scale factor for each batch in
+    a grouping of N batches (only call `scaler.update()` every N batches); this
     ensures that the gradient aggregation is valid.
 
 * PyTorch-native AMP:
-  * (repeated from above) always call scaler.step(optimizer) *after*
-    optimzer.synchronize()
-  * (repeated from above) only call scaler.update() after each grouping of N
+  * (repeated from above) always call `scaler.step(optimizer)` *after*
+    `optimizer.synchronize()`
+  * (repeated from above) only call `scaler.update()` after each grouping of N
     batches.
 
 * Nvidia apex AMP:
@@ -219,3 +218,16 @@ limitations (needing to know the optimizer when calling `scale_loss`).
     because `amp.scale_loss()` requires us to take actions on the correct
     optimizer, we do not allow multiple optimizers; we have to know that the
     our one optimizer is the correct optimizer to pass to scale_loss().
+
+* PyTorch Distributed:
+  * PyTorch Distributed wraps models in a `DistributedDataParallel` wrapper,
+  which must be done after initializing APEX AMP.
+  * PyTorch DDP synchronizes losses during the backwards pass
+  * Since gradients are automatically synchronized during each backwards pass,
+    each N-1 step must be wrapped in a `no_sync` context manager to avoid
+    inefficiencies of syncing gradients at every step during gradient
+    aggregation
+  * DDP broadcasts parameters on model instantiation with
+    `DistributedDataParallel()`, during which the `state_dict` from rank 0 is
+    broadcast to all other ranks in the group. This is done automatically,
+    unlike horovod's explicit use of `broadcast_parameters`

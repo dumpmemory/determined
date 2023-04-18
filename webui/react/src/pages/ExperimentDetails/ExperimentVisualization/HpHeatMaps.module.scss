@@ -1,6 +1,6 @@
 .base {
   height: 100%;
-  
+
   .container {
     display: inline-flex;
     flex-direction: column;
@@ -8,7 +8,7 @@
     min-height: 200px;
     width: 100%;
   }
-  .container > [class*=Message_base] {
+  .container > [class*='Message_base'] {
     height: 400px;
   }
   .charts {
@@ -18,9 +18,9 @@
     width: 100%;
   }
   .legend {
-    border-bottom: solid var(--theme-sizes-border-width) var(--theme-colors-monochrome-12);
+    border-bottom: solid var(--theme-stroke-width) var(--theme-colors-monochrome-12);
     flex-shrink: 0;
-    padding: var(--theme-sizes-layout-large);
+    padding: 12px;
     width: 100%;
   }
 }

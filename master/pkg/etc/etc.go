@@ -30,6 +30,8 @@ const (
 	NotebookIdleCheckResource = "check_idle.py"
 	// TaskCheckReadyLogsResource is the script to parse logs to check if a task is ready.
 	TaskCheckReadyLogsResource = "check_ready_logs.py"
+	// TaskEnrichLogsResource is the script to enrich logs for slurm (which doesn't run fluent).
+	TaskEnrichLogsResource = "enrich_task_logs.py"
 	// TensorboardEntryScriptResource is the script to set up TensorBoard.
 	TensorboardEntryScriptResource = "tensorboard-entrypoint.sh"
 	// TrialEntrypointScriptResource is the script to set up a trial.
@@ -40,6 +42,10 @@ const (
 	K8InitContainerEntryScriptResource = "k8_init_container_entrypoint.sh"
 	// TaskLoggingSetupScriptResource is the script to setup prerequistites for logging.
 	TaskLoggingSetupScriptResource = "task-logging-setup.sh"
+	// TaskLoggingTeardownScriptResource is the script to teardown stuff for logging.
+	TaskLoggingTeardownScriptResource = "task-logging-teardown.sh"
+	// TaskSignalHandlingScriptResource is the script to teardown stuff for logging.
+	TaskSignalHandlingScriptResource = "task-signal-handling.sh"
 )
 
 var staticRoot string

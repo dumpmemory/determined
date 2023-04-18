@@ -5,34 +5,33 @@
  * learn more: https://github.com/testing-library/jest-dom
  */
 import '@testing-library/jest-dom/extend-expect';
-import 'prototypes';
-import { readFileSync } from 'fs';
+import 'micro-observables/batchingForReactDom';
+import 'shared/prototypes';
+import 'whatwg-fetch';
+
+import Schema from 'async-validator';
+
+import { noOp } from 'shared/utils/service';
+
+/**
+ * To clean up the async-validator console warning that get generated during testing.
+ * https://github.com/yiminghe/async-validator#how-to-avoid-global-warning
+ */
+Schema.warning = noOp;
 
 Object.defineProperty(window, 'matchMedia', {
   value: () => ({
-    addEventListener: jest.fn(),
-    addListener: jest.fn(),         // deprecated
-    dispatchEvent: jest.fn(),
+    addEventListener: vi.fn(),
+    addListener: vi.fn(), // deprecated
+    dispatchEvent: vi.fn(),
     matches: false,
     onchange: null,
-    removeEventListener: jest.fn(),
-    removeListener: jest.fn(),       // deprecated
+    removeEventListener: vi.fn(),
+    removeListener: vi.fn(), // deprecated
   }),
 });
 
-Object.defineProperty(window, 'loadAntdStyleSheet', {
-  /*
-  * function to load ant styles into test environment
-  * https://github.com/testing-library/jest-dom/issues/113#issuecomment-496971128
-  * https://github.com/testing-library/jest-dom
-  * /blob/09f7f041805b2a4bcf5ac5c1e8201ee10a69ab9b/src/__tests__/to-have-style.js#L12-L18
-  */
-  value: () => {
-    const antdStyleSheet = readFileSync('node_modules/antd/dist/antd.css').toString();
-    const style = document.createElement('style');
-    style.innerHTML = antdStyleSheet;
-    document.body.appendChild(style);
-  },
-});
+vi.mock('router');
+vi.mock('services/api', () => ({}));
 
 global.ResizeObserver = require('resize-observer-polyfill');

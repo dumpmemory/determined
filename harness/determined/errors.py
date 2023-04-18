@@ -1,6 +1,12 @@
 from typing import Any, Dict, Type
 
 
+class EnterpriseOnlyError(Exception):
+    """Exception indicating the master may be missing an EE-only feature."""
+
+    pass
+
+
 class InternalException(Exception):
     def __init__(self, message: str) -> None:
         self.message = (
@@ -85,3 +91,27 @@ class CheckpointNotFound(Exception):
     """
     CheckpointNotFoundException indicates a checkpoint could not be found in checkpoint storage.
     """
+
+
+class CheckpointStateException(Exception):
+    """CheckpointStateException indicates a checkpoint is in an inappropriate state."""
+
+    pass
+
+
+class NoDirectStorageAccess(Exception):
+    """Direct checkpoint storage access unavailable, e.g., no credentials or permissions."""
+
+    pass
+
+
+class ProxiedDownloadFailed(Exception):
+    """Proxied checkpoint download through master failed"""
+
+    pass
+
+
+class MultipleDownloadsFailed(Exception):
+    """Multiple checkpoint download methods failed"""
+
+    pass

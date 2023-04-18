@@ -1,5 +1,8 @@
-import { MINIMUM_PAGE_SIZE } from 'components/Table';
-import { BaseType, SettingsConfig } from 'hooks/useSettings';
+import { array, boolean, literal, number, string, undefined as undefinedType, union } from 'io-ts';
+
+import { MINIMUM_PAGE_SIZE } from 'components/Table/Table';
+import { SettingsConfig } from 'hooks/useSettings';
+import { TrialWorkloadFilter } from 'types';
 
 export interface Settings {
   filter: TrialWorkloadFilter;
@@ -10,51 +13,43 @@ export interface Settings {
   tableOffset: number;
 }
 
-export enum TrialWorkloadFilter {
-  All = 'All',
-  Checkpoint = 'Has Checkpoint',
-  Validation = 'Has Validation',
-  CheckpointOrValidation = 'Has Checkpoint or Validation',
-}
-
-const config: SettingsConfig = {
-  settings: [
-    {
+export const settingsConfigForExperiment = (id: number): SettingsConfig<Settings> => ({
+  settings: {
+    filter: {
       defaultValue: TrialWorkloadFilter.CheckpointOrValidation,
-      key: 'filter',
       storageKey: 'filter',
-      type: { baseType: BaseType.String },
+      type: union([
+        literal(TrialWorkloadFilter.All),
+        literal(TrialWorkloadFilter.Checkpoint),
+        literal(TrialWorkloadFilter.CheckpointOrValidation),
+        literal(TrialWorkloadFilter.Validation),
+      ]),
     },
-    {
-      key: 'metric',
+    metric: {
+      defaultValue: undefined,
       storageKey: 'metric',
-      type: { baseType: BaseType.String, isArray: true },
+      type: union([undefinedType, array(string)]),
     },
-    {
+    sortDesc: {
       defaultValue: true,
-      key: 'sortDesc',
       storageKey: 'sortDesc',
-      type: { baseType: BaseType.Boolean },
+      type: boolean,
     },
-    {
+    sortKey: {
       defaultValue: 'batches',
-      key: 'sortKey',
       storageKey: 'sortKey',
-      type: { baseType: BaseType.String },
+      type: string,
     },
-    {
+    tableLimit: {
       defaultValue: MINIMUM_PAGE_SIZE,
-      key: 'tableLimit',
       storageKey: 'tableLimit',
-      type: { baseType: BaseType.Integer },
+      type: number,
     },
-    {
+    tableOffset: {
       defaultValue: 0,
-      key: 'tableOffset',
-      type: { baseType: BaseType.Integer },
+      storageKey: 'tableOffset',
+      type: number,
     },
-  ],
-  storagePath: 'trial-detail',
-};
-
-export default config;
+  },
+  storagePath: `experiment-trials-${id}`,
+});

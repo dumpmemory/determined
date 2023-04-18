@@ -18,7 +18,6 @@ func makeGoPgOpts(dbURL string) (*pg.Options, error) {
 	re := regexp.MustCompile(`&sslrootcert=([^&]*)`)
 	url := re.ReplaceAllString(dbURL, "")
 	opts, err := pg.ParseURL(url)
-
 	if err != nil {
 		return nil, err
 	}
@@ -101,8 +100,6 @@ func ensureMigrationUpgrade(tx *pg.Tx) error {
 		return err
 	}
 
-	fmt.Printf("Upgrade debug %s %t\n", goMigrateEntry.Version, goMigrateEntry.Dirty)
-
 	// CREATE gopg_migrations table,
 	// and INSERT the initial version from go-migrate.
 	if _, _, err := migrations.Run(tx, "init"); err != nil {
@@ -135,12 +132,24 @@ func (db *PgDB) Migrate(migrationURL string, actions []string) error {
 	if err != nil {
 		return err
 	}
+
 	defer func() {
 		// Rollback unless it has already been committed.
 		if errd := tx.Close(); errd != nil {
 			log.Errorf("failed to rollback pg transaction while migrating: %s", errd)
 		}
 	}()
+
+	// In integration tests, multiple processes can be running this code at once, which can lead to
+	// errors because PostgreSQL's CREATE TABLE IF NOT EXISTS is not great with concurrency.
+
+	// Arbitrarily chosen unique consistent ID for the lock.
+	const MigrationLockID = 0x33ad0708c9bed25b
+
+	_, err = tx.Exec("SELECT pg_advisory_xact_lock(?)", MigrationLockID)
+	if err != nil {
+		return err
+	}
 
 	if err = ensureMigrationUpgrade(tx); err != nil {
 		return errors.Wrap(err, "error upgrading migration metadata")

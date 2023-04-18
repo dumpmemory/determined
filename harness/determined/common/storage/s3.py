@@ -71,11 +71,14 @@ class S3StorageManager(storage.CloudStorageManager):
         return os.path.join(self.prefix, storage_id)
 
     @util.preserve_random_state
-    def upload(self, src: Union[str, os.PathLike], dst: str) -> None:
+    def upload(
+        self, src: Union[str, os.PathLike], dst: str, paths: Optional[storage.Paths] = None
+    ) -> None:
         src = os.fspath(src)
         prefix = self.get_storage_prefix(dst)
-        logging.info(f"Uploading to s3: {prefix}/{dst}")
-        for rel_path in sorted(self._list_directory(src)):
+        logging.info(f"Uploading to s3: prefix={prefix}")
+        upload_paths = paths if paths is not None else self._list_directory(src)
+        for rel_path in sorted(upload_paths):
             key_name = f"{prefix}/{rel_path}"
             logging.debug(f"Uploading {rel_path} to s3://{self.bucket_name}/{key_name}")
 
@@ -96,26 +99,51 @@ class S3StorageManager(storage.CloudStorageManager):
                 self.bucket.upload_file(abs_path, key_name)
 
     @util.preserve_random_state
-    def download(self, src: str, dst: Union[str, os.PathLike]) -> None:
+    def download(
+        self,
+        src: str,
+        dst: Union[str, os.PathLike],
+        selector: Optional[storage.Selector] = None,
+    ) -> None:
+        import botocore
+
         dst = os.fspath(dst)
         prefix = self.get_storage_prefix(src)
         logging.info(f"Downloading {prefix} from S3")
         found = False
-        for obj in self.bucket.objects.filter(Prefix=prefix):
-            found = True
-            _dst = os.path.join(dst, os.path.relpath(obj.key, prefix))
-            dst_dir = os.path.dirname(_dst)
-            os.makedirs(dst_dir, exist_ok=True)
 
-            logging.debug(f"Downloading s3://{self.bucket_name}/{obj.key} to {_dst}")
+        try:
+            for obj in self.bucket.objects.filter(Prefix=prefix):
+                found = True
+                relname = os.path.relpath(obj.key, prefix)
+                if obj.key.endswith("/"):
+                    relname = os.path.join(relname, "")
 
-            # Only create empty directory for keys that end with "/".
-            # See `upload` method for more context.
-            if obj.key.endswith("/"):
-                os.makedirs(_dst, exist_ok=True)
-                continue
+                if selector is not None and not selector(relname):
+                    continue
+                _dst = os.path.join(dst, relname)
+                dst_dir = os.path.dirname(_dst)
+                os.makedirs(dst_dir, exist_ok=True)
 
-            self.bucket.download_file(obj.key, _dst)
+                logging.debug(f"Downloading s3://{self.bucket_name}/{obj.key} to {_dst}")
+
+                # Only create empty directory for keys that end with "/".
+                # See `upload` method for more context.
+                if obj.key.endswith("/"):
+                    os.makedirs(_dst, exist_ok=True)
+                    continue
+
+                self.bucket.download_file(obj.key, _dst)
+
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] == "AccessDenied":
+                raise errors.NoDirectStorageAccess(
+                    "Unable to access cloud checkpoint storage"
+                ) from e
+            raise
+
+        except botocore.exceptions.NoCredentialsError as e:
+            raise errors.NoDirectStorageAccess("Unable to access cloud checkpoint storage") from e
 
         if not found:
             raise errors.CheckpointNotFound(f"Did not find {prefix} in S3")

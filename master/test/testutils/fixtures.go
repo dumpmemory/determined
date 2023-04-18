@@ -6,6 +6,7 @@ package testutils
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"time"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/ghodss/yaml"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/determined-ai/determined/master/internal"
@@ -49,9 +51,9 @@ root: ../../..
 `
 )
 
-// ResolveElastic resolves a connection to an elasticsearch database. To debug tests that use this
-// (or otherwise run the tests outside of the Makefile), make sure to set DET_INTEGRATION_ES_HOST and
-// DET_INTEGRATION_ES_PORT.
+// ResolveElastic resolves a connection to an elasticsearch database.
+// To debug tests that use this (or otherwise run the tests outside of the Makefile),
+// make sure to set DET_INTEGRATION_ES_HOST and DET_INTEGRATION_ES_PORT.
 func ResolveElastic() (*elastic.Elastic, error) {
 	es, err := elastic.Setup(*DefaultElasticConfig().ElasticLoggingConfig)
 	if err != nil {
@@ -81,9 +83,9 @@ func RunMaster(ctx context.Context, c *config.Config) (
 		err := m.Run(ctx)
 		switch {
 		case err == context.Canceled:
-			fmt.Println("master stopped")
+			log.Println("master stopped")
 		case err != nil:
-			fmt.Println("error running master: ", err)
+			log.Println("error running master: ", err)
 		}
 	}()
 
@@ -108,7 +110,8 @@ func ConnectMaster(c *config.Config) (apiv1.DeterminedClient, error) {
 	var clConn *grpc.ClientConn
 	var err error
 	for i := 0; i < 15; i++ {
-		clConn, err = grpc.Dial(fmt.Sprintf("localhost:%d", c.Port), grpc.WithInsecure())
+		clConn, err = grpc.Dial(fmt.Sprintf("localhost:%d", c.Port),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			err = fmt.Errorf("failed to dial master: %w", err)
 			continue
@@ -152,6 +155,7 @@ func DefaultMasterConfig() (*config.Config, error) {
 	return c, nil
 }
 
+// DefaultElasticConfig returns the default elastic config.
 func DefaultElasticConfig() model.LoggingConfig {
 	port, err := strconv.Atoi(os.Getenv("DET_INTEGRATION_ES_PORT"))
 	if err != nil {

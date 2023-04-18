@@ -1,57 +1,61 @@
 import base64
 import distutils.util
-import io
 import json
 import numbers
 import pathlib
 import sys
 import time
-from argparse import FileType, Namespace
+from argparse import ArgumentError, FileType, Namespace
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import tabulate
+import termcolor
 
 import determined as det
 import determined.experimental
 import determined.load
-from determined import _local_execution_manager
-from determined.cli import checkpoint, render
+from determined import cli
+from determined.cli import checkpoint, proxy, render
 from determined.cli.command import CONFIG_DESC, parse_config_overrides
-from determined.cli.session import setup_session
-from determined.common import api, constants, context, set_logger, util, yaml
-from determined.common.api import authentication, bindings
+from determined.cli.errors import CliError
+from determined.common import api, context, set_logger, util, yaml
+from determined.common.api import authentication, bindings, logs
 from determined.common.declarative_argparse import Arg, Cmd, Group
-from determined.common.experimental import Determined, session
+from determined.experimental import client
 
 from .checkpoint import render_checkpoint
+from .project import project_by_name
+from .trial import logs_args_description
 
 # Avoid reporting BrokenPipeError when piping `tabulate` output through
 # a filter like `head`.
 FLUSH = False
 
 
-def patch_experiment(args: Namespace, verb: str, patch_doc: Dict[str, Any]) -> None:
-    api.patch_experiment(args.master, args.experiment_id, patch_doc)
+def patch_experiment(args: Namespace, patch_doc: Dict[str, Any]) -> None:
+    path = f"experiments/{args.experiment_id}"
+    headers = {"Content-Type": "application/merge-patch+json"}
+    cli.setup_session(args).patch(path, json=patch_doc, headers=headers)
 
 
 @authentication.required
 def activate(args: Namespace) -> None:
-    bindings.post_ActivateExperiment(setup_session(args), id=args.experiment_id)
-    print("Activated experiment {}".format(args.experiment_id))
+    bindings.post_ActivateExperiment(cli.setup_session(args), id=args.experiment_id)
+    print(f"Activated experiment {args.experiment_id}")
 
 
 @authentication.required
 def archive(args: Namespace) -> None:
-    bindings.post_ArchiveExperiment(setup_session(args), id=args.experiment_id)
-    print("Archived experiment {}".format(args.experiment_id))
+    bindings.post_ArchiveExperiment(cli.setup_session(args), id=args.experiment_id)
+    print(f"Archived experiment {args.experiment_id}")
 
 
 @authentication.required
 def cancel(args: Namespace) -> None:
-    bindings.post_CancelExperiment(setup_session(args), id=args.experiment_id)
-    print("Canceled experiment {}".format(args.experiment_id))
+    bindings.post_CancelExperiment(cli.setup_session(args), id=args.experiment_id)
+    print(f"Canceled experiment {args.experiment_id}")
 
 
 def read_git_metadata(model_def_path: pathlib.Path) -> Tuple[str, str, str, str]:
@@ -61,9 +65,8 @@ def read_git_metadata(model_def_path: pathlib.Path) -> Tuple[str, str, str, str]
     """
     try:
         from git import Repo
-    except ImportError as e:
-        print("Error: Please verify that git is installed correctly: {}".format(e))
-        sys.exit(1)
+    except ImportError as e:  # pragma: no cover
+        raise CliError(f"Error: Please verify that git is installed correctly: {e}")
 
     if model_def_path.is_dir():
         repo_path = model_def_path.resolve()
@@ -71,31 +74,28 @@ def read_git_metadata(model_def_path: pathlib.Path) -> Tuple[str, str, str, str]
         repo_path = model_def_path.parent.resolve()
 
     if not repo_path.joinpath(".git").is_dir():
-        print(
-            "Error: No git directory found at {}. Please "
+        raise CliError(
+            f"Error: No git directory found at {repo_path}. Please "
             "initialize a git repository or refrain from "
-            "using the --git feature.".format(repo_path)
+            "using the --git feature."
         )
-        sys.exit(1)
 
     try:
         repo = Repo(str(repo_path))
     except Exception as e:
-        print("Failed to initialize git repository at ", "{}: {}".format(repo_path, e))
-        sys.exit(1)
+        raise CliError(f"Failed to initialize git repository at {repo_path}: {e}")
 
     if repo.is_dirty():
-        print(
+        raise CliError(
             "Git working directory is dirty. Please commit the "
             "following changes before creating an experiment "
             "with the --git feature:\n"
+            f"\n{repo.git.status()}"
         )
-        print(repo.git.status())
-        sys.exit(1)
 
     commit = repo.commit()
     commit_hash = commit.hexsha
-    committer = "{} <{}>".format(commit.committer.name, commit.committer.email)
+    committer = f"{commit.committer.name} <{commit.committer.email}>"
     commit_date = commit.committed_datetime.isoformat()
 
     # To get the upstream remote URL:
@@ -107,60 +107,197 @@ def read_git_metadata(model_def_path: pathlib.Path) -> Tuple[str, str, str, str]
     try:
         upstream_branch = repo.git.rev_parse("@{u}", abbrev_ref=True, symbolic_full_name=True)
         remote_name = upstream_branch.split("/", 1)[0]
-        remote_url = repo.git.config("remote.{}.url".format(remote_name), get=True)
-        print("Using remote URL '{}' from upstream branch '{}'".format(remote_url, upstream_branch))
+        remote_url = repo.git.config(f"remote.{remote_name}.url", get=True)
+        print(f"Using remote URL '{remote_url}' from upstream branch '{upstream_branch}'")
     except Exception as e:
-        print("Failed to find the upstream branch: ", e)
-        sys.exit(1)
+        raise CliError("Failed to find the upstream branch: ", e)
 
     return (remote_url, commit_hash, committer, commit_date)
 
 
-def _parse_config_file_or_exit(config_file: io.FileIO, config_overrides: Iterable[str]) -> Dict:
-    experiment_config = util.safe_load_yaml_with_exceptions(config_file)
+def _parse_config_text_or_exit(
+    config_text: str, path: str, config_overrides: Iterable[str]
+) -> Dict:
+    experiment_config = util.safe_load_yaml_with_exceptions(config_text)
 
-    config_file.close()
     if not experiment_config or not isinstance(experiment_config, dict):
-        print("Error: invalid experiment config file {!r}".format(config_file.name))
-        sys.exit(1)
+        raise ArgumentError(None, f"Error: invalid experiment config file {path}")
 
     parse_config_overrides(experiment_config, config_overrides)
 
     return experiment_config
 
 
+def _follow_experiment_logs(sess: api.Session, exp_id: int) -> None:
+    # Get the ID of this experiment's first trial (i.e., the one with the lowest ID).
+    print("Waiting for first trial to begin...")
+    while True:
+        trials = bindings.get_GetExperimentTrials(sess, experimentId=exp_id).trials
+        if len(trials) > 0:
+            break
+        else:
+            time.sleep(0.1)
+
+    first_trial_id = sorted(t_id.id for t_id in trials)[0]
+    print(f"Following first trial with ID {first_trial_id}")
+    try:
+        tlogs = logs.trial_logs(sess, first_trial_id, follow=True)
+        logs.pprint_logs(tlogs)
+    finally:
+        print(
+            termcolor.colored(
+                "Trial log stream ended. To reopen log stream, run: "
+                "det trial logs -f {}".format(first_trial_id),
+                "green",
+            )
+        )
+
+
+def _follow_test_experiment_logs(sess: api.Session, exp_id: int) -> None:
+    def print_progress(active_stage: int, ended: bool) -> None:
+        # There are four sequential stages of verification. Track the
+        # current stage with an index into this list.
+        stages = [
+            "Scheduling task",
+            "Testing training",
+            "Testing validation",
+            "Testing checkpointing",
+        ]
+
+        for idx, stage in enumerate(stages):
+            if active_stage > idx:
+                color = "green"
+                checkbox = "✔"
+            elif active_stage == idx:
+                color = "red" if ended else "yellow"
+                checkbox = "✗" if ended else " "
+            else:
+                color = "white"
+                checkbox = " "
+            print(termcolor.colored(stage + (25 - len(stage)) * ".", color), end="")
+            print(termcolor.colored(" [" + checkbox + "]", color), end="")
+
+            if idx == len(stages) - 1:
+                print("\n" if ended else "\r", end="")
+            else:
+                print(", ", end="")
+
+    while True:
+        exp = bindings.get_GetExperiment(sess, experimentId=exp_id).experiment
+        trials = bindings.get_GetExperimentTrials(sess, experimentId=exp_id).trials
+
+        # Wait for experiment to start and initialize a trial.
+        runner_state = trials[0].runnerState if trials else None
+
+        # Update the active_stage by examining the experiment state and trial runner state.
+        if exp.state == bindings.experimentv1State.COMPLETED:
+            active_stage = 4
+        elif runner_state == "checkpointing":
+            active_stage = 3
+        elif runner_state == "validating":
+            active_stage = 2
+        elif runner_state in (None, "UNSPECIFIED", "training"):
+            active_stage = 1
+        else:
+            active_stage = 0
+
+        # If the experiment is in a terminal state, output the appropriate
+        # message and exit. Otherwise, sleep and repeat.
+        if exp.state == bindings.experimentv1State.COMPLETED:
+            print_progress(active_stage, ended=True)
+            print(termcolor.colored("Model definition test succeeded! 🎉", "green"))
+            return
+        elif exp.state == bindings.experimentv1State.CANCELED:
+            print_progress(active_stage, ended=True)
+            print(
+                termcolor.colored(
+                    f"Model definition test (ID: {exp_id}) canceled before "
+                    "model test could complete. Please re-run the command.",
+                    "yellow",
+                )
+            )
+            sys.exit(1)
+        elif exp.state == bindings.experimentv1State.ERROR:
+            print_progress(active_stage, ended=True)
+            trial_id = trials[0].id
+            try:
+                tlogs = logs.trial_logs(sess, trial_id)
+                logs.pprint_logs(tlogs)
+            finally:
+                print(
+                    termcolor.colored(
+                        "Trial log stream ended. To reopen log stream, run: "
+                        "det trial logs -f {}".format(trial_id),
+                        "green",
+                    )
+                )
+            sys.exit(1)
+        else:
+            print_progress(active_stage, ended=False)
+            time.sleep(0.2)
+
+
 @authentication.required
 def submit_experiment(args: Namespace) -> None:
-    experiment_config = _parse_config_file_or_exit(args.config_file, args.config)
-    model_context = context.Context.from_local(args.model_def, constants.MAX_CONTEXT_SIZE)
+    config_text = args.config_file.read()
+    args.config_file.close()
+    experiment_config = _parse_config_text_or_exit(config_text, args.config_file.name, args.config)
+    model_context = context.read_v1_context(args.model_def, args.include)
 
-    additional_body_fields = {}
+    if args.config:
+        # The user provided tweaks as cli args, so we have to reserialize the submitted experiment
+        # config.  This will unfortunately remove comments they had in the yaml, so we only do it
+        # when we have to.
+        yaml_dump = yaml.dump(experiment_config)
+        assert yaml_dump is not None
+        config_text = yaml_dump
+
+    sess = cli.setup_session(args)
+
+    req = bindings.v1CreateExperimentRequest(
+        activate=not args.paused,
+        config=config_text,
+        modelDefinition=model_context,
+        parentId=None,
+        projectId=args.project_id,
+        template=args.template,
+        validateOnly=bool(args.test_mode),
+    )
+
     if args.git:
-        (
-            additional_body_fields["git_remote"],
-            additional_body_fields["git_commit"],
-            additional_body_fields["git_committer"],
-            additional_body_fields["git_commit_date"],
-        ) = read_git_metadata(args.model_def)
+        req.gitRemote, req.gitCommit, req.gitCommitter, req.gitCommitDate = read_git_metadata(
+            args.model_def
+        )
 
     if args.test_mode:
-        api.experiment.create_test_experiment_and_follow_logs(
-            args.master,
-            experiment_config,
-            model_context,
-            template=args.template if args.template else None,
-            additional_body_fields=additional_body_fields,
-        )
+        print(termcolor.colored("Validating experiment configuration...", "yellow"), end="\r")
+        bindings.post_CreateExperiment(sess, body=req)
+        print(termcolor.colored("Experiment configuration validation succeeded! 🎉", "green"))
+
+        print(termcolor.colored("Creating test experiment...", "yellow"), end="\r")
+        req.validateOnly = False
+        test_config = det._make_test_experiment_config(experiment_config)
+        req.config = yaml.dump(test_config)
+        resp = bindings.post_CreateExperiment(sess, body=req)
+        print(termcolor.colored(f"Created test experiment {resp.experiment.id}", "green"))
+
+        _follow_test_experiment_logs(sess, resp.experiment.id)
+
     else:
-        api.experiment.create_experiment_and_follow_logs(
-            master_url=args.master,
-            config=experiment_config,
-            model_context=model_context,
-            template=args.template if args.template else None,
-            additional_body_fields=additional_body_fields,
-            activate=not args.paused,
-            follow_first_trial_logs=args.follow_first_trial,
-        )
+        resp = bindings.post_CreateExperiment(sess, body=req)
+
+        print(f"Created experiment {resp.experiment.id}")
+
+        if resp.warnings:
+            cli.print_warnings(resp.warnings)
+
+        if not args.paused and args.follow_first_trial:
+            if args.publish:
+                port_map = proxy.parse_port_map_flag(args.publish)
+                with proxy.tunnel_experiment(sess, resp.experiment.id, port_map):
+                    _follow_experiment_logs(sess, resp.experiment.id)
+            else:
+                _follow_experiment_logs(sess, resp.experiment.id)
 
 
 def local_experiment(args: Namespace) -> None:
@@ -171,11 +308,14 @@ def local_experiment(args: Namespace) -> None:
             "the --local flag."
         )
 
-    experiment_config = _parse_config_file_or_exit(args.config_file, args.config)
+    config_text = args.config_file.read()
+    args.config_file.close()
+    experiment_config = _parse_config_text_or_exit(config_text, args.config_file.name, args.config)
+    entrypoint = experiment_config["entrypoint"]
 
     # --local --test mode only makes sense for the legacy trial entrypoints.  Otherwise the user
     # would just run their training script directly.
-    if not det.util.match_legacy_trial_class(experiment_config["entrypoint"]):
+    if not det.util.match_legacy_trial_class(entrypoint):
         raise NotImplementedError(
             "Local test mode (--local --test) is only supported for Trial-like entrypoints. "
             "Script-like entrypoints are not supported, but maybe you can just invoke your script "
@@ -184,17 +324,8 @@ def local_experiment(args: Namespace) -> None:
 
     set_logger(bool(experiment_config.get("debug", False)))
 
-    with _local_execution_manager(args.model_def.resolve()):
-        trial_entrypoint = determined.load.parse_trial_class_from_entrypoint(
-            experiment_config["entrypoint"]
-        )
-        if not trial_entrypoint:
-            raise ValueError(
-                "no class specification (model_def:TrialClass) "
-                "was found in ({experiment_config['entrypoint']})"
-            )
-
-        trial_class = determined.load.trial_class_from_entrypoint(trial_entrypoint)
+    with det._local_execution_manager(args.model_def.resolve()):
+        trial_class = determined.load.trial_class_from_entrypoint(entrypoint)
         determined.experimental.test_one_batch(trial_class=trial_class, config=experiment_config)
 
 
@@ -203,26 +334,6 @@ def create(args: Namespace) -> None:
         local_experiment(args)
     else:
         submit_experiment(args)
-
-
-def limit_offset_paginator(
-    method: Callable,
-    agg_field: str,
-    sess: session.Session,
-    limit: int = 200,
-    offset: Optional[int] = None,
-    **kwargs: Any
-) -> List[Any]:
-    all_objects: List[Any] = []
-    internal_offset = offset or 0
-    while True:
-        r = method(sess, limit=limit, offset=internal_offset, **kwargs)
-        page_objects = getattr(r, agg_field)
-        all_objects += page_objects
-        internal_offset += len(page_objects)
-        if offset is not None or len(page_objects) < limit:
-            break
-    return all_objects
 
 
 @authentication.required
@@ -234,41 +345,39 @@ def delete_experiment(args: Namespace) -> None:
         "alternative, see the 'det archive' command. Do you still \n"
         "wish to proceed?"
     ):
-        bindings.delete_DeleteExperiment(setup_session(args), experimentId=args.experiment_id)
-        print("Delete of experiment {} is in progress".format(args.experiment_id))
+        bindings.delete_DeleteExperiment(cli.setup_session(args), experimentId=args.experiment_id)
+        print(f"Deletion of experiment {args.experiment_id} is in progress")
     else:
         print("Aborting experiment deletion.")
 
 
 @authentication.required
 def describe(args: Namespace) -> None:
-    session = setup_session(args)
-    exps = []
+    session = cli.setup_session(args)
+    responses: List[bindings.v1GetExperimentResponse] = []
     for experiment_id in args.experiment_ids.split(","):
         r = bindings.get_GetExperiment(session, experimentId=experiment_id)
-        if args.json:
-            exps.append(r.to_json())
-        else:
-            exps.append(r.experiment)
+        responses.append(r)
 
     if args.json:
-        print(json.dumps(exps, indent=4))
+        print(json.dumps([resp.to_json() for resp in responses], indent=4))
         return
+    exps = [resp.experiment for resp in responses]
 
     # Display overall experiment information.
     headers = [
         "Experiment ID",
         "State",
         "Progress",
-        "Start Time",
-        "End Time",
+        "Started",
+        "Ended",
         "Name",
         "Description",
         "Archived",
         "Resource Pool",
         "Labels",
     ]
-    values = [
+    values: List[List] = [
         [
             exp.id,
             exp.state.value.replace("STATE_", ""),
@@ -291,13 +400,21 @@ def describe(args: Namespace) -> None:
     render.tabulate_or_csv(headers, values, args.csv, outfile)
 
     # Display trial-related information.
-    trials_for_experiment: Dict[str, Sequence[bindings.trialv1Trial]] = {}
-    for exp in exps:
-        trials_for_experiment[exp.id] = bindings.get_GetExperimentTrials(
-            session, experimentId=exp.id
-        ).trials
 
-    headers = ["Trial ID", "Experiment ID", "State", "Start Time", "End Time", "H-Params"]
+    def get_all_trials(exp_id: int) -> List[bindings.trialv1Trial]:
+        def get_with_offset(offset: int) -> bindings.v1GetExperimentTrialsResponse:
+            return bindings.get_GetExperimentTrials(
+                session,
+                offset=offset,
+                experimentId=exp_id,
+            )
+
+        resps = api.read_paginated(get_with_offset)
+        return [t for r in resps for t in r.trials]
+
+    trials_for_experiment = {exp.id: get_all_trials(exp.id) for exp in exps}
+
+    headers = ["Trial ID", "Experiment ID", "State", "Started", "Ended", "H-Params"]
     values = [
         [
             trial.id,
@@ -317,7 +434,25 @@ def describe(args: Namespace) -> None:
         outfile = args.outdir.joinpath("trials.csv")
     render.tabulate_or_csv(headers, values, args.csv, outfile)
 
-    # Display step-related information.
+    # Display workload-related information.
+
+    def get_all_workloads(trial_id: int) -> List[bindings.v1WorkloadContainer]:
+        def get_with_offset(offset: int) -> bindings.v1GetTrialWorkloadsResponse:
+            return bindings.get_GetTrialWorkloads(
+                session,
+                offset=offset,
+                trialId=trial_id,
+                limit=500,
+            )
+
+        resps = api.read_paginated(get_with_offset)
+        return [w for r in resps for w in r.workloads]
+
+    all_workloads = {
+        exp.id: {t.id: get_all_workloads(t.id) for t in trials_for_experiment[exp.id]}
+        for exp in exps
+    }
+
     t_metrics_headers: List[str] = []
     t_metrics_names: List[str] = []
     v_metrics_headers: List[str] = []
@@ -326,13 +461,13 @@ def describe(args: Namespace) -> None:
         # Accumulate the scalar training and validation metric names from all provided experiments.
         for exp in exps:
             sample_trial = trials_for_experiment[exp.id][0]
-            sample_workloads = bindings.get_GetTrial(session, trialId=sample_trial.id).workloads
+            sample_workloads = all_workloads[exp.id][sample_trial.id]
             t_metrics_names += scalar_training_metrics_names(sample_workloads)
             v_metrics_names += scalar_validation_metrics_names(sample_workloads)
         t_metrics_names = sorted(set(t_metrics_names))
-        t_metrics_headers = ["Training Metric: {}".format(name) for name in t_metrics_names]
+        t_metrics_headers = [f"Training Metric: {name}" for name in t_metrics_names]
         v_metrics_names = sorted(set(v_metrics_names))
-        v_metrics_headers = ["Validation Metric: {}".format(name) for name in v_metrics_names]
+        v_metrics_headers = [f"Validation Metric: {name}" for name in v_metrics_names]
 
     headers = (
         ["Trial ID", "# of Batches", "State", "Report Time"]
@@ -346,10 +481,11 @@ def describe(args: Namespace) -> None:
         + v_metrics_headers
     )
 
-    wl_output: Dict[int, List[Any]] = {}
+    values = []
     for exp in exps:
         for trial in trials_for_experiment[exp.id]:
-            workloads = bindings.get_GetTrial(session, trialId=trial.id).workloads
+            workloads = all_workloads[exp.id][trial.id]
+            wl_output: Dict[int, List[Any]] = {}
             for workload in workloads:
                 t_metrics_fields = []
                 wl_detail: Optional[
@@ -358,8 +494,12 @@ def describe(args: Namespace) -> None:
                 if workload.training:
                     wl_detail = workload.training
                     for name in t_metrics_names:
-                        if wl_detail.metrics and (name in wl_detail.metrics):
-                            t_metrics_fields.append(wl_detail.metrics[name])
+                        if (
+                            wl_detail.metrics
+                            and wl_detail.metrics.avgMetrics
+                            and (name in wl_detail.metrics.avgMetrics)
+                        ):
+                            t_metrics_fields.append(wl_detail.metrics.avgMetrics[name])
                         else:
                             t_metrics_fields.append(None)
                 else:
@@ -369,6 +509,7 @@ def describe(args: Namespace) -> None:
                     wl_detail = workload.checkpoint
 
                 if workload.checkpoint and wl_detail:
+                    assert isinstance(wl_detail, bindings.v1CheckpointWorkload)
                     checkpoint_state = wl_detail.state.value
                     checkpoint_end_time = wl_detail.endTime
                 else:
@@ -378,11 +519,15 @@ def describe(args: Namespace) -> None:
                 v_metrics_fields = []
                 if workload.validation:
                     wl_detail = workload.validation
-                    validation_state = wl_detail.state.value
+                    validation_state = "STATE_COMPLETED"
                     validation_end_time = wl_detail.endTime
                     for name in v_metrics_names:
-                        if wl_detail.metrics and (name in wl_detail.metrics):
-                            v_metrics_fields.append(wl_detail.metrics[name])
+                        if (
+                            wl_detail.metrics
+                            and wl_detail.metrics.avgMetrics
+                            and (name in wl_detail.metrics.avgMetrics)
+                        ):
+                            v_metrics_fields.append(wl_detail.metrics.avgMetrics[name])
                         else:
                             v_metrics_fields.append(None)
                 else:
@@ -419,7 +564,7 @@ def describe(args: Namespace) -> None:
                             [
                                 trial.id,
                                 wl_detail.totalBatches,
-                                wl_detail.state.value.replace("STATE_", ""),
+                                (checkpoint_state or validation_state).replace("STATE_", ""),
                                 render.format_time(wl_detail.endTime),
                             ]
                             + t_metrics_fields
@@ -433,30 +578,76 @@ def describe(args: Namespace) -> None:
                         )
                         wl_output[wl_detail.totalBatches] = row
 
+            # Done processing one trial's workloads, add to output values.
+            values += sorted(wl_output.values(), key=lambda a: int(a[1]))
+
     if not args.outdir:
         outfile = None
         print("\nWorkloads:")
     else:
         outfile = args.outdir.joinpath("workloads.csv")
-    values = sorted(wl_output.values(), key=lambda a: int(a[1]))
     render.tabulate_or_csv(headers, values, args.csv, outfile)
 
 
 @authentication.required
+def experiment_logs(args: Namespace) -> None:
+    sess = cli.setup_session(args)
+    trials = bindings.get_GetExperimentTrials(sess, experimentId=args.experiment_id).trials
+    if len(trials) == 0:
+        print(
+            f"No trials found for experiment {args.experiment_id}. "
+            "Try again after the experiment has a trial running."
+        )
+        return
+    first_trial_id = sorted(t_id.id for t_id in trials)[0]
+    try:
+        logs = api.trial_logs(
+            cli.setup_session(args),
+            first_trial_id,
+            head=args.head,
+            tail=args.tail,
+            follow=args.follow,
+            agent_ids=args.agent_ids,
+            container_ids=args.container_ids,
+            rank_ids=args.rank_ids,
+            sources=args.sources,
+            stdtypes=args.stdtypes,
+            min_level=args.level,
+            timestamp_before=args.timestamp_before,
+            timestamp_after=args.timestamp_after,
+        )
+        if args.json:
+            api.print_json_logs(logs)
+        else:
+            api.pprint_logs(logs)
+    finally:
+        print(
+            termcolor.colored(
+                "Trial log stream ended. To reopen log stream, run: "
+                "det trial logs -f {}".format(first_trial_id),
+                "green",
+            )
+        )
+
+
+@authentication.required
 def config(args: Namespace) -> None:
-    result = bindings.get_GetExperiment(setup_session(args), experimentId=args.experiment_id).config
+    result = bindings.get_GetExperiment(
+        cli.setup_session(args), experimentId=args.experiment_id
+    ).experiment.config
     yaml.safe_dump(result, stream=sys.stdout, default_flow_style=False)
 
 
 @authentication.required
 def download_model_def(args: Namespace) -> None:
-    resp = bindings.get_GetModelDef(setup_session(args), experimentId=args.experiment_id)
-    with args.output_dir.joinpath(str(args.experiment_id)).open("wb") as f:
+    resp = bindings.get_GetModelDef(cli.setup_session(args), experimentId=args.experiment_id)
+    dst = f"experiment_{args.experiment_id}_model_def.tgz"
+    with args.output_dir.joinpath(dst).open("wb") as f:
         f.write(base64.b64decode(resp.b64Tgz))
 
 
 def download(args: Namespace) -> None:
-    exp = Determined(args.master, args.user).get_experiment(args.experiment_id)
+    exp = client.ExperimentReference(args.experiment_id, cli.setup_session(args))
     checkpoints = exp.top_n_checkpoints(
         args.top_n, sort_by=args.sort_by, smaller_is_better=args.smaller_is_better
     )
@@ -474,45 +665,35 @@ def download(args: Namespace) -> None:
 
 @authentication.required
 def kill_experiment(args: Namespace) -> None:
-    bindings.post_KillExperiment(setup_session(args), id=args.experiment_id)
-    print("Killed experiment {}".format(args.experiment_id))
+    bindings.post_KillExperiment(cli.setup_session(args), id=args.experiment_id)
+    print(f"Killed experiment {args.experiment_id}")
 
 
 @authentication.required
 def wait(args: Namespace) -> None:
-    while True:
-        r = bindings.get_GetExperiment(
-            setup_session(args), experimentId=args.experiment_id
-        ).experiment
-
-        if r.state.value.replace("STATE_", "") in constants.TERMINAL_STATES:
-            print(
-                "Experiment {} terminated with state {}".format(
-                    args.experiment_id, r.state.value.replace("STATE_", "")
-                )
-            )
-            if r.state.value.replace("STATE_", "") == constants.COMPLETED:
-                sys.exit(0)
-            else:
-                sys.exit(1)
-
-        time.sleep(args.polling_interval)
+    exp = client.ExperimentReference(args.experiment_id, cli.setup_session(args))
+    state = exp.wait(interval=args.polling_interval)
+    if state != client.ExperimentState.COMPLETED:
+        sys.exit(1)
 
 
 @authentication.required
 def list_experiments(args: Namespace) -> None:
-    kwargs = {
-        "limit": args.limit,
-        "offset": args.offset,
-    }
-    if not args.all:
-        kwargs["archived"] = "false"
-        kwargs["users"] = [authentication.must_cli_auth().get_session_user()]
-    all_experiments: List[bindings.v1Experiment] = limit_offset_paginator(
-        bindings.get_GetExperiments, "experiments", setup_session(args), **kwargs
-    )
+    session = cli.setup_session(args)
 
-    def format_experiment(e: Any) -> List[Any]:
+    def get_with_offset(offset: int) -> bindings.v1GetExperimentsResponse:
+        return bindings.get_GetExperiments(
+            session,
+            offset=offset,
+            archived=False if args.all else None,
+            limit=args.limit,
+            users=None if args.all else [authentication.must_cli_auth().get_session_user()],
+        )
+
+    resps = api.read_paginated(get_with_offset, offset=args.offset, pages=args.pages)
+    all_experiments = [e for r in resps for e in r.experiments]
+
+    def format_experiment(e: bindings.v1Experiment) -> List[Any]:
         result = [
             e.id,
             e.username,
@@ -523,7 +704,9 @@ def list_experiments(args: Namespace) -> None:
             render.format_time(e.startTime),
             render.format_time(e.endTime),
             e.resourcePool,
-        ]
+        ]  # type: List[Any]
+        if args.show_project:
+            result = [e.workspaceName, e.projectName] + result
         if args.all:
             result.append(e.archived)
         return result
@@ -535,10 +718,12 @@ def list_experiments(args: Namespace) -> None:
         "Parent ID",
         "State",
         "Progress",
-        "Start Time",
-        "End Time",
+        "Started",
+        "Ended",
         "Resource Pool",
     ]
+    if args.show_project:
+        headers = ["Workspace", "Project"] + headers
     if args.all:
         headers.append("Archived")
 
@@ -551,7 +736,7 @@ def is_number(value: Any) -> bool:
 
 
 def scalar_training_metrics_names(
-    workloads: Sequence[bindings.GetTrialResponseWorkloadContainer],
+    workloads: Sequence[bindings.v1WorkloadContainer],
 ) -> Set[str]:
     """
     Given an experiment history, return the names of training metrics
@@ -566,36 +751,40 @@ def scalar_training_metrics_names(
             metrics = workload.training.metrics
             if not metrics:
                 continue
-            return set(metrics.keys())
+            return set(metrics.avgMetrics.keys())
 
     return set()
 
 
 def scalar_validation_metrics_names(
-    workloads: Sequence[bindings.GetTrialResponseWorkloadContainer],
+    workloads: Sequence[bindings.v1WorkloadContainer],
 ) -> Set[str]:
     for workload in workloads:
         if workload.validation:
             metrics = workload.validation.metrics
             if not metrics:
                 continue
-            return set(metrics.keys())
+            return set(metrics.avgMetrics.keys())
 
     return set()
 
 
 @authentication.required
 def list_trials(args: Namespace) -> None:
-    all_trials: List[bindings.trialv1Trial] = limit_offset_paginator(
-        bindings.get_GetExperimentTrials,
-        "trials",
-        setup_session(args),
-        experimentId=args.experiment_id,
-        limit=args.limit,
-        offset=args.offset,
-    )
+    session = cli.setup_session(args)
 
-    headers = ["Trial ID", "State", "H-Params", "Start Time", "End Time", "# of Batches"]
+    def get_with_offset(offset: int) -> bindings.v1GetExperimentTrialsResponse:
+        return bindings.get_GetExperimentTrials(
+            session,
+            offset=offset,
+            experimentId=args.experiment_id,
+            limit=args.limit,
+        )
+
+    resps = api.read_paginated(get_with_offset, offset=args.offset, pages=args.pages)
+    all_trials = [t for r in resps for t in r.trials]
+
+    headers = ["Trial ID", "State", "H-Params", "Started", "Ended", "# of Batches"]
     values = [
         [
             t.id,
@@ -613,33 +802,33 @@ def list_trials(args: Namespace) -> None:
 
 @authentication.required
 def pause(args: Namespace) -> None:
-    bindings.post_PauseExperiment(setup_session(args), id=args.experiment_id)
-    print("Paused experiment {}".format(args.experiment_id))
+    bindings.post_PauseExperiment(cli.setup_session(args), id=args.experiment_id)
+    print(f"Paused experiment {args.experiment_id}")
 
 
 @authentication.required
 def set_description(args: Namespace) -> None:
-    session = setup_session(args)
+    session = cli.setup_session(args)
     exp = bindings.get_GetExperiment(session, experimentId=args.experiment_id).experiment
     exp_patch = bindings.v1PatchExperiment.from_json(exp.to_json())
     exp_patch.description = args.description
     bindings.patch_PatchExperiment(session, body=exp_patch, experiment_id=args.experiment_id)
-    print("Set description of experiment {} to '{}'".format(args.experiment_id, args.description))
+    print(f"Set description of experiment {args.experiment_id} to '{args.description}'")
 
 
 @authentication.required
 def set_name(args: Namespace) -> None:
-    session = setup_session(args)
+    session = cli.setup_session(args)
     exp = bindings.get_GetExperiment(session, experimentId=args.experiment_id).experiment
     exp_patch = bindings.v1PatchExperiment.from_json(exp.to_json())
     exp_patch.name = args.name
     bindings.patch_PatchExperiment(session, body=exp_patch, experiment_id=args.experiment_id)
-    print("Set name of experiment {} to '{}'".format(args.experiment_id, args.name))
+    print(f"Set name of experiment {args.experiment_id} to '{args.name}'")
 
 
 @authentication.required
 def add_label(args: Namespace) -> None:
-    session = setup_session(args)
+    session = cli.setup_session(args)
     exp = bindings.get_GetExperiment(session, experimentId=args.experiment_id).experiment
     exp_patch = bindings.v1PatchExperiment.from_json(exp.to_json())
     if exp_patch.labels is None:
@@ -647,36 +836,36 @@ def add_label(args: Namespace) -> None:
     if args.label not in exp_patch.labels:
         exp_patch.labels = list(exp_patch.labels) + [args.label]
         bindings.patch_PatchExperiment(session, body=exp_patch, experiment_id=args.experiment_id)
-    print("Added label '{}' to experiment {}".format(args.label, args.experiment_id))
+    print(f"Added label '{args.label}' to experiment {args.experiment_id}")
 
 
 @authentication.required
 def remove_label(args: Namespace) -> None:
-    session = setup_session(args)
+    session = cli.setup_session(args)
     exp = bindings.get_GetExperiment(session, experimentId=args.experiment_id).experiment
     exp_patch = bindings.v1PatchExperiment.from_json(exp.to_json())
     if (exp_patch.labels) and (args.label in exp_patch.labels):
         exp_patch.labels = [label for label in exp_patch.labels if label != args.label]
         bindings.patch_PatchExperiment(session, body=exp_patch, experiment_id=args.experiment_id)
-    print("Removed label '{}' from experiment {}".format(args.label, args.experiment_id))
+    print(f"Removed label '{args.label}' from experiment {args.experiment_id}")
 
 
 @authentication.required
 def set_max_slots(args: Namespace) -> None:
-    patch_experiment(args, "change `max_slots` of", {"resources": {"max_slots": args.max_slots}})
-    print("Set `max_slots` of experiment {} to {}".format(args.experiment_id, args.max_slots))
+    patch_experiment(args, {"resources": {"max_slots": args.max_slots}})
+    print(f"Set `max_slots` of experiment {args.experiment_id} to {args.max_slots}")
 
 
 @authentication.required
 def set_weight(args: Namespace) -> None:
-    patch_experiment(args, "change `weight` of", {"resources": {"weight": args.weight}})
-    print("Set `weight` of experiment {} to {}".format(args.experiment_id, args.weight))
+    patch_experiment(args, {"resources": {"weight": args.weight}})
+    print(f"Set `weight` of experiment {args.experiment_id} to {args.weight}")
 
 
 @authentication.required
 def set_priority(args: Namespace) -> None:
-    patch_experiment(args, "change `priority` of", {"resources": {"priority": args.priority}})
-    print("Set `priority` of experiment {} to {}".format(args.experiment_id, args.priority))
+    patch_experiment(args, {"resources": {"priority": args.priority}})
+    print(f"Set `priority` of experiment {args.experiment_id} to {args.priority}")
 
 
 @authentication.required
@@ -688,9 +877,7 @@ def set_gc_policy(args: Namespace) -> None:
     }
 
     if not args.yes:
-        r = api.get(
-            args.master, "experiments/{}/preview_gc".format(args.experiment_id), params=policy
-        )
+        r = api.get(args.master, f"experiments/{args.experiment_id}/preview_gc", params=policy)
         response = r.json()
         checkpoints = response["checkpoints"]
         metric_name = response["metric_name"]
@@ -699,20 +886,22 @@ def set_gc_policy(args: Namespace) -> None:
             "Trial ID",
             "# of Batches",
             "State",
-            "Validation Metric\n({})".format(metric_name),
+            f"Validation Metric\n({metric_name})",
             "UUID",
             "Resources",
         ]
         values = [
             [
-                c["trial_id"],
-                c["step"]["total_batches"],
-                c["state"],
-                api.metric.get_validation_metric(metric_name, c["step"]["validation"]),
-                c["uuid"],
-                render.format_resources(c["resources"]),
+                c["TrialID"],
+                c["StepsCompleted"],
+                c["State"],
+                api.metric.get_validation_metric(
+                    metric_name, {"metrics": {"validation_metrics": c["ValidationMetrics"]}}
+                ),
+                c["UUID"],
+                render.format_resources(c["Resources"]),
             ]
-            for c in sorted(checkpoints, key=lambda c: (c["trial_id"], c["end_time"]))
+            for c in sorted(checkpoints, key=lambda c: (c["TrialID"], c["ReportTime"]))
             if "step" in c and c["step"].get("validation")
         ]
 
@@ -723,10 +912,8 @@ def set_gc_policy(args: Namespace) -> None:
             )
             print(tabulate.tabulate(values, headers, tablefmt="presto"), flush=FLUSH)
         print(
-            "This policy will delete {} checkpoints with "
-            "validations and {} checkpoints without validations.".format(
-                len(values), len(checkpoints) - len(values)
-            )
+            f"This policy will delete {len(values)} checkpoints with "
+            f"validations and {len(checkpoints) - len(values)} checkpoints without validations."
         )
 
     if args.yes or render.yes_or_no(
@@ -735,16 +922,28 @@ def set_gc_policy(args: Namespace) -> None:
         "in the unrecoverable deletion of checkpoints.  Do you wish to "
         "proceed?"
     ):
-        patch_experiment(args, "change gc policy of", {"checkpoint_storage": policy})
-        print("Set GC policy of experiment {} to\n{}".format(args.experiment_id, pformat(policy)))
+        patch_experiment(args, {"checkpoint_storage": policy})
+        print(f"Set GC policy of experiment {args.experiment_id} to\n{pformat(policy)}")
     else:
         print("Aborting operations.")
 
 
 @authentication.required
 def unarchive(args: Namespace) -> None:
-    bindings.post_UnarchiveExperiment(setup_session(args), id=args.experiment_id)
-    print("Unarchived experiment {}".format(args.experiment_id))
+    bindings.post_UnarchiveExperiment(cli.setup_session(args), id=args.experiment_id)
+    print(f"Unarchived experiment {args.experiment_id}")
+
+
+@authentication.required
+def move_experiment(args: Namespace) -> None:
+    sess = cli.setup_session(args)
+    (w, p) = project_by_name(sess, args.workspace_name, args.project_name)
+    req = bindings.v1MoveExperimentRequest(
+        destinationProjectId=p.id,
+        experimentId=args.experiment_id,
+    )
+    bindings.post_MoveExperiment(sess, body=req, experimentId=args.experiment_id)
+    print(f'Moved experiment {args.experiment_id} to project "{args.project_name}"')
 
 
 def none_or_int(string: str) -> Optional[int]:
@@ -757,22 +956,6 @@ def experiment_id_arg(help: str) -> Arg:  # noqa: A002
     return Arg("experiment_id", type=int, help=help)
 
 
-# do not use util.py's pagination_args because default behavior here is
-# to hide pagination and unify all experiment pages into one output
-pagination_args = [
-    Arg(
-        "--limit",
-        type=int,
-        default=200,
-        help="Maximum items per page of results",
-    ),
-    Arg(
-        "--offset",
-        type=int,
-        default=None,
-        help="Number of items to skip before starting page of results",
-    ),
-]
 main_cmd = Cmd(
     "e|xperiment",
     None,
@@ -780,7 +963,7 @@ main_cmd = Cmd(
     [
         # Inspection commands.
         Cmd(
-            "list",
+            "list ls",
             list_experiments,
             "list experiments",
             [
@@ -790,7 +973,12 @@ main_cmd = Cmd(
                     action="store_true",
                     help="show all experiments (including archived and other users')",
                 ),
-                *pagination_args,
+                Arg(
+                    "--show_project",
+                    action="store_true",
+                    help="include columns for workspace name and project name",
+                ),
+                *cli.default_pagination_args,
                 Arg("--csv", action="store_true", help="print as CSV"),
             ],
             is_default=True,
@@ -804,11 +992,21 @@ main_cmd = Cmd(
                 Arg("experiment_ids", help="comma-separated list of experiment IDs to describe"),
                 Arg("--metrics", action="store_true", help="display full metrics"),
                 Group(
-                    Arg("--csv", action="store_true", help="print as CSV"),
-                    Arg("--json", action="store_true", help="print as JSON"),
+                    cli.output_format_args["csv"],
+                    cli.output_format_args["json"],
                     Arg("--outdir", type=Path, help="directory to save output"),
                 ),
             ],
+        ),
+        Cmd(
+            "logs",
+            experiment_logs,
+            "fetch logs of the first trial of an experiment",
+            [
+                experiment_id_arg("experiment ID"),
+                cli.output_format_args["json"],
+            ]
+            + logs_args_description,
         ),
         Cmd(
             "download-model-def",
@@ -825,7 +1023,7 @@ main_cmd = Cmd(
             "list trials of experiment",
             [
                 experiment_id_arg("experiment ID"),
-                *pagination_args,
+                *cli.default_pagination_args,
                 Arg("--csv", action="store_true", help="print as CSV"),
             ],
         ),
@@ -841,6 +1039,7 @@ main_cmd = Cmd(
                     help="Return the best N checkpoints for this experiment. "
                     "If this flag is used, only checkpoints with an associated "
                     "validation metric will be considered.",
+                    metavar="N",
                 ),
                 Arg("--csv", action="store_true", help="print as CSV"),
             ],
@@ -853,6 +1052,14 @@ main_cmd = Cmd(
             [
                 Arg("config_file", type=FileType("r"), help="experiment config file (.yaml)"),
                 Arg("model_def", type=Path, help="file or directory containing model definition"),
+                Arg(
+                    "-i",
+                    "--include",
+                    action="append",
+                    default=[],
+                    type=Path,
+                    help="additional files to copy into the task container",
+                ),
                 Arg(
                     "-g",
                     "--git",
@@ -873,6 +1080,7 @@ main_cmd = Cmd(
                     type=str,
                     help="name of template to apply to the experiment configuration",
                 ),
+                Arg("--project_id", type=int, help="place this experiment inside this project"),
                 Arg("--config", action="append", default=[], help=CONFIG_DESC),
                 Group(
                     Arg(
@@ -893,6 +1101,14 @@ main_cmd = Cmd(
                         "checkpoints can be saved. The test experiment will "
                         "be archived on creation.",
                     ),
+                ),
+                Arg(
+                    "-p",
+                    "--publish",
+                    action="append",
+                    default=[],
+                    type=str,
+                    help="publish task ports to the host",
                 ),
             ],
         ),
@@ -1015,6 +1231,16 @@ main_cmd = Cmd(
                     "remove label",
                     [experiment_id_arg("experiment ID"), Arg("label", help="label")],
                 ),
+            ],
+        ),
+        Cmd(
+            "move",
+            move_experiment,
+            "move experiment to another project",
+            [
+                experiment_id_arg("experiment ID to move"),
+                Arg("workspace_name", help="Name of destination workspace"),
+                Arg("project_name", help="Name of destination project"),
             ],
         ),
         Cmd(

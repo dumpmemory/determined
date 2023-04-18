@@ -1,20 +1,20 @@
-import { Tooltip } from 'antd';
-import { ColumnType } from 'antd/es/table';
 import React, { ReactNode } from 'react';
 
-import Avatar from 'components/Avatar';
 import Badge, { BadgeType } from 'components/Badge';
-import Icon from 'components/Icon';
+import Tooltip from 'components/kit/Tooltip';
 import Link from 'components/Link';
-import { relativeTimeRenderer } from 'components/Table';
+import { ColumnDef } from 'components/Table/InteractiveTable';
+import { relativeTimeRenderer } from 'components/Table/Table';
 import { paths } from 'routes/utils';
 import { getJupyterLabs, getTensorBoards } from 'services/api';
-import { Job, JobType } from 'types';
+import Icon from 'shared/components/Icon/Icon';
+import { floatToPercent, truncate } from 'shared/utils/string';
+import { CommandTask, Job, JobType } from 'types';
 import { jobTypeIconName, jobTypeLabel } from 'utils/job';
-import { floatToPercent, truncate } from 'utils/string';
-import { openCommand } from 'wait';
+import { openCommand } from 'utils/wait';
 
 import css from './JobQueue.module.scss';
+import { DEFAULT_COLUMN_WIDTHS } from './JobQueue.settings';
 
 type Renderer<T> = (_: unknown, record: T) => ReactNode;
 export type JobTypeRenderer = Renderer<Job>;
@@ -22,7 +22,7 @@ export type JobTypeRenderer = Renderer<Job>;
 export const SCHEDULING_VAL_KEY = 'schedulingVal';
 
 const routeToTask = async (taskId: string, jobType: JobType): Promise<void> => {
-  let cmds = [];
+  let cmds: CommandTask[] = [];
   switch (jobType) {
     case JobType.TENSORBOARD:
       cmds = await getTensorBoards({});
@@ -34,7 +34,7 @@ const routeToTask = async (taskId: string, jobType: JobType): Promise<void> => {
       throw new Error(`Unsupported job type: ${jobType}`);
   }
 
-  const task = cmds.find(t => t.id === taskId);
+  const task = cmds.find((t) => t.id === taskId);
   if (task) {
     openCommand(task);
   } else {
@@ -49,9 +49,11 @@ const linkToEntityPage = (job: Job, label: ReactNode): ReactNode => {
     case JobType.NOTEBOOK:
     case JobType.TENSORBOARD:
       return (
-        <Link onClick={() => {
-          routeToTask(job.entityId, job.type);
-        }}>{label}
+        <Link
+          onClick={() => {
+            routeToTask(job.entityId, job.type);
+          }}>
+          {label}
         </Link>
       );
     default:
@@ -59,8 +61,13 @@ const linkToEntityPage = (job: Job, label: ReactNode): ReactNode => {
   }
 };
 
-export const columns: ColumnType<Job>[] = [
-  { key: 'jobsAhead' },
+export const columns: ColumnDef<Job>[] = [
+  {
+    align: 'center',
+    dataIndex: 'preemptible',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['preemptible'],
+    key: 'jobsAhead',
+  },
   // { // We might want to show the entityId here instead.
   //   dataIndex: 'jobId',
   //   key: 'jobId',
@@ -71,7 +78,9 @@ export const columns: ColumnType<Job>[] = [
   //   title: 'ID',
   // },
   {
+    align: 'center',
     dataIndex: 'type',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['type'],
     key: 'type',
     render: (_: unknown, record: Job): ReactNode => {
       const title = jobTypeLabel(record.type);
@@ -87,21 +96,26 @@ export const columns: ColumnType<Job>[] = [
     title: 'Type',
   },
   {
+    dataIndex: 'name',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['name'],
     key: 'name',
     render: (_: unknown, record: Job): ReactNode => {
       let label: ReactNode = null;
       switch (record.type) {
         case JobType.EXPERIMENT:
           label = (
-            <div>{record.name}
-              <Tooltip title="Experiment ID">
-                {` (${record.entityId})`}
-              </Tooltip>
+            <div>
+              {record.name}
+              <Tooltip title="Experiment ID">{` (${record.entityId})`}</Tooltip>
             </div>
           );
           break;
         default:
-          label = <span>{jobTypeLabel(record.type)} {truncate(record.entityId, 6, '')}</span>;
+          label = (
+            <span>
+              {jobTypeLabel(record.type)} {truncate(record.entityId, 6, '')}
+            </span>
+          );
           break;
       }
 
@@ -111,17 +125,23 @@ export const columns: ColumnType<Job>[] = [
   },
   {
     dataIndex: 'priority',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['priority'],
     key: SCHEDULING_VAL_KEY,
     title: 'Priority',
   },
   {
+    align: 'right',
     dataIndex: 'submissionTime',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['submissionTime'],
     key: 'submitted',
     render: (_: unknown, record: Job): ReactNode =>
       record.submissionTime && relativeTimeRenderer(record.submissionTime),
     title: 'Submitted',
   },
   {
+    align: 'right',
+    dataIndex: 'slots',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['slots'],
     key: 'slots',
     render: (_: unknown, record: Job): ReactNode => {
       const cell = (
@@ -136,32 +156,34 @@ export const columns: ColumnType<Job>[] = [
     title: 'Slots',
   },
   {
+    align: 'center',
+    dataIndex: 'status',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['status'],
     key: 'state',
     render: (_: unknown, record: Job): ReactNode => {
       return (
         <div className={css.state}>
           <Badge state={record.summary.state} type={BadgeType.State} />
-          {(!!record?.progress) && <span> {floatToPercent(record.progress, 1)}</span>}
+          {!!record?.progress && <span> {floatToPercent(record.progress, 1)}</span>}
         </div>
       );
     },
-    title: 'Status',
+    title: 'State',
   },
   {
+    align: 'center',
     dataIndex: 'user',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['user'],
     key: 'user',
-    render: (_: unknown, record: Job): ReactNode => {
-      const cell = <Avatar username={record.username} />;
-      return cell;
-    },
     title: 'User',
   },
   {
     align: 'right',
     className: 'fullCell',
+    dataIndex: 'action',
+    defaultWidth: DEFAULT_COLUMN_WIDTHS['action'],
     fixed: 'right',
     key: 'actions',
     title: '',
-    width: 40,
   },
 ];

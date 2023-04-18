@@ -1,167 +1,210 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import { DownloadOutlined } from '@ant-design/icons';
+import { Tooltip } from 'antd';
+import React, { RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { throttle } from 'throttle-debounce';
 import uPlot, { AlignedData } from 'uplot';
 
-import Message, { MessageType } from 'components/Message';
 import useResize from 'hooks/useResize';
-import { RecordKey } from 'types';
-import { distance } from 'utils/chart';
+import Spinner from 'shared/components/Spinner';
+import useUI from 'shared/contexts/stores/UI';
+import usePrevious from 'shared/hooks/usePrevious';
+import { DarkLight } from 'shared/themes';
+import { ErrorLevel, ErrorType } from 'shared/utils/error';
+import handleError from 'utils/error';
 
-import { FacetedData, UPlotData } from './types';
+import { useChartSync } from './SyncProvider';
+import { FacetedData } from './types';
+import css from './UPlotChart.module.scss';
 
 export interface Options extends Omit<uPlot.Options, 'width'> {
+  key?: number;
   width?: number;
 }
 
 interface Props {
+  allowDownload?: boolean;
   data?: AlignedData | FacetedData;
-  focusIndex?: number;
+  experimentId?: number;
+  isLoading?: boolean;
   options?: Partial<Options>;
   style?: React.CSSProperties;
 }
 
-interface ScaleZoomData {
-  isZoomed?: boolean;
-  max?: number;
-  min?: number;
-}
-
 const SCROLL_THROTTLE_TIME = 500;
 
-const UPlotChart: React.FC<Props> = ({ data, focusIndex, options, style }: Props) => {
+const shouldRecreate = (
+  prev: Partial<Options> | undefined,
+  next: Partial<Options> | undefined,
+): boolean => {
+  if (!next) return false;
+  if (!prev) return true;
+  if (prev === next) return false;
+  if (prev.key !== next.key) return true;
+  if (Object.keys(prev).length !== Object.keys(next).length) return true;
+
+  if (prev.axes?.length !== next.axes?.length) return true;
+
+  if (prev?.series?.length !== next.series?.length) return true;
+
+  const someScaleHasChanged = Object.entries(next.scales ?? {}).some(([scaleKey, nextScale]) => {
+    const prevScale = prev?.scales?.[scaleKey];
+    return prevScale?.distr !== nextScale?.distr;
+  });
+
+  if (someScaleHasChanged) return true;
+
+  const someAxisHasChanged = prev.axes?.some((prevAxis, seriesIdx) => {
+    const nextAxis = next.axes?.[seriesIdx];
+    return (
+      prevAxis.label !== nextAxis?.label ||
+      prevAxis.stroke !== nextAxis?.stroke ||
+      prevAxis.scale !== nextAxis?.scale
+    );
+  });
+  if (someAxisHasChanged) return true;
+
+  const someSeriesHasChanged = prev.series?.some((prevSerie, seriesIdx) => {
+    const nextSerie = next.series?.[seriesIdx];
+
+    return (
+      (nextSerie?.label != null && prevSerie?.label !== nextSerie?.label) ||
+      (prevSerie?.stroke != null && prevSerie?.stroke !== nextSerie?.stroke) ||
+      (nextSerie?.paths != null && prevSerie?.paths !== nextSerie?.paths) ||
+      (nextSerie?.fill != null && prevSerie?.fill !== nextSerie?.fill) ||
+      prevSerie?.points?.show !== nextSerie?.points?.show
+    );
+  });
+  if (someSeriesHasChanged) return true;
+
+  return false;
+};
+type ChartType = 'Line' | 'Scatter';
+
+const UPlotChart: React.FC<Props> = ({
+  allowDownload,
+  data,
+  isLoading,
+  options,
+  style,
+  experimentId,
+}: Props) => {
   const chartRef = useRef<uPlot>();
+  const [divHeight, setDivHeight] = useState((options?.height ?? 300) + 20);
   const chartDivRef = useRef<HTMLDivElement>(null);
-  const scalesRef = useRef<Record<RecordKey, uPlot.Scale>>();
-  const scalesZoomData = useRef<Record<string, ScaleZoomData>>({});
-  const isZoomed = useRef<boolean>(false);
-  const mousePosition = useRef<[number, number]>();
+  const classes = [css.base];
 
-  const [ hasData, normalizedData ] = useMemo(() => {
-    if (!data || data.length < 2) return [ false, undefined ];
+  const { ui } = useUI();
+  const { options: syncOptions, syncService } = useChartSync();
 
-    // Is the chart aligned (eg. linear) or faceted (eg. scatter plot)?
-    if (options?.mode === 2) {
-      return [ true, data as AlignedData ];
-    } else {
-      // Figure out the lowest sized series data.
-      const chartData = data as AlignedData;
-      const minDataLength = chartData.reduce((acc: number, series: UPlotData[]) => {
-        return Math.min(acc, series.length);
-      }, Number.MAX_SAFE_INTEGER);
+  // line charts have their zoom state handled by `SyncProvider`, scatter charts do not.
+  const chartType: ChartType = options?.mode === 2 ? 'Scatter' : 'Line';
 
-      // Making sure the X series and all the other series data are the same length;
-      const trimmedData = chartData.map(series => series.slice(0, minDataLength));
+  const hasData = data && data.length > 1 && (chartType === 'Scatter' || data?.[0]?.length);
 
-      // Checking to make sure the X series has some data.
-      const hasXValues = trimmedData?.[0]?.length !== 0;
+  if (ui.darkLight === DarkLight.Dark) classes.push(css.dark);
 
-      return [ hasXValues, trimmedData as unknown as AlignedData ];
-    }
-  }, [ data, options?.mode ]);
-
-  /*
-   * Chart mount and dismount.
-   */
   useEffect(() => {
-    if (!chartDivRef.current || !hasData || !options) return;
+    if (data !== undefined && chartType === 'Line')
+      syncService.updateDataBounds(data as AlignedData);
+  }, [syncService, chartType, data]);
 
-    const optionsExtended = uPlot.assign(
+  const extendedOptions = useMemo(() => {
+    const extended: Partial<uPlot.Options> = uPlot.assign(
       {
-        cursor: {
-          bind: {
-            dblclick: (_uPlot: uPlot, _target: EventTarget, handler: (e: Event) => void) => {
-              return (e: Event) => {
-                isZoomed.current = false;
-                handler(e);
-              };
-            },
-            mousedown: (_uPlot: uPlot, _target: EventTarget, handler: (e: Event) => void) => {
-              return (e: MouseEvent) => {
-                mousePosition.current = [ e.clientX, e.clientY ];
-                handler(e);
-              };
-            },
-            mouseup: (_uPlot: uPlot, _target: EventTarget, handler: (e: Event) => void) => {
-              return (e: MouseEvent) => {
-                if (!mousePosition.current) {
-                  handler(e);
-                  return;
-                }
-                if (distance(
-                  e.clientX,
-                  e.clientY,
-                  mousePosition.current[0],
-                  mousePosition.current[1],
-                ) > 5) {
-                  isZoomed.current = true;
-                }
-                mousePosition.current = undefined;
-                handler(e);
-              };
-            },
-          },
-          drag: { dist: 5, uni: 10, x: true, y: true },
-        },
-        hooks: {
-          ready: [ (chart: uPlot) => {
-            chartRef.current = chart;
-          } ],
-          setScale: [ (uPlot: uPlot, scaleKey: string) => {
-            const currentMax = uPlot.posToVal(scaleKey === 'x' ? uPlot.bbox.width : 0, scaleKey);
-            const currentMin = uPlot.posToVal(scaleKey === 'x' ? 0 : uPlot.bbox.height, scaleKey);
-            let max = scalesZoomData.current[scaleKey]?.max;
-            let min = scalesZoomData.current[scaleKey]?.min;
-
-            if (max == null || currentMax > max) max = currentMax;
-            if (min == null || currentMin < min) min = currentMin;
-
-            scalesZoomData.current[scaleKey] = { isZoomed: isZoomed.current, max, min };
-
-            /*
-             * Save the scale info if zoomed in and clear it otherwise.
-             * This info will be used to restore the zoom when remounting
-             * the chart, which can be caused by new series data, chart option
-             * changes, etc.
-             */
-            if (!scalesRef.current) scalesRef.current = {};
-            if (isZoomed.current) {
-              scalesRef.current[scaleKey] = uPlot.scales[scaleKey];
-            } else {
-              delete scalesRef.current[scaleKey];
-            }
-            if (Object.keys(scalesRef.current).length === 0) scalesRef.current = undefined;
-          } ],
-        },
-        scales: scalesRef.current,
-        width: chartDivRef.current.offsetWidth,
+        width: chartDivRef.current?.offsetWidth,
       },
-      options,
-    ) as uPlot.Options;
+      chartType === 'Line' ? syncOptions : {},
+      options ?? {},
+    );
 
-    const plotChart = new uPlot(optionsExtended, normalizedData, chartDivRef.current);
+    if (chartType === 'Line') {
+      const activeBounds = syncService.activeBounds.get();
+      if (activeBounds) {
+        const { min, max } = activeBounds;
+        const xScale = extended.scales?.x;
+        if (xScale) {
+          xScale.max = max;
+          xScale.min = min;
+        }
+      }
+    }
 
+    // Override chart support colors to match theme.
+    if (ui.theme && extended.axes) {
+      const borderColor = ui.theme.surfaceBorderWeak;
+      const labelColor = ui.theme.surfaceOn;
+      extended.axes = extended.axes.map((axis) => {
+        return {
+          ...axis,
+          border: { stroke: borderColor },
+          grid: { ...axis.grid, stroke: borderColor },
+          stroke: labelColor,
+          ticks: { ...axis.ticks, stroke: borderColor },
+        };
+      });
+    }
+
+    return extended as uPlot.Options;
+  }, [options, ui.theme, chartType, syncOptions, syncService]);
+
+  const previousOptions = usePrevious(extendedOptions, undefined);
+
+  useEffect(() => {
     return () => {
-      plotChart.destroy();
+      chartRef?.current?.destroy();
       chartRef.current = undefined;
     };
-  }, [ chartDivRef, hasData, normalizedData, options ]);
+  }, []);
 
-  /*
-   * Chart data when data changes.
-   */
   useEffect(() => {
-    if (!chartRef.current || !normalizedData) return;
-    chartRef.current.setData(normalizedData, isZoomed.current);
-  }, [ normalizedData ]);
+    if (!chartDivRef.current) return;
+    if (!hasData) {
+      chartRef.current?.destroy();
+      chartRef.current = undefined;
+      return;
+    }
+    if (!chartRef.current || shouldRecreate(previousOptions, extendedOptions)) {
+      chartRef.current?.destroy();
+      chartRef.current = undefined;
+      try {
+        if (chartType === 'Scatter' || extendedOptions.series.length === data?.length) {
+          chartRef.current = new uPlot(extendedOptions, data as AlignedData, chartDivRef.current);
+        }
+      } catch (e) {
+        chartRef.current?.destroy();
+        chartRef.current = undefined;
+        handleError(e, {
+          level: ErrorLevel.Error,
+          publicMessage: 'Unable to Load data for chart',
+          publicSubject: 'Bad Data',
+          silent: false,
+          type: ErrorType.Ui,
+        });
+      }
+    } else {
+      try {
+        chartRef.current?.setData(data as AlignedData, chartType === 'Scatter');
+      } catch (e) {
+        chartRef.current?.destroy();
+        chartRef.current = undefined;
+        handleError(e, {
+          level: ErrorLevel.Error,
+          publicMessage: 'Unable to Load data for chart',
+          publicSubject: 'Bad Data',
+          silent: false,
+          type: ErrorType.Ui,
+        });
+      }
+    }
+  }, [data, hasData, extendedOptions, previousOptions, chartType]);
 
-  /*
-   * When a focus index is provided, highlight applicable series.
-   */
   useEffect(() => {
-    if (!chartRef.current) return;
-    const hasFocus = focusIndex !== undefined;
-    chartRef.current.setSeries(hasFocus ? focusIndex as number + 1 : null, { focus: hasFocus });
-  }, [ focusIndex ]);
+    extendedOptions.series.forEach((ser, i) => {
+      const chartSer = chartRef.current?.series?.[i];
+      if (chartSer && chartSer.show !== ser?.show)
+        chartRef.current?.setSeries(i, { show: ser.show }, false);
+    });
+  }, [extendedOptions.series]);
 
   /*
    * Resize the chart when resize events happen.
@@ -169,10 +212,12 @@ const UPlotChart: React.FC<Props> = ({ data, focusIndex, options, style }: Props
   const resize = useResize(chartDivRef);
   useEffect(() => {
     if (!chartRef.current) return;
-    const [ width, height ] = [ resize.width, options?.height || chartRef.current.height ];
+    const [width, height] = [resize.width, options?.height || chartRef.current.height];
     if (chartRef.current.width === width && chartRef.current.height === height) return;
     chartRef.current.setSize({ height, width });
-  }, [ options?.height, resize ]);
+    const container = chartDivRef.current;
+    if (container && height) setDivHeight(height);
+  }, [options?.height, resize]);
 
   /*
    * Resync the chart when scroll events happen to correct the cursor position upon
@@ -198,16 +243,62 @@ const UPlotChart: React.FC<Props> = ({ data, focusIndex, options, style }: Props
   }, []);
 
   return (
-    <div ref={chartDivRef} style={style}>
-      {!hasData && (
-        <Message
-          style={{ height: options?.height ?? 'auto' }}
-          title="No data to plot."
-          type={MessageType.Empty}
-        />
+    <div className={classes.join(' ')} ref={chartDivRef} style={{ ...style, height: divHeight }}>
+      {allowDownload && <DownloadButton containerRef={chartDivRef} experimentId={experimentId} />}
+      {!hasData && !isLoading && (
+        <div className={css.chartEmpty}>
+          <span>No data to plot.</span>
+        </div>
       )}
+      {isLoading && <Spinner spinning tip="Loading chart data..." />}
     </div>
   );
 };
 
 export default UPlotChart;
+
+const DownloadButton = ({
+  containerRef,
+  experimentId,
+}: {
+  containerRef: RefObject<HTMLDivElement>;
+  experimentId?: number;
+}) => {
+  const downloadUrl = useRef<string>();
+  const downloadNode = useRef<HTMLAnchorElement>(null);
+  const fileName = useMemo(
+    () => (experimentId ? `chart-trial-${experimentId}.png` : 'chart.png'),
+    [experimentId],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current);
+    };
+  }, []);
+
+  const handleDownloadClick = useCallback(() => {
+    if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current);
+    const canvas = containerRef.current?.querySelector('canvas');
+    const url = canvas?.toDataURL('image/png');
+    if (url && downloadNode.current) {
+      downloadNode.current.href = url;
+      downloadNode.current.click();
+    }
+    downloadUrl.current = url;
+  }, [containerRef]);
+
+  return (
+    <Tooltip className={css.download} title="Download Chart">
+      <DownloadOutlined onClick={handleDownloadClick} />
+      {/* this is an invisible button to programatically download the image file */}
+      <a
+        aria-disabled
+        className={css.invisibleLink}
+        download={fileName}
+        href={downloadUrl.current}
+        ref={downloadNode}
+      />
+    </Tooltip>
+  );
+};

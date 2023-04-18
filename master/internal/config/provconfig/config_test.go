@@ -10,6 +10,7 @@ import (
 	"google.golang.org/api/compute/v1"
 	"gotest.tools/assert"
 
+	"github.com/determined-ai/determined/master/pkg/aproto"
 	"github.com/determined-ai/determined/master/pkg/check"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/master/version"
@@ -20,7 +21,7 @@ func TestProvisionerConfigMissingFields(t *testing.T) {
 	err := json.Unmarshal([]byte(`{}`), &config)
 	assert.NilError(t, err)
 	err = check.Validate(&config)
-	assert.ErrorContains(t, err, "must configure aws or gcp cluster")
+	assert.ErrorContains(t, err, "must configure aws or gcp or hpc cluster")
 	expected := Config{
 		MaxIdleAgentPeriod:     model.Duration(20 * time.Minute),
 		MaxAgentStartingPeriod: model.Duration(20 * time.Minute),
@@ -28,7 +29,9 @@ func TestProvisionerConfigMissingFields(t *testing.T) {
 		AgentDockerRuntime:     "runc",
 		AgentDockerNetwork:     "default",
 		AgentDockerImage:       fmt.Sprintf("determinedai/determined-agent:%s", version.Version),
-		AgentFluentImage:       "fluent/fluent-bit:1.6",
+		AgentFluentImage:       aproto.FluentImage,
+		AgentReconnectAttempts: aproto.AgentReconnectAttempts,
+		AgentReconnectBackoff:  aproto.AgentReconnectBackoffValue,
 	}
 	assert.DeepEqual(t, config, expected)
 }
@@ -66,6 +69,8 @@ func TestUnmarshalProvisionerConfigMasterURL(t *testing.T) {
 		MaxIdleAgentPeriod:     model.Duration(30 * time.Second),
 		MaxAgentStartingPeriod: model.Duration(30 * time.Second),
 		MaxInstances:           5,
+		AgentReconnectAttempts: aproto.AgentReconnectAttempts,
+		AgentReconnectBackoff:  aproto.AgentReconnectBackoffValue,
 	}
 	assert.DeepEqual(t, config, unmarshaled)
 }
@@ -111,12 +116,14 @@ func TestUnmarshalProvisionerConfigWithAWS(t *testing.T) {
 		MasterURL:              "http://test.master:8080",
 		AWS:                    &awsConfig,
 		AgentDockerImage:       "test_image",
-		AgentFluentImage:       "fluent/fluent-bit:1.6",
+		AgentFluentImage:       aproto.FluentImage,
 		AgentDockerRuntime:     "runc",
 		AgentDockerNetwork:     "default",
 		MaxIdleAgentPeriod:     model.Duration(30 * time.Second),
 		MaxAgentStartingPeriod: model.Duration(30 * time.Second),
 		MaxInstances:           5,
+		AgentReconnectAttempts: aproto.AgentReconnectAttempts,
+		AgentReconnectBackoff:  aproto.AgentReconnectBackoffValue,
 	}
 	assert.DeepEqual(t, config, unmarshaled)
 }
@@ -145,12 +152,14 @@ func TestUnmarshalProvisionerConfigWithGCP(t *testing.T) {
 		MasterURL:              "http://test.master:8080",
 		GCP:                    &expected,
 		AgentDockerImage:       "test_image",
-		AgentFluentImage:       "fluent/fluent-bit:1.6",
+		AgentFluentImage:       aproto.FluentImage,
 		AgentDockerRuntime:     "runc",
 		AgentDockerNetwork:     "default",
 		MaxIdleAgentPeriod:     model.Duration(20 * time.Minute),
 		MaxAgentStartingPeriod: model.Duration(20 * time.Minute),
 		MaxInstances:           5,
+		AgentReconnectAttempts: aproto.AgentReconnectAttempts,
+		AgentReconnectBackoff:  aproto.AgentReconnectBackoffValue,
 	}
 	assert.DeepEqual(t, config, unmarshaled)
 }
@@ -205,12 +214,31 @@ boot_disk_source_image: test-source_image3
 		MasterURL:              "http://test.master:8080",
 		GCP:                    &expectedGCP,
 		AgentDockerImage:       "test_image",
-		AgentFluentImage:       "fluent/fluent-bit:1.6",
+		AgentFluentImage:       aproto.FluentImage,
 		AgentDockerRuntime:     "runc",
 		AgentDockerNetwork:     "default",
 		MaxIdleAgentPeriod:     model.Duration(20 * time.Minute),
 		MaxAgentStartingPeriod: model.Duration(20 * time.Minute),
 		MaxInstances:           5,
+		AgentReconnectAttempts: aproto.AgentReconnectAttempts,
+		AgentReconnectBackoff:  aproto.AgentReconnectBackoffValue,
 	}
 	assert.DeepEqual(t, expected, unmarshaled)
+}
+
+func TestUnmarshalProvisionerConfigWithHpc(t *testing.T) {
+	configRaw := `
+master_url: http://test.master
+agent_docker_image: test_image
+
+type: hpc
+partition: tesla_queue
+`
+	unmarshaled := Config{}
+	err := yaml.Unmarshal([]byte(configRaw), &unmarshaled, yaml.DisallowUnknownFields)
+	assert.NilError(t, err)
+	err = check.Validate(&unmarshaled)
+	assert.NilError(t, err)
+
+	assert.Equal(t, unmarshaled.HPC.Partition, "tesla_queue")
 }

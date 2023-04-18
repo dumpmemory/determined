@@ -1,6 +1,8 @@
 import collections
+import contextlib
 import datetime
 import enum
+import errno
 import inspect
 import json
 import logging
@@ -11,15 +13,51 @@ import pathlib
 import random
 import re
 import shutil
+import signal
 import socket
+import stat
+import subprocess
 import time
 import uuid
-import warnings
-from typing import Any, Callable, Dict, List, Optional, Set, SupportsFloat, Tuple, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    SupportsFloat,
+    Tuple,
+    Union,
+    cast,
+)
 
 import determined as det
 from determined import constants
 from determined.common import check, util
+
+
+def rmtree_nfs_safe(
+    path: Union[str, os.PathLike],
+    ignore_errors: bool = False,
+    onerror: Optional[Callable[[Any, Any, Any], Any]] = None,
+) -> None:
+    """
+    Reported shutil.rmtree() fails sometimes under NFS, and apparently the right solution is to
+    just retry a few times.
+    """
+    max_tries = 5
+    for tries in range(1, max_tries + 1):
+        try:
+            return shutil.rmtree(path, ignore_errors=ignore_errors, onerror=onerror)
+        except OSError as e:
+            if e.errno != errno.ENOTEMPTY or tries == max_tries:
+                raise
+            # This should not be possible, since rmtree empties directories before rmdir'ing them.
+            logging.debug(f"rmtree() failed ({e}), is this NFS?  Retrying (tries={tries})...")
+            # All 5 tries should take on the order of half a second.
+            time.sleep(2 ** tries / 100)
 
 
 @util.preserve_random_state
@@ -39,7 +77,7 @@ def download_gcs_blob_with_backoff(blob: Any, n_retries: int = 32, max_backoff: 
 
 
 def is_overridden(full_method: Any, parent_class: Any) -> bool:
-    """Check if a function is overriden over the given parent class.
+    """Check if a function is overridden over the given parent class.
 
     Note that full_method should always be the name of a method, but users may override
     that name with a variable anyway. In that case we treat full_method as not overridden.
@@ -122,9 +160,9 @@ def make_metrics(num_inputs: Optional[int], batch_metrics: List[Dict[str, Any]])
     for name, values in metric_dict.items():
         m = None  # type: Optional[float]
         try:
-            values = np.array(values)
-            filtered_values = values[values != None]  # noqa: E711
-            m = np.mean(filtered_values)
+            np_values = np.array(values)
+            filtered_values = np_values[np_values != None]  # noqa: E711
+            m = np.mean(filtered_values).item()
         except (TypeError, ValueError):
             # If we get here, values are non-scalars, which cannot be averaged.
             # We keep the key so consumers can see all the metric names but
@@ -161,7 +199,7 @@ def json_encode(obj: Any, indent: Optional[str] = None, sort_keys: bool = False)
             if math.isnan(obj):
                 return "NaN"
             if math.isinf(obj):
-                return "Infinity" if obj > 0 else "-Infinity"
+                return "Infinity" if float(obj) > 0.0 else "-Infinity"
             return float(obj)
         if isinstance(obj, bytes):
             # Assume bytes are utf8 (json can't encode arbitrary binary data).
@@ -196,7 +234,7 @@ def write_user_code(path: pathlib.Path, on_cluster: bool) -> None:
     # in the checkpoint directory. This happens for EstimatorTrial because we overwrite the
     # estimator model directory with the checkpoint folder at the start of training.
     if code_path.exists():
-        shutil.rmtree(str(code_path))
+        rmtree_nfs_safe(str(code_path))
 
     # Most models can only be restored from a checkpoint if the original code is present. However,
     # since it is rather common that users mount large, non-model files into their working directory
@@ -226,20 +264,6 @@ def filter_duplicates(
     return duplicates
 
 
-T = TypeVar("T", bound=Callable[..., Any])
-
-
-def deprecated(msg: str) -> Callable[[T], T]:
-    def make_wrapper(fn: T) -> T:
-        def wrapper(*arg: List, **kwarg: Dict) -> Any:
-            warnings.warn(msg, FutureWarning)
-            return fn(*arg, **kwarg)
-
-        return cast(T, wrapper)
-
-    return make_wrapper
-
-
 def humanize_float(n: float) -> float:
     """
     Take a float and convert it to a more human-friendly float.
@@ -267,6 +291,7 @@ def calculate_batch_sizes(
     slots_per_trial: int,
     trialname: str,
 ) -> Tuple[int, int]:
+    slots_per_trial = max(slots_per_trial, 1)
     if "global_batch_size" not in hparams:
         raise det.errors.InvalidExperimentException(
             "Please specify an integer `global_batch_size` hyperparameter in your experiment "
@@ -340,3 +365,78 @@ def match_legacy_trial_class(arg: str) -> bool:
 
 def legacy_trial_entrypoint_to_script(trial_entrypoint: str) -> List[str]:
     return ["python3", "-m", "determined.exec.harness", trial_entrypoint]
+
+
+def force_create_symlink(src: str, dst: str) -> None:
+    os.makedirs(src, exist_ok=True)
+    try:
+        os.symlink(src, dst, target_is_directory=True)
+    except FileExistsError:
+        try:
+            if os.path.islink(dst) or os.path.isfile(dst):
+                os.unlink(dst)
+            else:
+                rmtree_nfs_safe(dst)
+
+            try:
+                os.symlink(src, dst, target_is_directory=True)
+                # be nice, make the newly created link world-writable
+                file_mode = os.stat(dst).st_mode
+                os.chmod(dst, file_mode | stat.S_IWOTH)
+            except FileExistsError:
+                # in case of a race between two workers
+                pass
+
+        except PermissionError as err:
+            logging.warning(f"{err} trying to remove {dst}")
+
+
+@contextlib.contextmanager
+def forward_signals(p: subprocess.Popen, *signums: signal.Signals) -> Iterator[None]:
+    """Forward a list of signals to a subprocess, restoring the original handlers afterwards."""
+    if not signums:
+        # Pick a useful default for wrapper processes.
+        names = ["SIGINT", "SIGTERM", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH", "SIGBREAK"]
+        signums = tuple(getattr(signal, name) for name in names if hasattr(signal, name))
+
+    def signal_passthru(signum: Any, frame: Any) -> None:
+        p.send_signal(signum)
+
+    old_handlers = [None for n in signums]  # type: List[Any]
+    try:
+        # Install passthru handlers.
+        for i, n in enumerate(signums):
+            old_handlers[i] = signal.signal(n, signal_passthru)
+        yield
+    finally:
+        # restore original handlers
+        for n, old in zip(signums, old_handlers):
+            if old is None:
+                continue
+            signal.signal(n, old)
+
+
+def is_numerical_scalar(n: Any) -> bool:
+    """
+    Check if the argument is a numerical scalar that is writeable to TensorBoard.
+
+    There are two cases of numpy "scalars". The first is a true numpy scalar,
+    and the second is an array scalar that has 0 dimensions. Both of these
+    cases are mathematically scalars but represented differently in numpy for
+    historical reasons [1]. [2] is another useful reference.
+
+    [1] https://docs.scipy.org/doc/numpy/user/basics.types.html#array-scalars
+    [2] https://docs.scipy.org/doc/numpy/reference/arrays.scalars.html
+    """
+    import numpy as np
+
+    if isinstance(n, (int, float)):
+        return True
+
+    if isinstance(n, np.number):
+        return True
+
+    if isinstance(n, np.ndarray) and n.ndim == 0 and np.issubdtype(n.dtype, np.number):
+        return True
+
+    return False

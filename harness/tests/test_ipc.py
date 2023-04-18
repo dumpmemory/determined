@@ -10,7 +10,7 @@ from typing import Any, List, Optional, cast
 import pytest
 
 import determined as det
-from determined import _core, ipc
+from determined import core, ipc
 from tests import parallel
 
 
@@ -88,7 +88,7 @@ class BroadcastClientSubproc(Subproc):
     def main(self) -> None:
         with ipc.ZMQBroadcastClient(self._pub_url, self._pull_url) as broadcast_client:
             # Start the server-client communication test.
-            broadcast_client.send(ipc.ConnectedMessage(process_id=0))
+            broadcast_client.safe_start()
             for exp in self._exp_msgs:
                 msg = broadcast_client.recv()
                 assert msg == exp
@@ -107,39 +107,12 @@ def test_broadcast_server_client() -> None:
         with SubprocGroup(
             BroadcastClientSubproc(i, num_subprocs, pub_url, pull_url, msgs)
             for i in range(num_subprocs)
-        ) as subprocs:
-
-            def health_check() -> None:
-                assert all(subproc.is_alive() for subproc in subprocs)
-                for subproc in subprocs:
-                    assert subproc.is_alive()
-
-            gathered, _ = broadcast_server.gather_with_polling(health_check)
-            assert all(isinstance(g, ipc.ConnectedMessage) for g in gathered)
-
+        ):
+            broadcast_server.safe_start()
             for msg in msgs:
                 broadcast_server.broadcast(msg)
-                gathered, _ = broadcast_server.gather_with_polling(health_check)
+                gathered = broadcast_server.gather()
                 assert all(g == 2 * msg for g in gathered)
-
-
-def test_zmq_server_client() -> None:
-    server = ipc.ZMQServer(num_connections=1, ports=None, port_range=(1000, 65535))
-    assert len(server.get_ports()) == 1
-    port = server.get_ports()[0]
-    assert 1000 <= port <= 65535
-
-    client = ipc.ZMQClient(ip_address="localhost", port=port)
-
-    client_object = {"DeterminedAI": "Great", "det": "Fantastic", 12345: -100}
-    client.send(client_object)
-    server_object = server.receive_blocking(send_rank=0)
-    assert server_object == client_object
-
-    server_object["DeterminedAI"] = "VeryGreat"
-    server.send(server_object)
-    client_object = client.receive()
-    assert server_object == client_object
 
 
 @pytest.mark.parametrize("cross_size", [1, 4])
@@ -148,11 +121,21 @@ def test_zmq_server_client() -> None:
 def test_distributed_context(cross_size: int, local_size: int, force_tcp: bool) -> None:
     size = cross_size * local_size
 
+    # Make sure `make test` doesn't hang on macbook's default values.  Avoid skipping on linux
+    # because it's not a common default, and to avoid false positives in CI.
+    if sys.platform == "darwin" and size == 16:
+        import resource
+
+        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 1024:
+            pytest.skip(
+                "increase the open fd limit with `ulimit -n 1024` or greater to run this test"
+            )
+
     with parallel.Execution(size, local_size=local_size, make_distributed_context=False) as pex:
 
         @pex.run
-        def contexts() -> _core.DistributedContext:
-            return _core.DistributedContext(
+        def contexts() -> core.DistributedContext:
+            return core.DistributedContext(
                 rank=pex.rank,
                 size=pex.size,
                 local_rank=pex.local_rank,

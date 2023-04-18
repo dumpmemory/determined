@@ -1,22 +1,19 @@
-import { Tooltip } from 'antd';
-import React, { PropsWithChildren } from 'react';
+import React from 'react';
+
+import Tooltip from 'components/kit/Tooltip';
 
 import Badge, { BadgeProps } from './Badge';
 import css from './BadgeTag.module.scss';
 
-interface Props extends BadgeProps {
+export interface Props extends BadgeProps {
+  children?: React.ReactNode;
   label?: React.ReactNode;
   preLabel?: React.ReactNode;
 }
 
 const TOOLTIP_DELAY = 1.0;
 
-const BadgeTag: React.FC<Props> = ({
-  children,
-  label,
-  preLabel,
-  ...props
-}: PropsWithChildren<Props>) => {
+const BadgeTag: React.FC<Props> = ({ children, label, preLabel, ...props }: Props) => {
   return (
     <span className={css.base}>
       {preLabel && (

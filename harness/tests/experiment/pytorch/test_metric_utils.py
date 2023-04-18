@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def test_process_combined_metrics_and_batches() -> None:
-    # Test empty metrics. This case can arise when custom reducers are used so it's okay for
+    # Test empty metrics. This case can arise when custom reducers are used, so it's okay for
     # evaluate_batch to return an empty dict.
     combined_metrics_and_batches = [
         ({}, 2),  # this is from a rank actually computing metrics but returning an empty dict
@@ -59,12 +59,12 @@ def test_process_combined_metrics_and_batches() -> None:
 
 
 def test_average_training_metrics() -> None:
-    combined_timeseries = {"loss1": [[1, 2], [3, 4]], "loss2": [[-1, -2], [-3, -4]]}
+    combined_timeseries: Dict[str, Any] = {"loss1": [[1, 2], [3, 4]], "loss2": [[-1, -2], [-3, -4]]}
     combined_num_batches = [2, 2]
     averaged_metrics = metric_utils._average_training_metrics(
         combined_timeseries, combined_num_batches
     )
-    expected_metrics = [
+    expected_metrics: List[Dict[str, Any]] = [
         {"loss1": 2, "loss2": -2},
         {"loss1": 3, "loss2": -3},
     ]

@@ -10,14 +10,18 @@ import (
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"github.com/uptrace/bun"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/determined-ai/determined/master/internal/db"
+	"github.com/determined-ai/determined/master/internal/grpcutil"
+	modelauth "github.com/determined-ai/determined/master/internal/model"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
 	"github.com/determined-ai/determined/proto/pkg/checkpointv1"
 	"github.com/determined-ai/determined/proto/pkg/modelv1"
+	"github.com/determined-ai/determined/proto/pkg/workspacev1"
 
 	structpb "github.com/golang/protobuf/ptypes/struct"
 )
@@ -43,7 +47,8 @@ func (a *apiServer) ModelFromIdentifier(identifier string) (*modelv1.Model, erro
 }
 
 func (a *apiServer) ModelVersionFromID(modelIdentifier string,
-	versionID int32) (*modelv1.ModelVersion, error) {
+	versionID int32,
+) (*modelv1.ModelVersion, error) {
 	mv := &modelv1.ModelVersion{}
 	parentModel, err := a.ModelFromIdentifier(modelIdentifier)
 	if err != nil {
@@ -62,16 +67,29 @@ func (a *apiServer) ModelVersionFromID(modelIdentifier string,
 }
 
 func (a *apiServer) GetModel(
-	_ context.Context, req *apiv1.GetModelRequest) (*apiv1.GetModelResponse, error) {
+	ctx context.Context, req *apiv1.GetModelRequest,
+) (*apiv1.GetModelResponse, error) {
 	m, err := a.ModelFromIdentifier(req.ModelName)
 	if err != nil {
 		return nil, err
+	}
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ok, err := modelauth.AuthZProvider.Get().CanGetModel(ctx, *curUser, m,
+		m.WorkspaceId); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errors.Errorf("current user %q doesn't have permissions to get model %q.",
+			curUser.Username, m.Name)
 	}
 	return &apiv1.GetModelResponse{Model: m}, err
 }
 
 func (a *apiServer) GetModels(
-	_ context.Context, req *apiv1.GetModelsRequest) (*apiv1.GetModelsResponse, error) {
+	ctx context.Context, req *apiv1.GetModelsRequest,
+) (*apiv1.GetModelsResponse, error) {
 	resp := &apiv1.GetModelsResponse{}
 	idFilterExpr := req.Id
 	nameFilter := "%" + req.Name + "%"
@@ -81,7 +99,7 @@ func (a *apiServer) GetModels(
 		archFilterExpr = strconv.FormatBool(req.Archived.Value)
 	}
 	userFilterExpr := strings.Join(req.Users, ",")
-	userIds := make([]string, 0)
+	userIds := make([]string, 0, len(req.UserIds))
 	for _, userID := range req.UserIds {
 		userIds = append(userIds, strconv.Itoa(int(userID)))
 	}
@@ -95,6 +113,7 @@ func (a *apiServer) GetModels(
 		apiv1.GetModelsRequest_SORT_BY_CREATION_TIME:     "creation_time",
 		apiv1.GetModelsRequest_SORT_BY_LAST_UPDATED_TIME: "last_updated_time",
 		apiv1.GetModelsRequest_SORT_BY_NUM_VERSIONS:      "num_versions",
+		apiv1.GetModelsRequest_SORT_BY_WORKSPACE:         "w.name",
 	}
 	orderByMap := map[apiv1.OrderBy]string{
 		apiv1.OrderBy_ORDER_BY_UNSPECIFIED: "ASC",
@@ -113,7 +132,46 @@ func (a *apiServer) GetModels(
 	default:
 		orderExpr = fmt.Sprintf("id %s", orderByMap[req.OrderBy])
 	}
-	err := a.m.db.QueryProtof(
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var workspaceIdsGiven []int32
+	if req.WorkspaceIds != nil {
+		// default is to use workspace ids.
+		workspaceIdsGiven = req.WorkspaceIds
+	} else if req.WorkspaceIds == nil && req.WorkspaceNames != nil {
+		// get the ids of the corresponding workspaces
+		if err := db.Bun().NewSelect().Table("workspaces").Column("id").
+			Where("name in (?)", bun.In(req.WorkspaceNames)).Distinct().
+			Scan(ctx, &workspaceIdsGiven); err != nil {
+			return nil, fmt.Errorf("getting workspace ids from names: %w", err)
+		}
+	}
+	// function below returns a list of workspaces that have permissions
+	// filtered according to user given workspaces.
+	// if global permissions and no filter list given by user then it's an empty list.
+	workspaceIdsWithPermsAndFilterList, ok, err := modelauth.AuthZProvider.Get().
+		CanGetModels(ctx, *curUser, workspaceIdsGiven)
+	if err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errors.Errorf(
+			"current user doesn't have view permissions in related workspaces.")
+	}
+	var workspaceIds []string
+	var workspaceIdsWithPermsAndFilter string
+	if workspaceIdsWithPermsAndFilterList == nil {
+		workspaceIdsWithPermsAndFilter = ""
+	} else {
+		for _, wID := range workspaceIdsWithPermsAndFilterList {
+			workspaceIds = append(workspaceIds, strconv.Itoa(int(wID)))
+		}
+		workspaceIdsWithPermsAndFilter = strings.Join(workspaceIds, ",")
+	}
+
+	err = a.m.db.QueryProtof(
 		"get_models",
 		[]interface{}{orderExpr},
 		&resp.Models,
@@ -124,6 +182,7 @@ func (a *apiServer) GetModels(
 		labelFilterExpr,
 		nameFilter,
 		descFilterExpr,
+		workspaceIdsWithPermsAndFilter,
 	)
 	if err != nil {
 		return nil, err
@@ -132,14 +191,41 @@ func (a *apiServer) GetModels(
 }
 
 func (a *apiServer) GetModelLabels(
-	_ context.Context, req *apiv1.GetModelLabelsRequest) (*apiv1.GetModelLabelsResponse, error) {
-	resp := &apiv1.GetModelLabelsResponse{}
-	err := a.m.db.QueryProto("get_model_labels", resp)
+	ctx context.Context, req *apiv1.GetModelLabelsRequest,
+) (*apiv1.GetModelLabelsResponse, error) {
+	resp := apiv1.GetModelLabelsResponse{}
+
+	modelQuery := db.Bun().NewSelect().
+		ModelTableExpr("models as m").
+		Column("m.id").
+		ColumnExpr("UNNEST(m.labels) AS label")
+
+	if req.WorkspaceId != nil && int(*req.WorkspaceId) > 0 {
+		modelQuery = modelQuery.Where("workspace_id = ?", req.WorkspaceId)
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if modelQuery, err = modelauth.AuthZProvider.Get().
+		FilterReadableModelsQuery(ctx, *curUser, modelQuery); err != nil {
+		return nil, err
+	}
 
-	return resp, errors.Wrapf(err, "error getting model labels")
+	labelQuery := db.Bun().NewSelect().
+		ModelTableExpr("(?) AS all_labels", modelQuery).
+		Column("all_labels.label").
+		GroupExpr("all_labels.label").
+		OrderExpr("COUNT(DISTINCT(all_labels.id)) DESC, all_labels.label ASC")
+
+	opQuery := db.Bun().NewSelect().
+		ModelTableExpr("(?) AS sorted_labels", labelQuery).
+		Model(&resp.Labels).
+		ColumnExpr("sorted_labels.label")
+	err = opQuery.Scan(ctx)
+
+	return &resp, errors.Wrapf(err, "error getting model labels")
 }
 
 func (a *apiServer) clearModelName(ctx context.Context, modelName string) error {
@@ -156,21 +242,12 @@ func (a *apiServer) clearModelName(ctx context.Context, modelName string) error 
 	if len(re.FindAllString(modelName, 1)) > 0 {
 		return status.Errorf(codes.InvalidArgument, "model names cannot be only numbers")
 	}
-
-	getResp := &apiv1.GetModelsResponse{}
-	err := a.m.db.QueryProtof("get_models", []interface{}{"id"},
-		&getResp.Models, 0, "", "", "", "", modelName, "")
-	if err != nil {
-		return err
-	}
-	if len(getResp.Models) > 0 {
-		return status.Errorf(codes.AlreadyExists, "avoid names equal to other models (case-insensitive)")
-	}
 	return nil
 }
 
 func (a *apiServer) PostModel(
-	ctx context.Context, req *apiv1.PostModelRequest) (*apiv1.PostModelResponse, error) {
+	ctx context.Context, req *apiv1.PostModelRequest,
+) (*apiv1.PostModelResponse, error) {
 	if err := a.clearModelName(ctx, req.Name); err != nil {
 		return nil, err
 	}
@@ -184,20 +261,44 @@ func (a *apiServer) PostModel(
 	if err != nil {
 		return nil, err
 	}
+	workspaceID := 1
+	if req.WorkspaceId != nil { // default is to use workspace ID
+		workspaceID = int(*req.WorkspaceId)
+	} else if req.WorkspaceName != nil {
+		w := workspacev1.Workspace{}
+		err := a.m.db.Query("get_workspace_from_name", &w, *req.WorkspaceName)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to get workspace %v", *req.WorkspaceName)
+		}
+		workspaceID = int(w.Id)
+	}
 
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanCreateModel(ctx, *curUser,
+		int32(workspaceID)); err != nil {
+		return nil, err
+	}
 	m := &modelv1.Model{}
 	reqLabels := strings.Join(req.Labels, ",")
 	err = a.m.db.QueryProto(
 		"insert_model", m, req.Name, req.Description, b,
-		reqLabels, req.Notes, user.User.Id,
+		reqLabels, req.Notes, user.User.Id, workspaceID,
 	)
 
+	if err != nil && strings.Contains(err.Error(), db.CodeUniqueViolation) {
+		return nil,
+			status.Errorf(codes.AlreadyExists, "avoid names equal to other models (case-insensitive)")
+	}
 	return &apiv1.PostModelResponse{Model: m},
 		errors.Wrapf(err, "error creating model %q in database", req.Name)
 }
 
 func (a *apiServer) PatchModel(
-	ctx context.Context, req *apiv1.PatchModelRequest) (*apiv1.PatchModelResponse, error) {
+	ctx context.Context, req *apiv1.PatchModelRequest,
+) (*apiv1.PatchModelResponse, error) {
 	currModel, err := a.ModelFromIdentifier(req.ModelName)
 	if err != nil {
 		return nil, err
@@ -206,6 +307,15 @@ func (a *apiServer) PatchModel(
 	if currModel.Archived {
 		return nil, errors.Errorf("model %q is archived and cannot have attributes updated.",
 			currModel.Name)
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanEditModel(ctx, *curUser, currModel,
+		currModel.WorkspaceId); err != nil {
+		return nil, err
 	}
 
 	madeChanges := false
@@ -253,19 +363,56 @@ func (a *apiServer) PatchModel(
 
 	currLabels := strings.Join(currModel.Labels, ",")
 	if req.Model.Labels != nil {
-		var reqLabelList []string
+		// avoid duplicate keys
+		reqLabelSet := make(map[string]struct{}, len(req.Model.Labels.Values))
+		reqLabelList := make([]string, len(reqLabelSet))
 		for _, el := range req.Model.Labels.Values {
-			if _, ok := el.GetKind().(*structpb.Value_StringValue); ok {
-				reqLabelList = append(reqLabelList, el.GetStringValue())
+			if _, ok := el.GetKind().(*structpb.Value_StringValue); !ok {
+				// Invalid label.
+				continue
 			}
+			label := el.GetStringValue()
+			if _, ok := reqLabelSet[label]; ok {
+				// Duplicate key.
+				continue
+			}
+			reqLabelSet[label] = struct{}{}
+			reqLabelList = append(reqLabelList, label)
 		}
 		reqLabels := strings.Join(reqLabelList, ",")
 		if currLabels != reqLabels {
 			log.Infof("model %q labels changing from %q to %q",
 				currModel.Name, currModel.Labels, reqLabels)
 			madeChanges = true
+			currLabels = reqLabels
 		}
-		currLabels = reqLabels
+	}
+
+	currWorkspaceID := currModel.WorkspaceId
+	if req.Model.WorkspaceId != nil || req.Model.WorkspaceName != nil {
+		w := workspacev1.Workspace{}
+		if req.Model.WorkspaceId != nil { // default
+			err := a.m.db.Query("get_workspace", &w, *req.Model.WorkspaceId)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to get workspace with id %v", *req.Model.WorkspaceId)
+			}
+		} else {
+			err := a.m.db.Query("get_workspace_from_name", &w, *req.Model.WorkspaceName)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to get workspace %v", *req.Model.WorkspaceName)
+			}
+		}
+
+		newWorkspaceID := w.Id
+		if currWorkspaceID != newWorkspaceID {
+			// check if user has permissions in new workspace.
+			if err := modelauth.AuthZProvider.Get().CanEditModel(ctx, *curUser, currModel,
+				newWorkspaceID); err != nil {
+				return nil, err
+			}
+			currWorkspaceID = newWorkspaceID
+			madeChanges = true
+		}
 	}
 
 	if !madeChanges {
@@ -275,16 +422,30 @@ func (a *apiServer) PatchModel(
 	finalModel := &modelv1.Model{}
 	err = a.m.db.QueryProto(
 		"update_model", finalModel, currModel.Id, currModel.Name, currModel.Description,
-		currModel.Notes, currMeta, currLabels)
+		currModel.Notes, currMeta, currLabels, currWorkspaceID)
 
+	if err != nil && strings.Contains(err.Error(), db.CodeUniqueViolation) {
+		return nil,
+			status.Errorf(codes.AlreadyExists, "avoid names equal to other models (case-insensitive)")
+	}
 	return &apiv1.PatchModelResponse{Model: finalModel},
 		errors.Wrapf(err, "error updating model %q in database", currModel.Name)
 }
 
 func (a *apiServer) ArchiveModel(
-	ctx context.Context, req *apiv1.ArchiveModelRequest) (*apiv1.ArchiveModelResponse, error) {
+	ctx context.Context, req *apiv1.ArchiveModelRequest,
+) (*apiv1.ArchiveModelResponse, error) {
 	currModel, err := a.ModelFromIdentifier(req.ModelName)
 	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanEditModel(ctx, *curUser, currModel,
+		currModel.WorkspaceId); err != nil {
 		return nil, err
 	}
 
@@ -301,9 +462,19 @@ func (a *apiServer) ArchiveModel(
 }
 
 func (a *apiServer) UnarchiveModel(
-	ctx context.Context, req *apiv1.UnarchiveModelRequest) (*apiv1.UnarchiveModelResponse, error) {
+	ctx context.Context, req *apiv1.UnarchiveModelRequest,
+) (*apiv1.UnarchiveModelResponse, error) {
 	currModel, err := a.ModelFromIdentifier(req.ModelName)
 	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanEditModel(ctx, *curUser, currModel,
+		currModel.WorkspaceId); err != nil {
 		return nil, err
 	}
 
@@ -319,9 +490,42 @@ func (a *apiServer) UnarchiveModel(
 		errors.Wrapf(err, "error unarchiving model %q", req.ModelName)
 }
 
+func (a *apiServer) MoveModel(
+	ctx context.Context, req *apiv1.MoveModelRequest,
+) (*apiv1.MoveModelResponse, error) {
+	currModel, err := a.ModelFromIdentifier(req.ModelName)
+	if err != nil {
+		return nil, err
+	}
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	err = modelauth.AuthZProvider.
+		Get().
+		CanMoveModel(ctx, *curUser, currModel, currModel.WorkspaceId, req.DestinationWorkspaceId)
+	if err != nil {
+		return nil, err
+	}
+
+	holder := &modelv1.Model{}
+	err = a.m.db.QueryProto("move_model", holder, currModel.Id, req.DestinationWorkspaceId)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error moving a model (%s)", req.ModelName)
+	}
+	if holder.Id == 0 {
+		return nil, errors.Wrapf(err, "Model (%s) does not exist or not moveable by this user",
+			req.ModelName)
+	}
+
+	return &apiv1.MoveModelResponse{}, nil
+}
+
 func (a *apiServer) DeleteModel(
 	ctx context.Context, req *apiv1.DeleteModelRequest) (*apiv1.DeleteModelResponse,
-	error) {
+	error,
+) {
 	user, err := a.CurrentUser(ctx, &apiv1.CurrentUserRequest{})
 	if err != nil {
 		return nil, err
@@ -332,12 +536,20 @@ func (a *apiServer) DeleteModel(
 		return nil, err
 	}
 
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanDeleteModel(ctx, *curUser, currModel,
+		currModel.WorkspaceId); err != nil {
+		return nil, err
+	}
 	holder := &modelv1.Model{}
 	err = a.m.db.QueryProto("delete_model", holder, currModel.Name, user.User.Id,
 		user.User.Admin)
 
 	if holder.Id == 0 {
-		return nil, errors.Wrapf(err, "model %q does not exist or not delete-able by this user",
+		return nil, errors.Wrapf(err, "model %q does not exist or not deletable by this user",
 			req.ModelName)
 	}
 
@@ -346,21 +558,50 @@ func (a *apiServer) DeleteModel(
 }
 
 func (a *apiServer) GetModelVersion(
-	ctx context.Context, req *apiv1.GetModelVersionRequest) (*apiv1.GetModelVersionResponse, error) {
-	mv, err := a.ModelVersionFromID(req.ModelName, req.ModelVersion)
+	ctx context.Context, req *apiv1.GetModelVersionRequest,
+) (*apiv1.GetModelVersionResponse, error) {
+	mv, err := a.ModelVersionFromID(req.ModelName, req.ModelVersionNum)
 	if err != nil {
 		return nil, err
 	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currModel, err := a.ModelFromIdentifier(req.ModelName)
+	if ok, err := modelauth.AuthZProvider.Get().CanGetModel(ctx, *curUser, currModel,
+		currModel.WorkspaceId); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errors.Errorf("current user %q doesn't have permissions to get model %q.",
+			curUser.Username, currModel.Name)
+	}
+
 	resp := &apiv1.GetModelVersionResponse{}
 	resp.ModelVersion = mv
 	return resp, err
 }
 
 func (a *apiServer) GetModelVersions(
-	ctx context.Context, req *apiv1.GetModelVersionsRequest) (*apiv1.GetModelVersionsResponse, error) {
+	ctx context.Context, req *apiv1.GetModelVersionsRequest,
+) (*apiv1.GetModelVersionsResponse, error) {
 	parentModel, err := a.ModelFromIdentifier(req.ModelName)
 	if err != nil {
 		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if ok, err := modelauth.AuthZProvider.Get().CanGetModel(ctx, *curUser, parentModel,
+		parentModel.WorkspaceId); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, errors.Errorf("current user %q doesn't have permissions to get model %q.",
+			curUser.Username, parentModel.Name)
 	}
 
 	resp := &apiv1.GetModelVersionsResponse{Model: parentModel}
@@ -374,10 +615,20 @@ func (a *apiServer) GetModelVersions(
 }
 
 func (a *apiServer) PostModelVersion(
-	ctx context.Context, req *apiv1.PostModelVersionRequest) (*apiv1.PostModelVersionResponse, error) {
+	ctx context.Context, req *apiv1.PostModelVersionRequest,
+) (*apiv1.PostModelVersionResponse, error) {
 	// make sure that the model exists before adding a version
 	modelResp, err := a.ModelFromIdentifier(req.ModelName)
 	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanEditModel(ctx, *curUser, modelResp,
+		modelResp.WorkspaceId); err != nil {
 		return nil, err
 	}
 
@@ -438,32 +689,47 @@ func (a *apiServer) PostModelVersion(
 
 func (a *apiServer) PatchModelVersion(
 	ctx context.Context, req *apiv1.PatchModelVersionRequest) (*apiv1.PatchModelVersionResponse,
-	error) {
-	currModelVersion, err := a.ModelVersionFromID(req.ModelName, req.ModelVersionId)
+	error,
+) {
+	currModelVersion, err := a.ModelVersionFromID(req.ModelName, req.ModelVersionNum)
 	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currModel, err := a.ModelFromIdentifier(req.ModelName)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanEditModel(ctx, *curUser, currModel,
+		currModel.WorkspaceId); err != nil {
 		return nil, err
 	}
 
 	parentModel := currModelVersion.Model
 	madeChanges := false
+	modelVersionName := fmt.Sprintf("%v:%v", req.ModelName, req.ModelVersionNum)
 
 	if req.ModelVersion.Name != nil && req.ModelVersion.Name.Value != currModelVersion.Name {
 		log.Infof("model version (%v) name changing from %q to %q",
-			req.ModelVersionId, currModelVersion.Name, req.ModelVersion.Name.Value)
+			modelVersionName, currModelVersion.Name, req.ModelVersion.Name.Value)
 		madeChanges = true
 		currModelVersion.Name = req.ModelVersion.Name.Value
 	}
 
 	if req.ModelVersion.Comment != nil && req.ModelVersion.Comment.Value != currModelVersion.Comment {
 		log.Infof("model version (%v) comment changing from %q to %q",
-			req.ModelVersionId, currModelVersion.Comment, req.ModelVersion.Comment.Value)
+			modelVersionName, currModelVersion.Comment, req.ModelVersion.Comment.Value)
 		madeChanges = true
 		currModelVersion.Comment = req.ModelVersion.Comment.Value
 	}
 
 	if req.ModelVersion.Notes != nil && req.ModelVersion.Notes.Value != currModelVersion.Notes {
 		log.Infof("model version (%v) notes changing from %q to %q",
-			req.ModelVersionId, currModelVersion.Notes, req.ModelVersion.Notes.Value)
+			modelVersionName, currModelVersion.Notes, req.ModelVersion.Notes.Value)
 		madeChanges = true
 		currModelVersion.Notes = req.ModelVersion.Notes.Value
 	}
@@ -480,7 +746,7 @@ func (a *apiServer) PatchModelVersion(
 
 		if !bytes.Equal(currMeta, newMeta) {
 			log.Infof("model version (%v) metadata changing from %q to %q",
-				req.ModelVersionId, currMeta, newMeta)
+				modelVersionName, currMeta, newMeta)
 			madeChanges = true
 			currMeta = newMeta
 		}
@@ -488,16 +754,23 @@ func (a *apiServer) PatchModelVersion(
 
 	currLabels := strings.Join(currModelVersion.Labels, ",")
 	if req.ModelVersion.Labels != nil {
-		var reqLabelList []string
+		// avoid duplicate keys
+		reqLabelSet := make(map[string]struct{}, len(req.ModelVersion.Labels.Values))
 		for _, el := range req.ModelVersion.Labels.Values {
 			if _, ok := el.GetKind().(*structpb.Value_StringValue); ok {
-				reqLabelList = append(reqLabelList, el.GetStringValue())
+				reqLabelSet[el.GetStringValue()] = struct{}{}
 			}
+		}
+		reqLabelList := make([]string, len(reqLabelSet))
+		i := 0
+		for key := range reqLabelSet {
+			reqLabelList[i] = key
+			i++
 		}
 		reqLabels := strings.Join(reqLabelList, ",")
 		if currLabels != reqLabels {
 			log.Infof("model version (%v) labels changing from %q to %q",
-				req.ModelVersionId, currModelVersion.Labels, reqLabels)
+				modelVersionName, currModelVersion.Labels, reqLabels)
 			madeChanges = true
 		}
 		currLabels = reqLabels
@@ -508,31 +781,51 @@ func (a *apiServer) PatchModelVersion(
 	}
 
 	finalModelVersion := &modelv1.ModelVersion{}
-	err = a.m.db.QueryProto("update_model_version", finalModelVersion, req.ModelVersionId,
+	err = a.m.db.QueryProto("update_model_version", finalModelVersion, currModelVersion.Id,
 		parentModel.Id, currModelVersion.Name, currModelVersion.Comment, currModelVersion.Notes,
 		currMeta, currLabels)
 
 	return &apiv1.PatchModelVersionResponse{ModelVersion: finalModelVersion},
-		errors.Wrapf(err, "error updating model version %v in database", req.ModelVersionId)
+		errors.Wrapf(err, "error updating model version (%v) in database", modelVersionName)
 }
 
 func (a *apiServer) DeleteModelVersion(
 	ctx context.Context, req *apiv1.DeleteModelVersionRequest) (*apiv1.DeleteModelVersionResponse,
-	error) {
+	error,
+) {
 	user, err := a.CurrentUser(ctx, &apiv1.CurrentUserRequest{})
 	if err != nil {
 		return nil, err
 	}
 
+	modelVersion, err := a.ModelVersionFromID(req.ModelName, req.ModelVersionNum)
+	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currModel, err := a.ModelFromIdentifier(req.ModelName)
+	if err != nil {
+		return nil, err
+	}
+	if err := modelauth.AuthZProvider.Get().CanDeleteModel(ctx, *curUser, currModel,
+		currModel.WorkspaceId); err != nil {
+		return nil, err
+	}
+
 	holder := &modelv1.ModelVersion{}
-	err = a.m.db.QueryProto("delete_model_version", holder, req.ModelVersionId,
+	err = a.m.db.QueryProto("delete_model_version", holder, modelVersion.Id,
 		user.User.Id, user.User.Admin)
 
+	modelVersionName := fmt.Sprintf("%v:%v", req.ModelName, req.ModelVersionNum)
 	if holder.Id == 0 {
-		return nil, errors.Wrapf(err, "model version %v does not exist or not delete-able by this user",
-			req.ModelVersionId)
+		return nil, errors.Wrapf(err, "model version %v does not exist or not deletable by this user",
+			modelVersionName)
 	}
 
 	return &apiv1.DeleteModelVersionResponse{},
-		errors.Wrapf(err, "error deleting model version %v", req.ModelVersionId)
+		errors.Wrapf(err, "error deleting model version %v", modelVersionName)
 }

@@ -3,9 +3,11 @@ class defaults:
     AUX_AGENT_INSTANCE_TYPE = "n1-standard-4"
     COMPUTE_AGENT_INSTANCE_TYPE = "n1-standard-32"
     DB_PASSWORD = "postgres"
-    ENVIRONMENT_IMAGE = "det-environments-ed66d8a"
-    GPU_NUM = 8
-    GPU_TYPE = "nvidia-tesla-k80"
+    BOOT_DISK_SIZE = 200
+    BOOT_DISK_TYPE = "pd-standard"
+    ENVIRONMENT_IMAGE = "det-environments-9b5db1b"
+    GPU_NUM = 4
+    GPU_TYPE = "nvidia-tesla-t4"
     MASTER_INSTANCE_TYPE = "n1-standard-2"
     MAX_AUX_CONTAINERS_PER_AGENT = 100
     MAX_IDLE_AGENT_PERIOD = "10m"
@@ -13,7 +15,6 @@ class defaults:
     OPERATION_TIMEOUT_PERIOD = "5m"
     MIN_DYNAMIC_AGENTS = 0
     MAX_DYNAMIC_AGENTS = 5
-    STATIC_AGENTS = 0
     MIN_CPU_PLATFORM_MASTER = "Intel Skylake"
     MIN_CPU_PLATFORM_AGENT = "Intel Broadwell"
     NETWORK = "det-default"

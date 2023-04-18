@@ -113,3 +113,41 @@ func TestOverrideMasterConfigRegistryAuth(t *testing.T) {
 
 	assert.DeepEqual(t, actual, expected)
 }
+
+func TestOverrideMasterEnvironmentVariables(t *testing.T) {
+	masterDefault := &TaskContainerDefaultsConfig{
+		EnvironmentVariables: &RuntimeItems{
+			CPU: []string{"a=from_master", "b=from_master"},
+		},
+	}
+	actual := DefaultEnvConfig(masterDefault)
+	assert.NilError(t, json.Unmarshal([]byte(`{
+    "environment_variables": ["a=from_exp", "c=from_master"]
+}`), &actual))
+	assert.DeepEqual(t, actual.EnvironmentVariables.CPU, []string{
+		"a=from_master", "b=from_master",
+		"a=from_exp", "c=from_master", // Exp config overwriters master config by being later.
+	})
+}
+
+func TestDeviceConfig(t *testing.T) {
+	// Devices can be strings or maps, and merging device lists is additive.
+	var actual DevicesConfig
+
+	assert.NilError(t, json.Unmarshal([]byte(`[
+    {"host_path": "/not_asdf", "container_path": "/asdf"},
+    {"host_path": "/zxcv", "container_path": "/zxcv"}
+]`), &actual))
+
+	assert.NilError(t, json.Unmarshal([]byte(`[
+    {"host_path": "/asdf", "container_path": "/asdf"},
+    "/qwer:/qwer"
+]`), &actual))
+
+	var expected DevicesConfig
+	expected = append(expected, DeviceConfig{"/asdf", "/asdf", "mrw"})
+	expected = append(expected, DeviceConfig{"/qwer", "/qwer", "mrw"})
+	expected = append(expected, DeviceConfig{"/zxcv", "/zxcv", "mrw"})
+
+	assert.DeepEqual(t, actual, expected)
+}

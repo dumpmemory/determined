@@ -6,35 +6,80 @@ It launches the entrypoint script using DeepSpeed's launch process.
 import argparse
 import logging
 import os
-import pathlib
+import shlex
 import subprocess
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
+import deepspeed
+import filelock
 from deepspeed.launcher.runner import DEEPSPEED_ENVIRONMENT_NAME
+from packaging import version
 
 import determined as det
+import determined.common
 from determined import constants, util
 from determined.common import api
 from determined.common.api import certs
 
-hostfile_path = "/tmp/hostfile.txt"
+hostfile_path = None
+deepspeed_version = version.parse(deepspeed.__version__)
+
+
+def is_using_cuda() -> bool:
+
+    val = os.getenv("CUDA_VISIBLE_DEVICES")
+
+    if val is None or len(val.strip()) == 0:
+        return False
+    else:
+        return True
+
+
+def is_nccl_socket_ifname_env_var_set() -> bool:
+
+    val = os.getenv("NCCL_SOCKET_IFNAME")
+
+    if val is None or len(val.strip()) == 0:
+        return False
+    else:
+        return True
+
+
+def get_hostfile_path(multi_machine: bool, allocation_id: str) -> Optional[str]:
+    if not multi_machine:
+        return None
+
+    # When the task container uses "/tmp" from the host, having a file with
+    # a well-known name in a world writable directory is not only a security
+    # issue, but it can also cause a user's experiment to fail due to the
+    # file being owned by another user. Hence we suffix the hostfile by
+    # the allocation_id so it should be unique per trial launch.
+    hostfile_path = f"/tmp/hostfile-{allocation_id}.txt"
+    os.environ["DET_DEEPSPEED_HOSTFILE_PATH"] = hostfile_path
+    return hostfile_path
 
 
 def create_hostlist_file(
-    hostfile_path: pathlib.Path, num_proc_per_machine: int, ip_addresses: List[str]
+    hostfile_path: Optional[str], host_slot_counts: List[int], ip_addresses: List[str]
 ) -> str:
+    assert len(host_slot_counts) == len(ip_addresses), "don't know slots for each node"
+
     trial_runner_hosts = ip_addresses.copy()
     # In the single node case, deepspeed doesn't use pdsh so we don't need to launch sshd.
     # Instead, the deepspeed launcher will use localhost as the chief worker ip.
     if len(ip_addresses) == 1:
         trial_runner_hosts[0] = "localhost"
 
-    os.makedirs(hostfile_path.parent, exist_ok=True)
-    with open(hostfile_path, "w") as hostfile:
-        lines = [f"{host} slots={num_proc_per_machine}\n" for host in trial_runner_hosts]
-        hostfile.writelines(lines)
+    if hostfile_path is not None and not os.path.exists(hostfile_path):
+        os.makedirs(os.path.dirname(hostfile_path), exist_ok=True)
+        with open(hostfile_path, "w") as hostfile:
+            lines = [
+                f"{host} slots={slots}\n"
+                for host, slots in zip(trial_runner_hosts, host_slot_counts)
+            ]
+            hostfile.writelines(lines)
     return trial_runner_hosts[0]
 
 
@@ -69,7 +114,7 @@ def create_log_redirect_cmd() -> List[str]:
     return [
         "python3",
         "-m",
-        "determined.exec.worker_process_wrapper",
+        "determined.launch.wrap_rank",
         "RANK",
         "--",
     ]
@@ -95,39 +140,73 @@ def create_deepspeed_env_file() -> None:
     There are certain variables that we need to be set that we can pass to deepspeed using
     a custom env vars file.
     """
-    INCLUDE = ["PATH", "USE_DEEPSPEED", "DET_CHIEF_IP", "DET_MANUAL_INIT_DISTRIBUTED"]
+    INCLUDE = [
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "USE_DEEPSPEED",
+        "DET_CHIEF_IP",
+        "DET_MANUAL_INIT_DISTRIBUTED",
+        "DET_DEEPSPEED_HOSTFILE_PATH",
+        "DET_MASTER_CERT_FILE",
+        "DET_MASTER_CERT_NAME",
+    ]
     with open(DEEPSPEED_ENVIRONMENT_NAME, "w") as f:
         environ = os.environ.copy()
         for k, v in environ.items():
             if k in INCLUDE:
-                f.write(f"{k}={v}\n")
+                # We need to turn our envvars into shell-escaped strings to export them correctly
+                # since values may contain spaces and quotes.  shlex.quote was removed from the
+                # deepspeed launcher in 0.6.2 so we add it here for this version onwards.
+                if deepspeed_version >= version.parse("0.6.2"):
+                    f.write(f"{k}={shlex.quote(v)}\n")
+                else:
+                    f.write(f"{k}={v}\n")
 
 
-def create_run_command(master_address: str, hostfile_path: str) -> List[str]:
+def create_run_command(master_address: str, hostfile_path: Optional[str]) -> List[str]:
     # Construct the deepspeed command.
-    deepspeed_process_cmd = [
-        "deepspeed",
-        "-H",
-        hostfile_path,
-        "--master_addr",
-        master_address,
-        "--no_python",
-        "--no_local_rank",
-        "--",
-    ]
+    deepspeed_process_cmd = ["deepspeed"]
+    if hostfile_path is not None:
+        deepspeed_process_cmd += ["-H", hostfile_path]
+    deepspeed_process_cmd += ["--master_addr", master_address, "--no_python", "--no_local_rank"]
+    if deepspeed_version > version.parse("0.6.4"):
+        deepspeed_process_cmd.append("--no_ssh_check")  # Bypass deepspeed's ssh check.
+    deepspeed_process_cmd.append("--")
     return deepspeed_process_cmd
+
+
+def check_deepspeed_version(multi_machine: bool) -> None:
+    if not multi_machine:
+        return
+    # Upstream deepspeed added an ssh check from 0.6.1 onwards that does not have the
+    # StrictHostKeyChecking=no arg and fails with our agents.  A PR adding a no_ssh_check arg
+    # to bypass this should land for versions 0.6.5 and onwards.
+    if deepspeed_version <= version.parse("0.6.0"):
+        return
+    if deepspeed_version > version.parse("0.6.4"):
+        return
+    raise ValueError(
+        "This launcher is incompatible with deepspeed versions 0.6.1 to 0.6.4 due to an ssh check "
+        "in the upstream launcher that fails with our setup.  We perform our own ssh check by "
+        "default and can bypass this ssh check for deepspeed versions >= 0.6.5."
+    )
 
 
 def main(script: List[str]) -> int:
     info = det.get_cluster_info()
     assert info is not None, "must be run on-cluster"
     assert info.task_type == "TRIAL", f'must be run with task_type="TRIAL", not "{info.task_type}"'
+    experiment_config = det.ExperimentConfig(info.trial._config)
+    determined.common.set_logger(experiment_config.debug_enabled())
+
+    multi_machine = len(info.container_addrs) > 1
+    check_deepspeed_version(multi_machine)
 
     # Hack: get the resources id from the environment.
     resources_id = os.environ.get("DET_RESOURCES_ID")
     assert resources_id is not None, "Unable to run with DET_RESOURCES_ID unset"
 
-    # TODO: refactor websocket, data_layer, and profiling to to not use the cli_cert.
+    # TODO: refactor websocket and profiling to to not use the cli_cert.
     cert = certs.default_load(info.master_url)
     certs.cli_cert = cert
 
@@ -138,6 +217,31 @@ def main(script: List[str]) -> int:
 
     # Chief IP is set as an environment variable to support nested launch layers
     os.environ["DET_CHIEF_IP"] = chief_ip
+
+    # If the NCCL_SOCKET_IFNAME environment variable wasn't explicitly set by
+    # the user in the experiment's YAML file, then set it to the distributed
+    # network interface, if the value of "dtrain_network_interface" under
+    # "task_container_defaults" has been set in the "master.yaml".
+    if is_using_cuda() and not is_nccl_socket_ifname_env_var_set():
+        dtrain_network_interface = os.environ.get("DET_INTER_NODE_NETWORK_INTERFACE", None)
+
+        if dtrain_network_interface is not None and len(dtrain_network_interface) > 0:
+            os.environ["NCCL_SOCKET_IFNAME"] = dtrain_network_interface
+
+    # In some downstream training code, the hostfile is expected on all nodes so we create the
+    # hostfile on all nodes here before opening the non-chief node subprocess.  Since we
+    # use the allocation id to create the hostfile path, we register that path to an environment
+    # variable for access downstream.  A filelock is used to ensure we do not have clashing writes
+    # if the hostfile_path is on a shared filesystem.
+    hostfile_path = get_hostfile_path(multi_machine, info.allocation_id)
+
+    lock = str(hostfile_path) + ".lock"
+    with filelock.FileLock(lock):
+        master_address = create_hostlist_file(
+            hostfile_path=hostfile_path,
+            host_slot_counts=info.container_slot_counts,
+            ip_addresses=info.container_addrs,
+        )
 
     # All ranks will need to run sshd.
     run_sshd_command = create_sshd_cmd()
@@ -162,7 +266,9 @@ def main(script: List[str]) -> int:
             f"Non-chief [{info.container_rank}] training process launch "
             f"command: {run_sshd_command}."
         )
-        return subprocess.Popen(pid_server_cmd + run_sshd_command).wait()
+        p = subprocess.Popen(pid_server_cmd + run_sshd_command)
+        with det.util.forward_signals(p):
+            return p.wait()
 
     # We always need to set this variable to initialize the context correctly, even in the single
     # slot case.
@@ -172,16 +278,11 @@ def main(script: List[str]) -> int:
     # - a top-level pid_server, which causes the whole container to exit if any local worker dies.
     # - deepspeed, which launches $slots_per_trial copies of the following layers:
     #     - a pid_client process to contact the local pid_server
-    #     - worker_process_wrapper, which redirects stdin/stdout to the local container
+    #     - wrap_rank, which redirects stdin/stdout to the local container
     #     - harness.py, which actually does the training for the worker
 
     pid_server_cmd = create_pid_server_cmd(info.allocation_id, len(info.slot_ids))
 
-    master_address = create_hostlist_file(
-        hostfile_path=pathlib.Path(hostfile_path),
-        num_proc_per_machine=len(info.slot_ids),
-        ip_addresses=info.container_addrs,
-    )
     cmd = create_run_command(master_address, hostfile_path)
 
     pid_client_cmd = create_pid_client_cmd(info.allocation_id)
@@ -194,9 +295,10 @@ def main(script: List[str]) -> int:
 
     full_cmd = pid_server_cmd + cmd + pid_client_cmd + log_redirect_cmd + harness_cmd
 
-    multi_machine = len(info.container_addrs) > 1
     if not multi_machine:
-        return subprocess.Popen(full_cmd).wait()
+        p = subprocess.Popen(full_cmd)
+        with det.util.forward_signals(p):
+            return p.wait()
 
     # Create the environment file that will be passed by deepspeed to individual ranks.
     create_deepspeed_env_file()
@@ -220,7 +322,9 @@ def main(script: List[str]) -> int:
         for peer_addr in info.container_addrs:
             util.check_sshd(peer_addr, deadline, constants.DTRAIN_SSH_PORT)
 
-        return subprocess.Popen(full_cmd).wait()
+        p = subprocess.Popen(full_cmd)
+        with det.util.forward_signals(p):
+            return p.wait()
     finally:
         sshd_process.kill()
         sshd_process.wait()

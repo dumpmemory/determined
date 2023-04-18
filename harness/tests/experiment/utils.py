@@ -1,6 +1,5 @@
 import os
 import pathlib
-import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 import numpy as np
@@ -9,13 +8,12 @@ from mypy_extensions import DefaultNamedArg
 from tensorflow.keras import utils as keras_utils
 
 import determined as det
-from determined import _core, experimental, gpu, keras, workload
-from determined.common import check
+from determined import core, gpu, keras, workload
 
 
 class TrainAndValidate:
     """
-    Offer a similar interface as WorkloadResponseInterceptor, execpt let send() yield a whole
+    Offer a similar interface as WorkloadResponseInterceptor, except let send() yield a whole
     progression of RUN_STEP and COMPUTE_VALIDATION_METRICS, and let result() return the accumulated
     metrics from each.
     """
@@ -25,7 +23,7 @@ class TrainAndValidate:
         self._avg_training_metrics = None  # type: Optional[List[Dict[str, Any]]]
         self._validation_metrics = None  # type: Optional[List[Dict[str, Any]]]
         self.request_stop_step_id = request_stop_step_id
-        self._latest_batch = 0
+        self._steps_completed = 0
 
     def send(
         self,
@@ -38,7 +36,7 @@ class TrainAndValidate:
         self._training_metrics = []
         self._avg_training_metrics = []
         self._validation_metrics = []
-        self._latest_batch = 0
+        self._steps_completed = 0
         interceptor = workload.WorkloadResponseInterceptor()
 
         for step_id in range(initial_step_id, initial_step_id + steps):
@@ -47,7 +45,7 @@ class TrainAndValidate:
                 workload.train_workload(
                     step_id,
                     num_batches=scheduling_unit,
-                    total_batches_processed=self._latest_batch,
+                    total_batches_processed=self._steps_completed,
                 ),
             )
             metrics = interceptor.metrics_result()
@@ -55,22 +53,22 @@ class TrainAndValidate:
             assert len(batch_metrics) == scheduling_unit * train_batch_calls
             self._training_metrics.extend(batch_metrics)
             self._avg_training_metrics.append(metrics["metrics"]["avg_metrics"])
-            self._latest_batch += scheduling_unit
+            self._steps_completed += scheduling_unit
             if metrics.get("stop_requested"):
-                assert step_id == self.request_stop_step_id
+                assert step_id == self.request_stop_step_id, (step_id, self)
                 stop_requested = True
 
             if step_id % validation_freq == 0:
                 yield from interceptor.send(
                     workload.validation_workload(
-                        step_id, total_batches_processed=self._latest_batch
+                        step_id, total_batches_processed=self._steps_completed
                     ),
                 )
                 validation = interceptor.metrics_result()
                 v_metrics = validation["metrics"]["validation_metrics"]
                 self._validation_metrics.append(v_metrics)
                 if validation.get("stop_requested"):
-                    assert step_id == self.request_stop_step_id
+                    assert step_id == self.request_stop_step_id, (step_id, self)
                     stop_requested = True
 
             if stop_requested:
@@ -83,8 +81,8 @@ class TrainAndValidate:
         assert self._validation_metrics is not None
         return self._training_metrics, self._validation_metrics
 
-    def get_latest_batch(self) -> int:
-        return self._latest_batch
+    def get_steps_completed(self) -> int:
+        return self._steps_completed
 
     def get_avg_training_metrics(self) -> List[Dict[str, Any]]:
         assert self._avg_training_metrics is not None
@@ -105,19 +103,24 @@ def make_default_exp_config(
             "mixed_precision": "O0",
             "aggregation_frequency": 1,
             "gradient_compression": False,
-            "average_training_metrics": False,
+            "average_training_metrics": True,
             "auto_tune_tensor_fusion": False,
             "tensor_fusion_threshold": 100,
             "tensor_fusion_cycle_time": 3.5,
         },
         "data_layer": {"type": "shared_fs"},
+        "checkpoint_policy": "best",
+        "perform_initial_validation": False,
         "checkpoint_storage": {
             "type": "shared_fs",
             "host_path": checkpoint_dir or "/tmp",
         },
         "searcher": {
             "metric": searcher_metric,
+            "smaller_is_better": True,
         },
+        "min_checkpoint_period": {"batches": 0},
+        "min_validation_period": {"batches": 0},
     }
 
 
@@ -126,10 +129,10 @@ def make_default_env_context(
     experiment_config: Dict,
     trial_seed: int = 0,
     latest_checkpoint: Optional[str] = None,
-    latest_batch: int = 0,
+    steps_completed: int = 0,
     expose_gpus: bool = False,
 ) -> det.EnvContext:
-    assert (latest_checkpoint is None) == (latest_batch == 0)
+    assert (latest_checkpoint is None) == (steps_completed == 0)
 
     if expose_gpus:
         gpu_uuids = gpu.get_gpu_uuids()
@@ -145,12 +148,11 @@ def make_default_env_context(
         master_cert_name=None,
         hparams=hparams,
         latest_checkpoint=latest_checkpoint,
-        latest_batch=latest_batch,
+        steps_completed=steps_completed,
         use_gpu=use_gpu,
         container_gpus=gpu_uuids,
         slot_ids=[],
         debug=False,
-        det_trial_unique_port_offset=0,
         det_trial_id="1",
         det_experiment_id="1",
         det_agent_id="1",
@@ -179,7 +181,7 @@ def assert_equivalent_metrics(metrics_A: Dict[str, Any], metrics_B: Dict[str, An
     """
     assert set(metrics_A.keys()) == set(metrics_B.keys())
     for key in metrics_A.keys():
-        if isinstance(metrics_A[key], (float, np.float)):
+        if isinstance(metrics_A[key], (float, np.float64)):
             assert metrics_A[key] == pytest.approx(metrics_B[key])
         elif isinstance(metrics_A[key], np.ndarray):
             assert np.array_equal(metrics_A[key], metrics_B[key])
@@ -187,7 +189,7 @@ def assert_equivalent_metrics(metrics_A: Dict[str, Any], metrics_B: Dict[str, An
             assert metrics_A[key] == metrics_B[key]
 
 
-def xor_data(dtype: np.dtype = np.int64) -> Tuple[np.ndarray, np.ndarray]:
+def xor_data(dtype: Type[Any] = np.int64) -> Tuple[np.ndarray, np.ndarray]:
     training_data = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=dtype)
     training_labels = np.array([0, 1, 1, 0], dtype=dtype)
     return training_data, training_labels
@@ -196,7 +198,7 @@ def xor_data(dtype: np.dtype = np.int64) -> Tuple[np.ndarray, np.ndarray]:
 def make_xor_data_sequences(
     shuffle: bool = False,
     seed: Optional[int] = None,
-    dtype: np.dtype = np.int64,
+    dtype: Type[Any] = np.int64,
     multi_input_output: bool = False,
     batch_size: int = 1,
 ) -> Tuple[keras_utils.Sequence, keras_utils.Sequence]:
@@ -223,13 +225,13 @@ def make_xor_data_sequences(
 def make_trial_controller_from_trial_implementation(
     trial_class: Type[det.Trial],
     hparams: Dict,
-    workloads: workload.Stream,
+    workloads: Optional[workload.Stream] = None,
     scheduling_unit: int = 1,
     trial_seed: int = 0,
     exp_config: Optional[Dict] = None,
     checkpoint_dir: Optional[str] = None,
     latest_checkpoint: Optional[str] = None,
-    latest_batch: int = 0,
+    steps_completed: int = 0,
     expose_gpus: bool = False,
 ) -> det.TrialController:
     if not exp_config:
@@ -245,12 +247,13 @@ def make_trial_controller_from_trial_implementation(
         experiment_config=exp_config,
         trial_seed=trial_seed,
         latest_checkpoint=latest_checkpoint,
-        latest_batch=latest_batch,
+        steps_completed=steps_completed,
         expose_gpus=expose_gpus,
     )
 
-    storage_manager = det.common.storage.SharedFSStorageManager(checkpoint_dir or "/tmp")
-    core_context = _core._dummy_init(storage_manager=storage_manager)
+    checkpoint_dir = checkpoint_dir or "/tmp"
+    tbd_path = pathlib.Path(os.path.join("/tmp", "tensorboard"))
+    core_context = core._dummy_init(checkpoint_storage=checkpoint_dir, tensorboard_path=tbd_path)
 
     distributed_backend = det._DistributedBackend()
 
@@ -323,7 +326,7 @@ RestorableMakeControllerFn = Callable[
         workload.Stream,
         DefaultNamedArg(Optional[str], "checkpoint_dir"),  # noqa: F821
         DefaultNamedArg(Optional[str], "latest_checkpoint"),  # noqa: F821
-        DefaultNamedArg(int, "latest_batch"),  # noqa: F821
+        DefaultNamedArg(int, "steps_completed"),  # noqa: F821
     ],
     det.TrialController,
 ]
@@ -350,14 +353,17 @@ def train_and_validate(
 
 
 def checkpointing_and_restoring_test(
-    make_trial_controller_fn: RestorableMakeControllerFn, tmp_path: pathlib.Path
+    make_trial_controller_fn: RestorableMakeControllerFn,
+    tmp_path: pathlib.Path,
+    steps: Tuple[int, int] = (1, 1),
+    scheduling_unit: int = 100,
 ) -> Tuple[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]]:
     """
     Tests if a trial controller of any framework can checkpoint and restore from that checkpoint
     without state changes.
 
     This test runs two trials.
-    1) Trial A runs for one steps of 100 batches, checkpoints itself, and restores from
+    1) Trial A runs for one step of 100 batches, checkpoints itself, and restores from
        that checkpoint.
     2) Trial B runs for two steps of 100 batches.
 
@@ -368,12 +374,12 @@ def checkpointing_and_restoring_test(
     validation_metrics = {"A": [], "B": []}  # type: Dict[str, List[workload.Metrics]]
     checkpoint_dir = str(tmp_path.joinpath("checkpoint"))
     latest_checkpoint = None
-    latest_batch = 0
+    steps_completed = 0
 
     def make_workloads(steps: int, tag: str, checkpoint: bool) -> workload.Stream:
         trainer = TrainAndValidate()
 
-        yield from trainer.send(steps, validation_freq=1, scheduling_unit=100)
+        yield from trainer.send(steps, validation_freq=1, scheduling_unit=scheduling_unit)
         tm, vm = trainer.result()
         training_metrics[tag] += tm
         validation_metrics[tag] += vm
@@ -381,26 +387,26 @@ def checkpointing_and_restoring_test(
         if checkpoint is not None:
             interceptor = workload.WorkloadResponseInterceptor()
             yield from interceptor.send(workload.checkpoint_workload())
-            nonlocal latest_checkpoint, latest_batch
+            nonlocal latest_checkpoint, steps_completed
             latest_checkpoint = interceptor.metrics_result()["uuid"]
-            latest_batch = trainer.get_latest_batch()
+            steps_completed = trainer.get_steps_completed()
 
     controller_A1 = make_trial_controller_fn(
-        make_workloads(1, "A", True),
+        make_workloads(steps[0], "A", True),
         checkpoint_dir=checkpoint_dir,
     )
     controller_A1.run()
     assert latest_checkpoint is not None, "make_workloads did not set the latest_checkpoint"
 
     controller_A2 = make_trial_controller_fn(
-        make_workloads(1, "A", False),
+        make_workloads(steps[1], "A", False),
         checkpoint_dir=checkpoint_dir,
         latest_checkpoint=latest_checkpoint,
-        latest_batch=latest_batch,
+        steps_completed=steps_completed,
     )
     controller_A2.run()
 
-    controller_B = make_trial_controller_fn(make_workloads(2, "B", False))
+    controller_B = make_trial_controller_fn(make_workloads(steps[0] + steps[1], "B", False))
     controller_B.run()
 
     for A, B in zip(training_metrics["A"], training_metrics["B"]):
@@ -414,22 +420,6 @@ def checkpointing_and_restoring_test(
 
 def list_all_files(directory: str) -> List[str]:
     return [f for _, _, files in os.walk(directory) for f in files]
-
-
-def create_trial_instance(trial_def: Type[det.Trial]) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        trial_instance = experimental.create_trial_instance(
-            trial_def=trial_def,
-            config={
-                "hyperparameters": {
-                    "global_batch_size": det.Constant(16),
-                    "hidden_size": 4,
-                    "learning_rate": 0.01,
-                }
-            },
-            checkpoint_dir=td,
-        )
-    check.check_isinstance(trial_instance, det.Trial)
 
 
 def ensure_requires_global_batch_size(
@@ -446,7 +436,5 @@ def ensure_requires_global_batch_size(
     # Catch missing global_batch_size.
     with pytest.raises(det.errors.InvalidExperimentException, match="is a required hyperparameter"):
         _ = make_trial_controller_from_trial_implementation(
-            trial_class,
-            bad_hparams,
-            make_workloads(),
+            trial_class, workloads=make_workloads(), hparams=bad_hparams
         )

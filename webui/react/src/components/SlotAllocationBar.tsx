@@ -4,13 +4,13 @@ import React, { useMemo } from 'react';
 import Badge from 'components/Badge';
 import Bar from 'components/Bar';
 import { ConditionalWrapper } from 'components/ConditionalWrapper';
-import Link from 'components/Link';
 import { resourceStateToLabel } from 'constants/states';
 import { paths } from 'routes/utils';
 import { V1ResourcePoolType } from 'services/api-ts-sdk';
+import { routeToReactUrl } from 'shared/utils/routes';
+import { floatToPercent } from 'shared/utils/string';
 import { getStateColorCssVar, ShirtSize } from 'themes';
 import { ResourceState, SlotState } from 'types';
-import { floatToPercent } from 'utils/string';
 
 import { BadgeType } from './Badge';
 import css from './SlotAllocation.module.scss';
@@ -21,19 +21,21 @@ export interface Props {
   footer?: AllocationBarFooterProps;
   hideHeader?: boolean;
   isAux?: boolean;
+  poolName?: string;
   poolType?: V1ResourcePoolType;
   resourceStates: ResourceState[];
   showLegends?: boolean;
   size?: ShirtSize;
-  slotsPotential?:number;
+  slotsPotential?: number;
   title?: string;
   totalSlots: number;
 }
 
 export interface AllocationBarFooterProps {
-  auxContainerCapacity?:number
+  auxContainerCapacity?: number;
   auxContainersRunning?: number;
   queued?: number;
+  scheduled?: number;
 }
 
 interface LegendProps {
@@ -44,10 +46,11 @@ interface LegendProps {
 }
 
 const Legend: React.FC<LegendProps> = ({
-  count, totalSlots,
-  showPercentage, children,
+  count,
+  totalSlots,
+  showPercentage,
+  children,
 }: LegendProps) => {
-
   let label = `0 (${floatToPercent(0, 0)})`;
   if (totalSlots !== 0) {
     label = count.toString();
@@ -55,12 +58,8 @@ const Legend: React.FC<LegendProps> = ({
   }
   return (
     <li className={css.legend}>
-      <span className={css.count}>
-        {label}
-      </span>
-      <span>
-        {children}
-      </span>
+      <span className={css.count}>{label}</span>
+      <span>{children}</span>
     </li>
   );
 };
@@ -74,35 +73,42 @@ const SlotAllocationBar: React.FC<Props> = ({
   footer,
   isAux,
   title,
+  poolName,
   poolType,
   slotsPotential,
   ...barProps
 }: Props) => {
-
   const stateTallies = useMemo(() => {
     const tally: Record<ResourceState, number> = {
       [ResourceState.Assigned]: 0,
       [ResourceState.Pulling]: 0,
       [ResourceState.Running]: 0,
       [ResourceState.Starting]: 0,
+      [ResourceState.Warm]: 0,
       [ResourceState.Terminated]: 0,
       [ResourceState.Unspecified]: 0,
+      [ResourceState.Potential]: 0,
     };
-    resourceStates.forEach(state => {
+    resourceStates.forEach((state) => {
       tally[state] += 1;
     });
+    tally[ResourceState.Warm] = totalSlots - tally[ResourceState.Running];
+    tally[ResourceState.Potential] = slotsPotential ? slotsPotential - totalSlots : 0;
     return tally;
-  }, [ resourceStates ]);
+  }, [resourceStates, totalSlots, slotsPotential]);
 
-  const freeSlots = (totalSlots - resourceStates.length);
-  const pendingSlots = (resourceStates.length - stateTallies.RUNNING);
+  const freeSlots = totalSlots - resourceStates.length;
+  const pendingSlots = resourceStates.length - stateTallies.RUNNING;
 
   const barParts = useMemo(() => {
     if (isAux && footer) {
-      const freePerc = footer.auxContainerCapacity && footer.auxContainersRunning &&
-      footer.auxContainerCapacity - footer.auxContainersRunning > 0 ?
-        (footer.auxContainerCapacity - footer.auxContainersRunning) / footer.auxContainerCapacity
-        : 1;
+      const freePerc =
+        footer.auxContainerCapacity &&
+        footer.auxContainersRunning &&
+        footer.auxContainerCapacity - footer.auxContainersRunning > 0
+          ? (footer.auxContainerCapacity - footer.auxContainersRunning) /
+            footer.auxContainerCapacity
+          : 1;
       const parts = {
         free: {
           color: getStateColorCssVar(SlotState.Free),
@@ -113,10 +119,10 @@ const SlotAllocationBar: React.FC<Props> = ({
           percent: 1 - freePerc,
         },
       };
-      return [ parts.running, parts.free ];
+      return [parts.running, parts.free];
     }
-    const slotsAvaiablePer = slotsPotential && slotsPotential > totalSlots
-      ? (totalSlots / slotsPotential) : 1;
+    const slotsAvaiablePer =
+      slotsPotential && slotsPotential > totalSlots ? totalSlots / slotsPotential : 1;
     const parts = {
       free: {
         color: getStateColorCssVar(SlotState.Free),
@@ -137,99 +143,161 @@ const SlotAllocationBar: React.FC<Props> = ({
       },
     };
 
-    return [ parts.running, parts.pending, parts.free, parts.potential ];
-  }, [ totalSlots, stateTallies, pendingSlots, freeSlots, slotsPotential, footer, isAux ]);
+    return [parts.running, parts.pending, parts.free, parts.potential];
+  }, [totalSlots, stateTallies, pendingSlots, freeSlots, slotsPotential, footer, isAux]);
 
-  const stateDetails = useMemo(() => {
-    const states = [
+  const totalSlotsNum = useMemo(() => {
+    return slotsPotential || totalSlots;
+  }, [totalSlots, slotsPotential]);
+
+  const states = useMemo(() => {
+    let states = [
+      ResourceState.Potential,
+      ResourceState.Warm,
       ResourceState.Assigned,
       ResourceState.Pulling,
       ResourceState.Starting,
       ResourceState.Running,
     ];
+    if (showLegends) {
+      states = states.slice(2);
+    } else if (stateTallies[ResourceState.Potential] <= 0) {
+      states = states.slice(1);
+    }
+    return states;
+  }, [showLegends, stateTallies]);
+
+  const hasLegend = useMemo(() => {
+    return states.map((s) => stateTallies[s]).reduce((res, i) => res + i, 0) > 0;
+  }, [stateTallies, states]);
+
+  const classes = [css.base];
+  if (className) classes.push(className);
+
+  const renderStateDetails = () => {
     return (
       <ul className={css.detailedLegends}>
-        {states.map((state) => (
-          <Legend count={stateTallies[state]} key={state} totalSlots={totalSlots}>
-            <Badge
-              state={state === ResourceState.Running ? SlotState.Running : SlotState.Pending}
-              type={BadgeType.State}>
-              {resourceStateToLabel[state]}
-            </Badge>
-          </Legend>
-        ))}
+        {states.map((state) =>
+          stateTallies[state] ? (
+            <Legend count={stateTallies[state]} key={state} totalSlots={totalSlots}>
+              <Badge state={state} type={BadgeType.State}>
+                {resourceStateToLabel[state]}
+              </Badge>
+            </Legend>
+          ) : null,
+        )}
       </ul>
     );
-  }, [ stateTallies, totalSlots ]);
+  };
 
-  const classes = [ css.base ];
-  if (className) classes.push(className);
+  const onClickQueued = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    poolName && routeToReactUrl(`${paths.resourcePool(poolName)}/queued`);
+  };
+
+  const onClickScheduled = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    poolName && routeToReactUrl(`${paths.resourcePool(poolName)}`);
+  };
+
+  const renderFooterJobs = () => {
+    if (footer?.queued || footer?.scheduled) {
+      return footer.queued ? (
+        <div onClick={onClickQueued}>
+          <span className={css.queued}>
+            {`${footer.queued > 100 ? '100+' : footer.queued} Queued`}
+          </span>
+        </div>
+      ) : (
+        <div onClick={onClickScheduled}>
+          <span className={css.queued}>
+            {`${footer.scheduled && footer.scheduled > 100 ? '100+' : footer.scheduled} Active`}
+          </span>
+        </div>
+      );
+    }
+    return !isAux && <span>{`${freeSlots} ${freeSlots > 1 ? 'Slots' : 'Slot'} Free`}</span>;
+  };
+
+  const renderLegend = () => (
+    <ol>
+      <Legend count={stateTallies.RUNNING} showPercentage totalSlots={totalSlots}>
+        <Badge state={SlotState.Running} type={BadgeType.State} />
+      </Legend>
+      <Legend count={pendingSlots} showPercentage totalSlots={totalSlots}>
+        <Badge state={SlotState.Pending} type={BadgeType.State} />
+      </Legend>
+      <Legend count={freeSlots} showPercentage totalSlots={totalSlots}>
+        <Badge state={SlotState.Free} type={BadgeType.State} />
+      </Legend>
+    </ol>
+  );
 
   return (
     <div className={classes.join(' ')}>
       {!hideHeader && (
         <div className={css.header}>
           <header>{title || 'Compute'} Slots Allocated</header>
-          {totalSlots === 0 ? <span>0/0</span> : (
+          {totalSlots === 0 ? (
+            <span>0/0</span>
+          ) : (
             <span>
               {resourceStates.length}/{totalSlots}
-              {totalSlots > 0 ? ` (${floatToPercent(resourceStates.length / totalSlots, 0)})` : ''}
+              {totalSlots > 0 ? ` (${floatToPercent(resourceStates.length / totalSlots, 2)})` : ''}
             </span>
           )}
         </div>
       )}
       <ConditionalWrapper
         condition={!showLegends}
-        wrapper={(ch) => (
-          <Popover content={stateDetails} placement="bottom">
-            {ch}
-          </Popover>
-        )}>
+        wrapper={(ch) =>
+          !isAux && hasLegend ? (
+            <Popover content={renderStateDetails()} placement="bottom">
+              {ch}
+            </Popover>
+          ) : (
+            <div>{ch}</div>
+          )
+        }>
         <div className={css.bar}>
-          <Bar {...barProps} parts={barParts} />
+          <Bar {...barProps} inline parts={barParts} />
         </div>
       </ConditionalWrapper>
       {footer && (
         <div className={css.footer}>
           {poolType === V1ResourcePoolType.K8S ? (
-            <header>{`${isAux ?
-              `${footer.auxContainersRunning} Aux Containers Running` :
-              `${stateTallies.RUNNING} Compute Slots Allocated`}`}
+            <header>
+              {`${
+                isAux
+                  ? `${footer.auxContainersRunning} Aux Containers Running`
+                  : `${resourceStates.length} ${title || 'Compute'} Slots Allocated`
+              }`}
             </header>
-          )
-            : (
-              <header>{`${isAux ?
-                `${footer.
-                  auxContainersRunning}/${footer.auxContainerCapacity} Aux Containers Running` :
-                `${stateTallies.RUNNING}/${totalSlots} Compute Slots Allocated`}`}
-              </header>
-            )}
-          {footer.queued ? (
-            <Link path={paths.jobs()}>
-              <span className={css.queued}>{`${footer.queued > 100 ?
-                '100+' :
-                footer.queued} ${footer.queued === 1 ? 'Job' : 'Jobs'} Queued`}
-              </span>
-            </Link>
-          ) :
-            !isAux && <span>{`${totalSlots - resourceStates.length} Slots Free`}</span>}
+          ) : (
+            <header>
+              {`${
+                isAux
+                  ? `${footer.auxContainersRunning}/${footer.auxContainerCapacity} Aux Containers Running`
+                  : `${resourceStates.length}/${totalSlotsNum} ${
+                      title || 'Compute'
+                    } Slots Allocated`
+              }`}
+            </header>
+          )}
+          {renderFooterJobs()}
         </div>
       )}
       {showLegends && (
         <div className={css.overallLegends}>
-          <Popover content={stateDetails} placement="bottom">
-            <ol>
-              <Legend count={stateTallies.RUNNING} showPercentage totalSlots={totalSlots}>
-                <Badge state={SlotState.Running} type={BadgeType.State} />
-              </Legend>
-              <Legend count={pendingSlots} showPercentage totalSlots={totalSlots}>
-                <Badge state={SlotState.Pending} type={BadgeType.State} />
-              </Legend>
-              <Legend count={freeSlots} showPercentage totalSlots={totalSlots}>
-                <Badge state={SlotState.Free} type={BadgeType.State} />
-              </Legend>
-            </ol>
-          </Popover>
+          {hasLegend ? (
+            <Popover content={renderStateDetails()} placement="bottom">
+              {renderLegend()}
+            </Popover>
+          ) : (
+            renderLegend()
+          )}
         </div>
       )}
     </div>

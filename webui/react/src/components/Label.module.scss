@@ -1,7 +1,11 @@
 .base {
   cursor: pointer;
-  font-size: var(--theme-sizes-font-small);
+  font-size: 14px;
   white-space: nowrap;
 }
-.alignRight { text-align: right; }
-.textOnly { cursor: auto; }
+.alignRight {
+  text-align: right;
+}
+.textOnly {
+  cursor: auto;
+}

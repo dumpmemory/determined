@@ -1,94 +1,72 @@
 import * as Api from 'services/api-ts-sdk';
+import { V1AgentUserGroup, V1Group, V1LaunchWarning, V1Trigger } from 'services/api-ts-sdk';
+import { Primitive, RawJson, RecordKey, ValueOf } from 'shared/types';
 
 interface WithPagination {
   pagination: Api.V1Pagination; // probably should use this or Pagination
 }
 
-export type RecordKey = string | number | symbol;
-export type UnknownRecord = Record<RecordKey, unknown>;
-export type Primitive = boolean | number | string;
-export type NullOrUndefined<T = undefined> = T | null | undefined;
-export type Point = { x: number; y: number };
-export type Range<T = Primitive> = [ T, T ];
-export type Eventually<T> = T | Promise<T>;
-
-/* eslint-disable-next-line @typescript-eslint/no-explicit-any */
-export type RawJson = Record<string, any>;
-
 export type PropsWithStoragePath<T> = T & { storagePath?: string };
-
 export interface User {
   displayName?: string;
+  id: number;
+  modifiedAt?: number;
   username: string;
 }
 
 export interface DetailedUser extends User {
-  displayName?: string;
+  agentUserGroup?: V1AgentUserGroup;
   id: number;
   isActive: boolean;
   isAdmin: boolean;
 }
 
+export interface DetailedUserList extends WithPagination {
+  users: DetailedUser[];
+}
+
 export interface Auth {
   isAuthenticated: boolean;
   token?: string;
-  user?: DetailedUser;
 }
 
-export interface SsoProvider {
-  name: string;
-  ssoUrl: string;
-}
+export const ResourceType = {
+  ALL: 'ALL',
+  CPU: 'CPU',
+  CUDA: 'CUDA',
+  ROCM: 'ROCM',
+  UNSPECIFIED: 'UNSPECIFIED',
+} as const;
 
-export enum BrandingType {
-  Determined = 'determined',
-  HPE = 'hpe',
-}
+export type ResourceType = ValueOf<typeof ResourceType>;
 
-export interface DeterminedInfo {
-  branding: BrandingType;
-  checked: boolean,
-  clusterId: string;
-  clusterName: string;
-  externalLoginUri?: string;
-  externalLogoutUri?: string;
-  isTelemetryEnabled: boolean;
-  masterId: string;
-  ssoProviders?: SsoProvider[];
-  version: string;
-}
+export const isDeviceType = (type: ResourceType): boolean => {
+  return ResourceType.CPU === type || ResourceType.CUDA === type || ResourceType.ROCM === type;
+};
 
-export interface Telemetry {
-  enabled: boolean;
-  segmentKey?: string;
-}
+export const ResourceState = {
+  // This is almost CommandState
+  Assigned: 'ASSIGNED',
+  Potential: 'POTENTIAL',
+  Pulling: 'PULLING',
+  Running: 'RUNNING',
+  Starting: 'STARTING',
+  Terminated: 'TERMINATED',
+  Unspecified: 'UNSPECIFIED',
+  Warm: 'WARM',
+} as const;
 
-export enum ResourceType {
-  CPU = 'CPU',
-  CUDA = 'CUDA',
-  ROCM = 'ROCM',
-  ALL = 'ALL',
-  UNSPECIFIED = 'UNSPECIFIED',
-}
-
-export const deviceTypes = new Set([ ResourceType.CPU, ResourceType.CUDA, ResourceType.ROCM ]);
-
-export enum ResourceState { // This is almost CommandState
-  Unspecified = 'UNSPECIFIED',
-  Assigned = 'ASSIGNED',
-  Pulling = 'PULLING',
-  Starting = 'STARTING',
-  Running = 'RUNNING',
-  Terminated = 'TERMINATED',
-}
+export type ResourceState = ValueOf<typeof ResourceState>;
 
 // High level Slot state
-export enum SlotState {
-  Running = 'RUNNING',
-  Free = 'FREE',
-  Pending = 'PENDING',
-  Potential = 'POTENTIAL'
-}
+export const SlotState = {
+  Free: 'FREE',
+  Pending: 'PENDING',
+  Potential: 'POTENTIAL',
+  Running: 'RUNNING',
+} as const;
+
+export type SlotState = ValueOf<typeof SlotState>;
 
 export const resourceStates: ResourceState[] = [
   ResourceState.Unspecified,
@@ -96,6 +74,7 @@ export const resourceStates: ResourceState[] = [
   ResourceState.Pulling,
   ResourceState.Starting,
   ResourceState.Running,
+  ResourceState.Warm,
   ResourceState.Terminated,
 ];
 
@@ -116,13 +95,15 @@ export interface Resource {
 export interface Agent {
   id: string;
   registeredTime: number;
-  resourcePool: string;
+  resourcePools: string[];
   resources: Resource[];
 }
 
 export interface ClusterOverviewResource {
+  /** allocated percentange of total connected slots  */
   allocation?: number;
   available: number;
+  /** sum of all slots of this type across all _connected_ agents */
   total: number;
 }
 
@@ -138,23 +119,20 @@ export interface StartEndTimes extends EndTimes {
   startTime: string;
 }
 
-export interface Pagination {
-  limit: number;
-  offset: number;
-}
-
 /* Command */
-export enum CommandState {
-  Pending = 'PENDING',
-  Assigned = 'ASSIGNED',
-  Pulling = 'PULLING',
-  Starting = 'STARTING',
-  Running = 'RUNNING',
-  Terminating = 'TERMINATING',
-  Terminated = 'TERMINATED',
-}
+export const CommandState = {
+  Pulling: 'PULLING',
+  Queued: 'QUEUED',
+  Running: 'RUNNING',
+  Starting: 'STARTING',
+  Terminated: 'TERMINATED',
+  Terminating: 'TERMINATING',
+  Waiting: 'WAITING',
+} as const;
 
-export type State = CommandState | RunState;
+export type CommandState = ValueOf<typeof CommandState>;
+
+export type State = CommandState | typeof RunState;
 
 export interface CommandAddress {
   containerIp: string;
@@ -164,12 +142,14 @@ export interface CommandAddress {
   protocol?: string;
 }
 
-export enum CommandType {
-  Command = 'command',
-  JupyterLab = 'jupyter-lab',
-  Shell = 'shell',
-  TensorBoard = 'tensor-board',
-}
+export const CommandType = {
+  Command: 'command',
+  JupyterLab: 'jupyter-lab',
+  Shell: 'shell',
+  TensorBoard: 'tensor-board',
+} as const;
+
+export type CommandType = ValueOf<typeof CommandType>;
 
 export interface CommandMisc {
   experimentIds: number[];
@@ -185,30 +165,25 @@ export interface Command {
   config: CommandConfig; // We do not use this field in the WebUI.
   exitStatus?: string;
   id: string;
-  kind: CommandType; // TODO rename to type
   misc?: CommandMisc;
   registeredTime: string;
   resourcePool: string;
   serviceAddress?: string;
   state: CommandState;
+  type: CommandType;
   user: User;
 }
 
-export interface JupyterLabConfig {
-  name?: string;
-  pool?: string;
-  slots?: number;
-  template?: string;
-}
+export const CheckpointStorageType = {
+  AWS: 'aws',
+  AZURE: 'azure',
+  GCS: 'gcs',
+  HDFS: 'hdfs',
+  S3: 's3',
+  SharedFS: 'shared_fs',
+} as const;
 
-export enum CheckpointStorageType {
-  AWS = 'aws',
-  GCS = 'gcs',
-  HDFS = 'hdfs',
-  S3 = 's3',
-  AZURE = 'azure',
-  SharedFS = 'shared_fs',
-}
+export type CheckpointStorageType = ValueOf<typeof CheckpointStorageType>;
 
 interface CheckpointStorage {
   bucket?: string;
@@ -220,22 +195,15 @@ interface CheckpointStorage {
   type?: CheckpointStorageType;
 }
 
-interface DataLayer {
-  containerStoragePath?: string;
-  type: string;
-}
+export const HyperparameterType = {
+  Categorical: 'categorical',
+  Constant: 'const',
+  Double: 'double',
+  Int: 'int',
+  Log: 'log',
+} as const;
 
-export type HpImportance = Record<string, number>;
-export type HpImportanceMetricMap = Record<string, HpImportance>;
-export type HpImportanceMap = { [key in MetricType]: HpImportanceMetricMap };
-
-export enum HyperparameterType {
-  Categorical = 'categorical',
-  Constant = 'const',
-  Double = 'double',
-  Int = 'int',
-  Log = 'log',
-}
+export type HyperparameterType = ValueOf<typeof HyperparameterType>;
 
 export interface HyperparameterBase {
   base?: number;
@@ -267,23 +235,27 @@ export type HyperparametersFlattened = {
   [keys: string]: Hyperparameter;
 };
 
-export enum ExperimentSearcherName {
-  AdaptiveAdvanced = 'adaptive',
-  AdaptiveAsha = 'adaptive_asha',
-  AdaptiveSimple = 'adaptive_simple',
-  Grid = 'grid',
-  Pbt = 'pbt',
-  Random = 'random',
-  Single = 'single',
-}
+export const ExperimentSearcherName = {
+  AdaptiveAdvanced: 'adaptive',
+  AdaptiveAsha: 'adaptive_asha',
+  AdaptiveSimple: 'adaptive_simple',
+  AsyncHalving: 'async_halving',
+  Custom: 'custom',
+  Grid: 'grid',
+  Pbt: 'pbt',
+  Random: 'random',
+  Single: 'single',
+} as const;
+
+export type ExperimentSearcherName = ValueOf<typeof ExperimentSearcherName>;
 
 export interface ExperimentConfig {
   checkpointPolicy: string;
   checkpointStorage?: CheckpointStorage;
-  dataLayer?: DataLayer;
   description?: string;
   hyperparameters: Hyperparameters;
   labels?: string[];
+  maxRestarts: number;
   name: string;
   profiling?: {
     enabled: boolean;
@@ -292,48 +264,73 @@ export interface ExperimentConfig {
     maxSlots?: number;
   };
   searcher: {
+    max_length?: Record<'batches' | 'records' | 'epochs', number>;
     max_trials?: number;
     metric: string;
     name: ExperimentSearcherName;
     smallerIsBetter: boolean;
+    sourceTrialId?: number;
   };
 }
 
 /* Experiment */
 
-export enum ExperimentAction {
-  Activate = 'Activate',
-  Archive = 'Archive',
-  Cancel = 'Cancel',
-  CompareTrials = 'Compare Trials',
-  ContinueTrial = 'Continue Trial',
-  Delete = 'Delete',
-  Fork = 'Fork',
-  Kill = 'Kill',
-  Pause = 'Pause',
-  OpenTensorBoard = 'View in TensorBoard',
-  Unarchive = 'Unarchive',
-  ViewLogs = 'View Logs',
+export const ExperimentAction = {
+  Activate: 'Activate',
+  Archive: 'Archive',
+  Cancel: 'Cancel',
+  CompareTrials: 'Compare Trials',
+  ContinueTrial: 'Continue Trial',
+  Delete: 'Delete',
+  DownloadCode: 'Download Experiment Code',
+  Edit: 'Edit',
+  Fork: 'Fork',
+  HyperparameterSearch: 'Hyperparameter Search',
+  Kill: 'Kill',
+  Move: 'Move',
+  OpenTensorBoard: 'View in TensorBoard',
+  Pause: 'Pause',
+  SwitchPin: 'Switch Pin',
+  Unarchive: 'Unarchive',
+  ViewLogs: 'View Logs',
+} as const;
+
+export type ExperimentAction = ValueOf<typeof ExperimentAction>;
+
+export interface BulkActionResult {
+  successful: number[];
+  failed: Api.V1ExperimentActionResult[];
 }
 
 export interface ExperimentPagination extends WithPagination {
   experiments: ExperimentItem[];
 }
 
-export enum RunState {
-  Active = 'ACTIVE',
-  Paused = 'PAUSED',
-  StoppingCanceled = 'STOPPING_CANCELED',
-  Canceled = 'CANCELED',
-  StoppingCompleted = 'STOPPING_COMPLETED',
-  Completed = 'COMPLETED',
-  StoppingError = 'STOPPING_ERROR',
-  Errored = 'ERROR',
-  Deleted = 'DELETED',
-  Deleting = 'DELETING',
-  DeleteFailed = 'DELETE_FAILED',
-  Unspecified = 'UNSPECIFIED',
+export interface SearchExperimentPagination extends WithPagination {
+  experiments: ExperimentWithTrial[];
 }
+
+export const RunState = {
+  Active: 'ACTIVE',
+  Canceled: 'CANCELED',
+  Completed: 'COMPLETED',
+  Deleted: 'DELETED',
+  DeleteFailed: 'DELETE_FAILED',
+  Deleting: 'DELETING',
+  Error: 'ERROR',
+  Paused: 'PAUSED',
+  Pulling: 'PULLING',
+  Queued: 'QUEUED',
+  Running: 'RUNNING',
+  Starting: 'STARTING',
+  StoppingCanceled: 'STOPPING_CANCELED',
+  StoppingCompleted: 'STOPPING_COMPLETED',
+  StoppingError: 'STOPPING_ERROR',
+  StoppingKilled: 'STOPPING_KILLED',
+  Unspecified: 'UNSPECIFIED',
+} as const;
+
+export type RunState = ValueOf<typeof RunState>;
 
 export interface ValidationHistory {
   endTime: string;
@@ -341,38 +338,36 @@ export interface ValidationHistory {
   validationError?: number;
 }
 
-export enum CheckpointState {
-  Active = 'ACTIVE',
-  Completed = 'COMPLETED',
-  Error = 'ERROR',
-  Deleted = 'DELETED',
-  Unspecified = 'UNSPECIFIED',
-}
+export const CheckpointState = {
+  Active: 'ACTIVE',
+  Completed: 'COMPLETED',
+  Deleted: 'DELETED',
+  Error: 'ERROR',
+  Unspecified: 'UNSPECIFIED',
+} as const;
 
-export enum MetricType {
-  Training = 'training',
-  Validation = 'validation',
-}
+export type CheckpointState = ValueOf<typeof CheckpointState>;
+
+export const MetricType = {
+  Training: 'training',
+  Validation: 'validation',
+} as const;
+
+export type MetricType = ValueOf<typeof MetricType>;
 
 export type MetricTypeParam =
-  'METRIC_TYPE_UNSPECIFIED' | 'METRIC_TYPE_TRAINING' | 'METRIC_TYPE_VALIDATION';
+  | 'METRIC_TYPE_UNSPECIFIED'
+  | 'METRIC_TYPE_TRAINING'
+  | 'METRIC_TYPE_VALIDATION';
 
 export const metricTypeParamMap: Record<string, MetricTypeParam> = {
   [MetricType.Training]: 'METRIC_TYPE_TRAINING',
   [MetricType.Validation]: 'METRIC_TYPE_VALIDATION',
 };
 
-export interface MetricName {
+export interface Metric {
   name: string;
   type: MetricType;
-}
-
-export interface Checkpoint extends EndTimes {
-  resources?: Record<string, number>;
-  state: CheckpointState;
-  trialId: number;
-  uuid?: string;
-  validationMetric?: number;
 }
 
 export interface BaseWorkload extends EndTimes {
@@ -399,55 +394,138 @@ export interface WorkloadGroup {
   validation?: MetricsWorkload;
 }
 
+export const TrialWorkloadFilter = {
+  All: 'All',
+  Checkpoint: 'Has Checkpoint',
+  CheckpointOrValidation: 'Has Checkpoint or Validation',
+  Validation: 'Has Validation',
+} as const;
+
+export type TrialWorkloadFilter = ValueOf<typeof TrialWorkloadFilter>;
+
 // This is to support the steps table in trial details and shouldn't be used
 // elsewhere so we can remove it with a redesign.
 export interface Step extends WorkloadGroup, StartEndTimes {
   batchNum: number;
+  key: string;
   training: MetricsWorkload;
 }
 
-export interface Metrics {
-  numInputs?: number;
-  validationMetrics?: Record<string, number>;
+type MetricStruct = Record<string, number>;
+export interface Metrics extends Api.V1Metrics {
+  // these two fields are present in the protos
+  // as a struct and list of structs, respectively
+  // here, we are being a bit more precise
+  avgMetrics: MetricStruct;
+  batchMetrics?: Array<MetricStruct>;
 }
 
 export type Metadata = Record<RecordKey, string>;
 
-export interface CheckpointDetail extends Checkpoint {
-  batch: number;
+export interface CoreApiGenericCheckpoint {
+  allocationId?: string;
+  experimentConfig?: ExperimentConfig;
   experimentId?: number;
-  metadata?: Metadata;
-  metrics?: Metrics;
+  hparams?: TrialHyperparameters;
+  metadata: Metadata;
+  reportTime?: string;
+  resources: Record<string, number>;
+  searcherMetric?: number;
+  state: CheckpointState;
+  taskId?: string;
+  totalBatches: number;
+  trainingMetrics?: Metrics;
+  trialId?: number;
+  uuid: string;
+  validationMetrics?: Metrics;
 }
+
+export interface CheckpointPagination extends WithPagination {
+  checkpoints: CoreApiGenericCheckpoint[];
+}
+
+export const checkpointAction = {
+  Delete: 'Delete',
+  Register: 'Register',
+} as const;
+
+export type CheckpointAction = ValueOf<typeof checkpointAction>;
 
 export interface TrialPagination extends WithPagination {
-  trials: TrialDetails[];
+  trials: TrialItem[];
 }
 
-type HpValue = Primitive | RawJson
-export type TrialHyperparameters = Record<string, HpValue>
+type HpValue = Primitive | RawJson;
+export type TrialHyperparameters = Record<string, HpValue>;
 
 export interface TrialItem extends StartEndTimes {
+  autoRestarts: number;
   bestAvailableCheckpoint?: CheckpointWorkload;
   bestValidationMetric?: MetricsWorkload;
+  checkpointCount?: number;
   experimentId: number;
   hyperparameters: TrialHyperparameters;
   id: number;
   latestValidationMetric?: MetricsWorkload;
   state: RunState;
   totalBatchesProcessed: number;
+  totalCheckpointSize: number;
 }
 
 export interface TrialDetails extends TrialItem {
   runnerState?: string;
+}
+
+export interface TrialWorkloads extends WithPagination {
   workloads: WorkloadGroup[];
+}
+
+export const Scale = {
+  Linear: 'linear',
+  Log: 'log',
+} as const;
+
+export type Scale = ValueOf<typeof Scale>;
+
+export interface MetricDatapoint {
+  batches: number;
+  epoch?: number;
+  time: Date;
+  value: number;
+}
+
+export interface MetricDatapointTime {
+  time: Date;
+  value: number;
+}
+
+export interface MetricDatapointEpoch {
+  epoch: number;
+  value: number;
+}
+
+export interface MetricContainer {
+  data: MetricDatapoint[];
+  epochs?: MetricDatapointEpoch[];
+  name: string;
+  time?: MetricDatapointTime[];
+  type: MetricType;
+}
+
+export interface TrialSummary extends TrialItem {
+  metrics: MetricContainer[];
 }
 
 export interface ExperimentItem {
   archived: boolean;
+  checkpointCount?: number;
+  checkpointSize?: number;
+  config: ExperimentConfig;
+  configRaw: RawJson; // Readonly unparsed config object.
   description?: string;
   endTime?: string;
   forkedFrom?: number;
+  hyperparameters: HyperparametersFlattened; // Nested HP keys are flattened, eg) foo.bar
   id: number;
   jobId: string;
   jobSummary?: JobSummary;
@@ -456,30 +534,42 @@ export interface ExperimentItem {
   notes?: string;
   numTrials: number;
   progress?: number;
+  projectId: number;
+  projectName?: string;
   resourcePool: string;
+  searcherMetricValue?: number;
   searcherType: string;
   startTime: string;
   state: CompoundRunState;
   trialIds?: number[];
-  userId?: number;
-  username: string;
+  userId: number;
+  workspaceId?: number;
+  workspaceName?: string;
 }
 
-export interface ExperimentBase extends ExperimentItem {
+export interface ExperimentWithTrial {
+  experiment?: ExperimentItem;
+  bestTrial?: TrialItem;
+}
+
+export interface ProjectExperiment extends ExperimentItem {
+  parentArchived: boolean;
+  projectName: string;
+  projectOwnerId: number;
+  workspaceId: number;
+  workspaceName: string;
+}
+
+export interface CreateExperimentResponse {
+  experiment: ExperimentBase;
+  warnings?: V1LaunchWarning[];
+}
+
+export interface ExperimentBase extends ProjectExperiment {
   config: ExperimentConfig;
   configRaw: RawJson; // Readonly unparsed config object.
   hyperparameters: HyperparametersFlattened; // nested hp keys are flattened, eg) foo.bar
-}
-// TODO we should be able to remove ExperimentOld but leaving this off.
-export interface ExperimentOld extends ExperimentBase {
-  url: string;
-}
-
-export enum ExperimentVisualizationType {
-  HpParallelCoordinates = 'hp-parallel-coordinates',
-  HpHeatMap = 'hp-heat-map',
-  HpScatterPlots = 'hp-scatter-plots',
-  LearningCurve = 'learning-curve',
+  originalConfig: string;
 }
 
 interface Allocation {
@@ -493,6 +583,13 @@ export interface TaskItem {
   taskId: string;
 }
 
+export interface TaskCounts {
+  commands: number;
+  notebooks: number;
+  shells: number;
+  tensorboards: number;
+}
+
 export interface ModelItem {
   archived?: boolean;
   creationTime: string;
@@ -504,11 +601,12 @@ export interface ModelItem {
   name: string;
   notes?: string;
   numVersions: number;
-  username: string;
+  userId: number;
+  workspaceId: number;
 }
 
 export interface ModelVersion {
-  checkpoint: CheckpointDetail;
+  checkpoint: CoreApiGenericCheckpoint;
   comment?: string;
   creationTime: string;
   id: number;
@@ -518,7 +616,7 @@ export interface ModelVersion {
   model: ModelItem;
   name?: string;
   notes?: string;
-  username: string;
+  userId: number;
   version: number;
 }
 
@@ -528,7 +626,7 @@ export interface ModelPagination extends WithPagination {
 
 export interface ModelVersions extends WithPagination {
   model: ModelItem;
-  modelVersions: ModelVersion[]
+  modelVersions: ModelVersion[];
 }
 
 export interface Task {
@@ -541,25 +639,33 @@ export interface Task {
 }
 
 // CompoundRunState adds more information about a job's state to RunState.
-export type CompoundRunState = RunState | JobState
+export type CompoundRunState = RunState | JobState;
 
 export interface ExperimentTask extends Task {
   archived: boolean;
+  parentArchived: boolean;
   progress?: number;
+  projectId: number;
   resourcePool: string;
   state: CompoundRunState;
   userId?: number;
   username: string;
+  workspaceId: number;
+}
+
+export interface CommandResponse {
+  command: CommandTask;
+  warnings?: V1LaunchWarning[];
 }
 
 export interface CommandTask extends Task {
-  displayName: string;
+  displayName?: string;
   misc?: CommandMisc;
   resourcePool: string;
   state: CommandState;
   type: CommandType;
-  userId?: number;
-  username: string;
+  userId: number;
+  workspaceId: number;
 }
 
 export type RecentEvent = {
@@ -576,18 +682,22 @@ export type RecentTask = AnyTask & RecentEvent;
 export type RecentCommandTask = CommandTask & RecentEvent;
 export type RecentExperimentTask = ExperimentTask & RecentEvent;
 
-export enum TaskType {
-  Command = 'command',
-  Experiment = 'experiment',
-  JupyterLab = 'jupyter-lab',
-  Shell = 'shell',
-  TensorBoard = 'tensor-board',
-}
+export const TaskType = {
+  Command: 'command',
+  Experiment: 'experiment',
+  JupyterLab: 'jupyter-lab',
+  Shell: 'shell',
+  TensorBoard: 'tensor-board',
+} as const;
 
-export enum ArchiveFilter {
-  Archived = 'archived',
-  Unarchived = 'unarchived',
-}
+export type TaskType = ValueOf<typeof TaskType>;
+
+export const ArchiveFilter = {
+  Archived: 'archived',
+  Unarchived: 'unarchived',
+} as const;
+
+export type ArchiveFilter = ValueOf<typeof ArchiveFilter>;
 
 export interface ExperimentFilters {
   archived?: ArchiveFilter;
@@ -596,7 +706,7 @@ export interface ExperimentFilters {
   users?: string[];
 }
 
-export interface TrialFilters {
+export interface ExperimentTrialFilters {
   states?: string[];
 }
 
@@ -605,33 +715,35 @@ export interface TaskFilters<T extends CommandType | TaskType = TaskType> {
   states?: string[];
   types?: T[];
   users?: string[];
+  workspaces?: string[];
 }
 
-export type CommonProps = {
-  children?: React.ReactNode;
-  className?: string;
-  title?: string;
-};
+export const LogLevel = {
+  Critical: 'critical',
+  Debug: 'debug',
+  Error: 'error',
+  Info: 'info',
+  None: 'none',
+  Trace: 'trace',
+  Warning: 'warning',
+} as const;
 
-export enum LogLevel {
-  Critical = 'critical',
-  Debug = 'debug',
-  Error = 'error',
-  Info = 'info',
-  None = 'none',
-  Trace = 'trace',
-  Warning = 'warning',
-}
+export type LogLevel = ValueOf<typeof LogLevel>;
 
-export enum LogLevelFromApi {
-  Unspecified = 'LOG_LEVEL_UNSPECIFIED',
-  Trace = 'LOG_LEVEL_TRACE',
-  Debug = 'LOG_LEVEL_DEBUG',
-  Info = 'LOG_LEVEL_INFO',
-  Warning = 'LOG_LEVEL_WARNING',
-  Error = 'LOG_LEVEL_ERROR',
-  Critical = 'LOG_LEVEL_CRITICAL',
-}
+// Disable `sort-keys` to sort LogLevel by higher severity levels
+export const LogLevelFromApi = {
+  Critical: 'LOG_LEVEL_CRITICAL',
+  Error: 'LOG_LEVEL_ERROR',
+  Warning: 'LOG_LEVEL_WARNING',
+  // eslint-disable-next-line sort-keys-fix/sort-keys-fix
+  Info: 'LOG_LEVEL_INFO',
+  // eslint-disable-next-line sort-keys-fix/sort-keys-fix
+  Debug: 'LOG_LEVEL_DEBUG',
+  Trace: 'LOG_LEVEL_TRACE',
+  Unspecified: 'LOG_LEVEL_UNSPECIFIED',
+} as const;
+
+export type LogLevelFromApi = ValueOf<typeof LogLevelFromApi>;
 
 export interface Log {
   id: number | string;
@@ -653,88 +765,8 @@ export interface Template {
   name: string;
 }
 
-export interface ResourcePool {
-  accelerator?: string;
-  auxContainerCapacity: number;
-  auxContainerCapacityPerAgent: number;
-  auxContainersRunning: number;
-  defaultAuxPool: boolean;
-  defaultComputePool?: boolean;
-  description: string;
-  details: RPDetails;
-  imageId: string;
-  instanceType: string;
-  location: string;
-  maxAgents: number;
-  minAgents: number;
-  name: string;
-  numAgents: number;
-  preemptible: boolean;
-  schedulerFittingPolicy: Api.V1FittingPolicy;
-  schedulerType: Api.V1SchedulerType;
+export interface ResourcePool extends Omit<Api.V1ResourcePool, 'slotType'> {
   slotType: ResourceType;
-  slotsAvailable: number;
-  slotsPerAgent?: number;
-  slotsUsed: number;
-  stats?: Api.V1QueueStats;
-  type: Api.V1ResourcePoolType;
-}
-
-export interface RPDetails {
-  aws?: Partial<Aws>;
-  gcp?: Partial<Gcp>;
-  priorityScheduler?: PriorityScheduler;
-}
-
-export interface Aws {
-  customTags?: CustomTag[];
-  iamInstanceProfileArn: string;
-  imageId: string;
-  instanceName: string;
-  instanceType: string;
-  logGroup: string;
-  logStream: string;
-  publicIp: boolean;
-  region: string;
-  rootVolumeSize: number;
-  securityGroupId: string;
-  spotEnabled: boolean;
-  spotMaxPrice: string;
-  sshKeyName: string;
-  subnetId: string;
-  tagKey: string;
-  tagValue: string;
-}
-
-interface CustomTag {
-  key: string;
-  value: string;
-}
-
-export interface Gcp {
-  bootDiskSize: number;
-  bootDiskSourceImage: string;
-  externalIp: boolean;
-  gpuNum: number;
-  gpuType: string;
-  labelKey: string;
-  labelValue: string;
-  machineType: string;
-  namePrefix: string;
-  network: string;
-  networkTags: string[];
-  operationTimeoutPeriod: number;
-  preemptible: boolean;
-  project: string;
-  serviceAccountEmail: string;
-  serviceAccountScopes: string[];
-  subnetwork: string;
-  zone: string;
-}
-
-export interface PriorityScheduler {
-  defaultPriority: number;
-  preemption: boolean;
 }
 
 /* Jobs */
@@ -742,18 +774,146 @@ export interface PriorityScheduler {
 export interface Job extends Api.V1Job {
   summary: Api.V1JobSummary;
 }
-export const JobType = Api.Determinedjobv1Type;
-export type JobType = Api.Determinedjobv1Type;
-export const JobState = Api.Determinedjobv1State;
-export type JobState = Api.Determinedjobv1State;
+export const JobType = Api.Jobv1Type;
+export type JobType = Api.Jobv1Type;
+export const JobState = Api.Jobv1State;
+export type JobState = Api.Jobv1State;
 export type JobSummary = Api.V1JobSummary;
 export type RPStats = Api.V1RPQueueStat;
 
-export enum JobAction {
-  Cancel = 'Cancel',
-  Kill = 'Kill',
-  ManageJob = 'Manage Job',
-  MoveToTop = 'Move To Top',
-}
+export const JobAction = {
+  Cancel: 'Cancel',
+  Kill: 'Kill',
+  ManageJob: 'Manage Job',
+  MoveToTop: 'Move To Top',
+  ViewLog: 'View Logs',
+} as const;
+
+export type JobAction = ValueOf<typeof JobAction>;
 
 /* End of Jobs */
+
+export interface Workspace {
+  agentUserGroup?: V1AgentUserGroup;
+  archived: boolean;
+  // eslint-disable-next-line  @typescript-eslint/no-explicit-any
+  checkpointStorageConfig?: any;
+  id: number;
+  immutable: boolean;
+  name: string;
+  numExperiments: number;
+  numProjects: number;
+  pinned: boolean;
+  pinnedAt?: Date;
+  state: WorkspaceState;
+  userId: number;
+}
+
+export interface WorkspacePagination extends WithPagination {
+  workspaces: Workspace[];
+}
+
+export interface DeletionStatus {
+  completed: boolean;
+}
+
+export const WorkspaceState = {
+  Deleted: 'DELETED',
+  DeleteFailed: 'DELETE_FAILED',
+  Deleting: 'DELETING',
+  Unspecified: 'UNSPECIFIED',
+} as const;
+
+export type WorkspaceState = ValueOf<typeof WorkspaceState>;
+
+export interface Note {
+  contents: string;
+  name: string;
+}
+export interface Project {
+  archived: boolean;
+  description?: string;
+  id: number;
+  immutable: boolean;
+  lastExperimentStartedAt?: Date;
+  name: string;
+  notes: Note[];
+  numActiveExperiments: number;
+  numExperiments: number;
+  state: WorkspaceState;
+  userId: number;
+  workspaceId: number;
+  workspaceName: string;
+}
+
+export interface ProjectPagination extends WithPagination {
+  projects: Project[];
+}
+
+export interface Permission {
+  id: Api.V1PermissionType;
+  scopeCluster: boolean;
+  scopeWorkspace: boolean;
+}
+
+export interface UserRole {
+  fromUser?: boolean;
+  id: number;
+  name: string;
+  permissions: Permission[];
+  scopeCluster?: boolean;
+}
+
+export interface UserAssignment {
+  roleId: number;
+  scopeCluster: boolean;
+  workspaces?: number | number[];
+}
+
+export interface PermissionsSummary {
+  assignments: UserAssignment[];
+  roles: UserRole[];
+}
+
+export interface ExperimentPermissionsArgs {
+  experiment: ProjectExperiment;
+}
+
+export interface PermissionWorkspace {
+  id: number;
+  userId?: number;
+}
+
+export interface WorkspacePermissionsArgs {
+  workspace?: PermissionWorkspace;
+}
+
+export interface WorkspaceMembersResponse {
+  assignments: Api.V1RoleWithAssignments[];
+  groups: Api.V1Group[];
+  usersAssignedDirectly: User[];
+}
+
+export interface Webhook {
+  id: number;
+  triggers: V1Trigger[];
+  url: string;
+  webhookType: string;
+}
+
+export type UserOrGroup = User | V1Group;
+
+export type GroupWithRoleInfo = {
+  groupId: Api.V1Group['groupId'];
+  groupName: Api.V1Group['name'];
+  roleAssignment: Api.V1RoleAssignment;
+};
+
+export type UserWithRoleInfo = {
+  displayName: User['displayName'];
+  roleAssignment: Api.V1RoleAssignment;
+  userId: User['id'];
+  username: User['username'];
+};
+
+export type UserOrGroupWithRoleInfo = UserWithRoleInfo | GroupWithRoleInfo;

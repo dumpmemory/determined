@@ -1,12 +1,13 @@
 import os
 import shutil
-from typing import Generator, cast
+from typing import Generator
 
 import attrdict
 import git
 import pytest
 import torch
 
+import determined as det
 import determined.pytorch as det_torch
 import model_hub.mmdetection as mh_mmdet
 import model_hub.mmdetection._callbacks as callbacks
@@ -26,6 +27,8 @@ def cleanup_dir(directory: str) -> None:
 @pytest.fixture(scope="module")
 def mmdet_config_dir() -> Generator[str, None, None]:
     git.Repo.clone_from("https://github.com/open-mmlab/mmdetection", "/tmp/mmdetection")
+    repo = git.Repo("/tmp/mmdetection")
+    repo.git.checkout("tags/v2.28.2")
     mmdet_config_dir = "/tmp/mmdetection/configs"
     os.environ["MMDETECTION_CONFIG_DIR"] = mmdet_config_dir
     yield mmdet_config_dir
@@ -39,8 +42,30 @@ def context(mmdet_config_dir: str) -> det_torch.PyTorchTrialContext:
     config_file = "./tests/fixtures/maskrcnn.yaml"
     with open(config_file, "rb") as f:
         config = util.safe_load_yaml_with_exceptions(f)
-    context = det_torch.PyTorchTrialContext.from_config(config)
-    context = cast(det_torch.PyTorchTrialContext, context)
+
+    core_context, env = det._make_local_execution_env(
+        managed_training=False,
+        test_mode=False,
+        config=config,
+        checkpoint_dir="/tmp",
+        limit_gpus=1,
+    )
+
+    context = det_torch.PyTorchTrialContext(
+        core_context=core_context,
+        trial_seed=env.trial_seed,
+        hparams=config["hyperparameters"],
+        slots_per_trial=1,
+        num_gpus=1,
+        exp_conf=config,
+        aggregation_frequency=1,
+        steps_completed=0,
+        managed_training=False,
+        debug_enabled=False,
+    )
+    context._set_default_gradient_compression(False)
+    context._set_default_average_aggregated_gradients(True)
+
     return context
 
 

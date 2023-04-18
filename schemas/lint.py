@@ -69,7 +69,6 @@ SUPPORTED_KEYWORDS_BY_TYPE = {
         "allOf",
         "optionalRef",
         "$comment",
-        "conditional",
     },
     "array": {"items", "default", "unionKey", "minLength", "checks", "$comment"},
     "string": {"pattern", "default", "unionKey", "checks", "$comment"},
@@ -187,15 +186,10 @@ def check_default_locations(schema: dict, path: str, ctx: LintContext) -> Errors
                         "default is the literal 'null' string, probable typo",
                     )
                 )
-            elif (
-                not re.match("^<[^>]*>\\.[^.]*$", subpath)
-                and sub["default"] is not None
-            ):
+            elif not re.match("^<[^>]*>\\.[^.]*$", subpath) and sub["default"] is not None:
                 # This is pretty valid in json-schema normally, but it makes reading defaults
                 # out of json-schema (which we need in multiple languages) much harder.
-                errors.append(
-                    (subpath + ".default", "non-null default is defined on a subobject")
-                )
+                errors.append((subpath + ".default", "non-null default is defined on a subobject"))
 
     return errors
 
@@ -279,23 +273,20 @@ def check_union(schema: dict, path: str, ctx: LintContext) -> Errors:
 
 
 @register_linter
-def check_conditional(schema: dict, path: str, ctx: LintContext) -> Errors:
-    if "conditional" not in schema:
+def check_if_then_else(schema: dict, path: str, ctx: LintContext) -> Errors:
+    if "if" not in schema and "then" not in schema and "else" not in schema:
         return []
 
-    conditional = schema["conditional"]
-    subpath = path + ".conditional"
+    if "if" not in schema:
+        return [(path, "found else or then clause without if clause")]
 
-    errors = []
+    if "then" not in schema and "else" in schema:
+        return [(path, "found if-else without then clause... don't be confusing")]
 
-    if "when" not in conditional and "unless" not in conditional:
-        errors.append((subpath, "has no when clause or until clause"))
-    if "when" in conditional and "unless" in conditional:
-        errors.append((subpath, "has both a when clause and an until clause"))
-    if "enforce" not in conditional:
-        errors.append((subpath, "has no enforce clause"))
+    if "then" not in schema:
+        return [(path, "found if clause with no then clause")]
 
-    return errors
+    return []
 
 
 @register_linter
@@ -427,18 +418,14 @@ def iter_schema(
     # Apply linters to this structural element.
     if ctx is None:
         assert filepath, "filepath must be provided when ctx is None"
-        ctx = LintContext(
-            schema, path, toplevel=True, in_checks=in_checks, filepath=filepath
-        )
+        ctx = LintContext(schema, path, toplevel=True, in_checks=in_checks, filepath=filepath)
     else:
         ctx = LintContext(schema, path, False, ctx.in_checks, ctx.filepath)
     for linter in linters:
         try:
             errors += linter(schema, path, ctx)
         except Exception as e:
-            raise ValueError(
-                f"error processing schema:\n{json.dumps(schema, indent=4)}"
-            ) from e
+            raise ValueError(f"error processing schema:\n{json.dumps(schema, indent=4)}") from e
 
     # Descend into child dicts of structural elements.
     for kw in ["properties"]:

@@ -7,10 +7,6 @@ If you encounter an issue or would like to request a new feature, please create
 also join the [Slack](https://join.slack.com/t/determined-community/shared_invite/zt-cnj7802v-KcVbaUrIzQOwmkmY7gP0Ew)
 to get support and talk with other users and developers in real-time.
 
-## Project Roadmap
-
-https://github.com/determined-ai/determined/wiki/Project-Roadmap
-
 ## Contributing Changes
 
 We welcome outside contributions. If you'd like to make a contribution, please:
@@ -30,7 +26,7 @@ We welcome outside contributions. If you'd like to make a contribution, please:
 
 1. Submit a pull request. Someone from the Determined team will review the
    request and provide feedback. Once we agree that the code is in good shape,
-   it will be merged it into master branch.
+   it will be merged into the master branch.
 
 ## Installation from Source
 
@@ -42,31 +38,88 @@ recommended for production deployments). Determined has been tested with Ubuntu
 recommended; on AWS, a good AMI to use is a recent version of "Deep Learning
 Base AMI (Ubuntu)".
 
-Start by cloning the Determined repo:
+Start by cloning the Determined repository:
 
 ```sh
-git clone git@github.com:determined-ai/determined.git
+git clone --recurse-submodules https://github.com/determined-ai/determined.git
 ```
 
 #### Prerequisites
 
-- Go (>= 1.18)
-- Python (>= 3.6, <= 3.9)
-- Node (>= 14.16)
-- NPM (>= 6.12)
+- Go (>= 1.20)
+- Python (>= 3.6, <= 3.9), including:
+  - python3-venv
+  - python3-wheel
+  - python3-dev
+- Node (>= 16.13, < 20)
+- NPM (>= 8)
 - Docker (>= 19.03)
 - Helm (>= 3.0.0)
-- Protoc (>= 3.0)
-- Java (>= 7)
+- protobuf-compiler (>= 3.15)
 - cURL (>= 7)
 - jq (>= 1.6)
 - socat (>= 1.7)
 
+If you are installing prerequisites from your Linux distribution's package
+repository, ensure that they meet the version requirements above, particularly
+Python and Node.
+
+#### Install Prerequisites with Homebrew for Linux and macOS
+
+Because the versions of prerequisites from Linux distribution package
+repositories can vary widely, we recommend installing the Determined build
+prerequisites with [Homebrew](https://brew.sh/).
+
+The following instructions are also applicable for building Determined on macOS.
+
+Install a compiler and build tools:
+
+- macOS: Install the [Command Line Tools for Xcode](https://developer.apple.com/) from Apple
+- Debian and Ubuntu: `sudo apt install build-essential`
+- Red Hat, CentOS, and Fedora: `sudo yum install gcc make perl-devel`
+- SUSE and openSUSE: `sudo zypper install -t pattern devel_basis`
+
+Install Homebrew:
+
+```sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Add Homebrew to your PATH:
+
+```sh
+echo 'eval "$($HOME/.linuxbrew/bin/brew shellenv)"' >> $HOME/.profile
+eval "$($HOME/.linuxbrew/bin/brew shellenv)"
+```
+
+Install the Determined prerequisites:
+
+```sh
+brew install go@1.20 python@3.9 node@16 protobuf docker helm curl jq socat
+```
+
+Add Python and Node to your PATH:
+
+```sh
+echo 'export PATH="$HOME/.linuxbrew/opt/python@3.9/bin:$HOME/.linuxbrew/opt/node@16/bin:$PATH"' >> $HOME/.profile
+source $HOME/.profile
+```
+
+On Red Hat and CentOS 8 and Ubuntu 16.04, add the compiled GCC 11 libraries to your LD_LIBRARY_PATH:
+
+```sh
+echo 'export LD_LIBRARY_PATH=$HOME/.linuxbrew/Cellar/gcc/$(ls $HOME/.linuxbrew/Cellar/gcc/)/lib/gcc/lib64/' >> $HOME/.profile
+source $HOME/.profile
+```
+
 ### Building Determined
 
 ```sh
-python3 -m venv ~/.virtualenvs/determined
-. ~/.virtualenvs/determined/bin/activate
+cd determined
+python3 -m venv $HOME/.virtualenvs/determined
+. $HOME/.virtualenvs/determined/bin/activate
+$HOME/.virtualenvs/determined/bin/python3.7 -m pip install --upgrade pip
+export PATH=$PATH:$HOME/go/bin
 make all
 ```
 
@@ -88,7 +141,7 @@ of master and one or more local agents.
 ### Accessing Determined
 
 After following either set of instructions above, the WebUI will be available at
-http://localhost:8080. You can also use our command-line tool, `det`, to
+`http://localhost:8080`. You can also use our command-line tool, `det`, to
 interact with Determined. For example, `det slot list` should print out a line
 for each GPU on your machine, if you have any, or a line for your CPU, if not.
 For more information, see [the reference
@@ -173,17 +226,17 @@ If this command displays one or more GPUs, the Determined agent should
 automatically detect the system's GPUs and make them available for
 running experiments.
 
-
 ### Secrets
 
 To prevent cloud credentials from accidentally being exposed on GitHub, install
 and configure the [git-secrets](https://github.com/awslabs/git-secrets) tool.
-This sets up git hooks to prevent pushing code that contain secrets (based on regex).
+This sets up git hooks to prevent pushing code that contains secrets (based on regex).
 
 For Mac, the tool can be installed via `brew install git-secrets`. For other
 OSes see installation instructions [here](https://github.com/awslabs/git-secrets#installing-git-secrets).
 
-Then navigate to the repo, set up the git hooks, and define the regexes:
+Then navigate to the repository, set up the git hooks, and define the regexes:
+
 ```shell
 cd /path/to/my/repository
 
@@ -195,4 +248,3 @@ git secrets --register-aws
 # Add GCP regex
 git secrets --add '"private_key":\s"-----BEGIN\sPRIVATE\sKEY-----'
 ```
-

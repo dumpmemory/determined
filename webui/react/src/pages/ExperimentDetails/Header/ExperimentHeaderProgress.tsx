@@ -1,7 +1,9 @@
-import { Progress, Tooltip } from 'antd';
+import { Progress } from 'antd';
 import React from 'react';
 
-import { ExperimentBase } from 'types';
+import Tooltip from 'components/kit/Tooltip';
+import { getStateColorCssVar } from 'themes';
+import { ExperimentBase, JobState, RunState } from 'types';
 
 import css from './ExperimentHeaderProgress.module.scss';
 
@@ -10,19 +12,22 @@ interface Props {
 }
 
 const ExperimentHeaderProgress: React.FC<Props> = ({ experiment }: Props) => {
-  if (typeof experiment.progress === 'undefined') {
-    return null;
-  }
+  const progressPercent = (experiment.progress ?? 0) * 100;
+  const status =
+    experiment.state === JobState.SCHEDULED ||
+    experiment.state === JobState.SCHEDULEDBACKFILLED ||
+    experiment.state === RunState.Active
+      ? 'active'
+      : undefined;
 
-  const progressPercent = experiment.progress * 100;
-
-  return (
+  return experiment.progress === undefined ? null : (
     <Tooltip title={progressPercent.toFixed(0) + '%'}>
       <Progress
         className={css.base}
         percent={progressPercent}
         showInfo={false}
-        status="active"
+        status={status}
+        strokeColor={getStateColorCssVar(experiment.state)}
       />
     </Tooltip>
   );

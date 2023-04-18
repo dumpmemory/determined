@@ -26,7 +26,7 @@ func TestItem(t *testing.T) {
 		Path:    "/test",
 		Type:    '0',
 		Content: "b3JpZ2luYWw=",
-		Mode:    0644,
+		Mode:    0o644,
 		Mtime:   1501632000,
 		UID:     0,
 		GID:     0,
@@ -35,6 +35,8 @@ func TestItem(t *testing.T) {
 	fileIn := RootItem("/test", []byte("original"), intermediateExpected.Mode, tar.TypeReg)
 	marshaled, err := json.Marshal(fileIn)
 	assert.NilError(t, err)
+	assert.Equal(t, true, fileIn.FileMode.IsRegular())
+	assert.Equal(t, false, fileIn.FileMode.IsDir())
 
 	// Confirm that we properly marshal into the intermediate types we expect, e.g., Content is
 	// base64-encoded, ModifiedTime is in epoch seconds.
@@ -94,7 +96,7 @@ func TestRoundtrip(t *testing.T) {
 		Item{
 			Path:     "dir",
 			Type:     tar.TypeDir,
-			FileMode: os.FileMode(0644),
+			FileMode: os.FileMode(0o644),
 			ModifiedTime: UnixTime{
 				Time: time.Unix(0, 0),
 			},
@@ -104,7 +106,7 @@ func TestRoundtrip(t *testing.T) {
 		Item{
 			Path:     "dir/b.txt",
 			Type:     tar.TypeReg,
-			FileMode: os.FileMode(0644),
+			FileMode: os.FileMode(0o644),
 			Content:  []byte("this is b"),
 			ModifiedTime: UnixTime{
 				Time: time.Unix(0, 0),
@@ -115,8 +117,19 @@ func TestRoundtrip(t *testing.T) {
 		Item{
 			Path:     "a.txt",
 			Type:     tar.TypeReg,
-			FileMode: os.FileMode(0644),
+			FileMode: os.FileMode(0o644),
 			Content:  []byte("this is a"),
+			ModifiedTime: UnixTime{
+				Time: time.Unix(0, 0),
+			},
+			UserID:  0,
+			GroupID: 0,
+		},
+		Item{
+			Path:     "link",
+			Type:     tar.TypeSymlink,
+			FileMode: os.FileMode(0o644),
+			Content:  []byte("targetoflink"),
 			ModifiedTime: UnixTime{
 				Time: time.Unix(0, 0),
 			},
@@ -125,6 +138,12 @@ func TestRoundtrip(t *testing.T) {
 		},
 	}
 
+	assert.Equal(t, true, archive.ContainsPath("dir/b.txt"))
+	assert.Equal(t, true, archive.ContainsFilePrefix("dir"))
+	assert.Equal(t, false, archive.ContainsFilePrefix("not-present"))
+	assert.Equal(t, false, archive.ContainsPath("dir/a.txt"))
+	assert.Equal(t, true, archive.ContainsPath("link"))
+
 	bytes, err := ToTarGz(archive)
 	assert.NilError(t, err)
 
@@ -132,4 +151,25 @@ func TestRoundtrip(t *testing.T) {
 	assert.NilError(t, err)
 
 	assert.DeepEqual(t, archive, roundTripArchive)
+}
+
+func TestPropertyMethods(t *testing.T) {
+	dirItem := Item{
+		Path: "dir/file",
+		Type: tar.TypeDir,
+	}
+	assert.Equal(t, "dir", dirItem.DirName())
+	assert.Equal(t, "file", dirItem.BaseName())
+	assert.Equal(t, true, dirItem.IsDir())
+	assert.Equal(t, false, dirItem.IsSymLink())
+
+	linkItem := Item{
+		Path:    "dir/link",
+		Type:    tar.TypeSymlink,
+		Content: byteString("target"),
+	}
+	assert.Equal(t, "dir", linkItem.DirName())
+	assert.Equal(t, "link", linkItem.BaseName())
+	assert.Equal(t, false, linkItem.IsDir())
+	assert.Equal(t, true, linkItem.IsSymLink())
 }

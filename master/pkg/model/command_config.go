@@ -2,6 +2,7 @@ package model
 
 import (
 	"github.com/determined-ai/determined/master/pkg/check"
+	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 )
 
 const (
@@ -29,6 +30,8 @@ func DefaultConfig(taskContainerDefaults *TaskContainerDefaultsConfig) CommandCo
 	if taskContainerDefaults != nil {
 		out.WorkDir = taskContainerDefaults.WorkDir
 		out.BindMounts = taskContainerDefaults.BindMounts
+		out.Pbs = taskContainerDefaults.Pbs
+		out.Slurm = taskContainerDefaults.Slurm
 	}
 
 	return out
@@ -37,16 +40,18 @@ func DefaultConfig(taskContainerDefaults *TaskContainerDefaultsConfig) CommandCo
 // CommandConfig holds the necessary configurations to launch a command task in
 // the cluster.
 type CommandConfig struct {
-	Description      string           `json:"description"`
-	BindMounts       BindMountsConfig `json:"bind_mounts"`
-	Environment      Environment      `json:"environment"`
-	Resources        ResourcesConfig  `json:"resources"`
-	Entrypoint       []string         `json:"entrypoint"`
-	TensorBoardArgs  []string         `json:"tensorboard_args,omitempty"`
-	IdleTimeout      *Duration        `json:"idle_timeout"`
-	NotebookIdleType string           `json:"notebook_idle_type"`
-	WorkDir          *string          `json:"work_dir"`
-	Debug            bool             `json:"debug"`
+	Description      string              `json:"description"`
+	BindMounts       BindMountsConfig    `json:"bind_mounts"`
+	Environment      Environment         `json:"environment"`
+	Resources        ResourcesConfig     `json:"resources"`
+	Entrypoint       []string            `json:"entrypoint"`
+	TensorBoardArgs  []string            `json:"tensorboard_args,omitempty"`
+	IdleTimeout      *Duration           `json:"idle_timeout"`
+	NotebookIdleType string              `json:"notebook_idle_type"`
+	WorkDir          *string             `json:"work_dir"`
+	Debug            bool                `json:"debug"`
+	Pbs              expconf.PbsConfig   `json:"pbs,omitempty"`
+	Slurm            expconf.SlurmConfig `json:"slurm,omitempty"`
 }
 
 // Validate implements the check.Validatable interface.

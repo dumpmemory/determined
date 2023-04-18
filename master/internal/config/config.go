@@ -1,11 +1,15 @@
 package config
 
 import (
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/pkg/errors"
 
@@ -23,12 +27,16 @@ var (
 	DefaultSegmentWebUIKey  = ""
 )
 
-var once sync.Once
-var masterConfig *Config
+var (
+	once         sync.Once
+	masterConfig *Config
+)
 
 // KubernetesDefaultPriority is the default K8 resource manager priority.
-const KubernetesDefaultPriority = 50
-const sslModeDisable = "disable"
+const (
+	KubernetesDefaultPriority = 50
+	sslModeDisable            = "disable"
+)
 
 type (
 	// ExperimentConfigPatch is the updatedble fields for patching an experiment.
@@ -45,12 +53,9 @@ func DefaultDBConfig() *DBConfig {
 	}
 }
 
-// HPImportanceConfig is the configuration in the master for hyperparameter importance.
-type HPImportanceConfig struct {
-	WorkersLimit   uint `json:"workers_limit"`
-	QueueLimit     uint `json:"queue_limit"`
-	CoresPerWorker uint `json:"cores_per_worker"`
-	MaxTrees       uint `json:"max_trees"`
+// CacheConfig is the configuration for file cache.
+type CacheConfig struct {
+	CacheDir string `json:"cache_dir"`
 }
 
 // DBConfig hosts configuration fields of the database.
@@ -63,6 +68,12 @@ type DBConfig struct {
 	Name        string `json:"name"`
 	SSLMode     string `json:"ssl_mode"`
 	SSLRootCert string `json:"ssl_root_cert"`
+}
+
+// WebhooksConfig hosts configuration fields for webhook functionality.
+type WebhooksConfig struct {
+	BaseURL    string `json:"base_url"`
+	SigningKey string `json:"signing_key"`
 }
 
 // DefaultConfig returns the default configuration of the master.
@@ -83,29 +94,30 @@ func DefaultConfig() *Config {
 			SSH: SSHConfig{
 				RsaKeySize: 1024,
 			},
+			AuthZ: *DefaultAuthZConfig(),
 		},
 		// If left unspecified, the port is later filled in with 8080 (no TLS) or 8443 (TLS).
-		Port:        0,
-		HarnessPath: "/opt/determined",
-		Root:        "/usr/share/determined/master",
+		Port: 0,
+		Root: "/usr/share/determined/master",
 		Telemetry: config.TelemetryConfig{
-			Enabled:          true,
-			OtelEnabled:      false,
-			SegmentMasterKey: DefaultSegmentMasterKey,
-			SegmentWebUIKey:  DefaultSegmentWebUIKey,
+			Enabled:                  true,
+			OtelEnabled:              false,
+			OtelExportedOtlpEndpoint: "localhost:4317",
+			SegmentMasterKey:         DefaultSegmentMasterKey,
+			SegmentWebUIKey:          DefaultSegmentWebUIKey,
 		},
 		EnableCors:  false,
+		LaunchError: true,
 		ClusterName: "",
 		Logging: model.LoggingConfig{
 			DefaultLoggingConfig: &model.DefaultLoggingConfig{},
 		},
-		HPImportance: HPImportanceConfig{
-			WorkersLimit:   2,
-			QueueLimit:     16,
-			CoresPerWorker: 1,
-			MaxTrees:       100,
+		// For developers this should be a writable directory for caching files.
+		Cache: CacheConfig{
+			CacheDir: "/var/cache/determined",
 		},
-		ResourceConfig: DefaultResourceConfig(),
+		FeatureSwitches: []string{},
+		ResourceConfig:  *DefaultResourceConfig(),
 	}
 }
 
@@ -118,19 +130,22 @@ type Config struct {
 	Log                   logger.Config                     `json:"log"`
 	DB                    DBConfig                          `json:"db"`
 	TensorBoardTimeout    int                               `json:"tensorboard_timeout"`
+	NotebookTimeout       *int                              `json:"notebook_timeout"`
 	Security              SecurityConfig                    `json:"security"`
 	CheckpointStorage     expconf.CheckpointStorageConfig   `json:"checkpoint_storage"`
 	TaskContainerDefaults model.TaskContainerDefaultsConfig `json:"task_container_defaults"`
 	Port                  int                               `json:"port"`
-	HarnessPath           string                            `json:"harness_path"`
 	Root                  string                            `json:"root"`
 	Telemetry             config.TelemetryConfig            `json:"telemetry"`
 	EnableCors            bool                              `json:"enable_cors"`
+	LaunchError           bool                              `json:"launch_error"`
 	ClusterName           string                            `json:"cluster_name"`
 	Logging               model.LoggingConfig               `json:"logging"`
-	HPImportance          HPImportanceConfig                `json:"hyperparameter_importance"`
 	Observability         ObservabilityConfig               `json:"observability"`
-	*ResourceConfig
+	Cache                 CacheConfig                       `json:"cache"`
+	Webhooks              WebhooksConfig                    `json:"webhooks"`
+	FeatureSwitches       []string                          `json:"feature_switches"`
+	ResourceConfig
 
 	// Internal contains "hidden" useful debugging configurations.
 	InternalConfig InternalConfig `json:"__internal"`
@@ -170,11 +185,21 @@ func (c Config) Printable() ([]byte, error) {
 	}
 	if c.TaskContainerDefaults.RegistryAuth != nil {
 		if c.TaskContainerDefaults.RegistryAuth.Password != "" {
-			c.TaskContainerDefaults.RegistryAuth.Password = hiddenValue
+			// RegistryAuth is a pointer, so if we need to hide the password we need to be very
+			// careful to replace the pointer, not the contents behind the pointer.
+			printable := *c.TaskContainerDefaults.RegistryAuth
+			printable.Password = hiddenValue
+			c.TaskContainerDefaults.RegistryAuth = &printable
 		}
 	}
 
 	c.CheckpointStorage = c.CheckpointStorage.Printable()
+
+	pools := make([]ResourcePoolConfig, 0, len(c.ResourcePools))
+	for _, poolConfig := range c.ResourcePools {
+		pools = append(pools, poolConfig.Printable())
+	}
+	c.ResourcePools = pools
 
 	optJSON, err := json.Marshal(c)
 	if err != nil {
@@ -205,6 +230,14 @@ func (c *Config) Resolve() error {
 		c.ResourceManager.AgentRM.Scheduler = DefaultSchedulerConfig()
 	}
 
+	if c.Webhooks.SigningKey == "" {
+		b := make([]byte, 6)
+		if _, err := rand.Read(b); err != nil {
+			return err
+		}
+		c.Webhooks.SigningKey = hex.EncodeToString(b)
+	}
+
 	if err := c.ResolveResource(); err != nil {
 		return err
 	}
@@ -213,7 +246,24 @@ func (c *Config) Resolve() error {
 		return err
 	}
 
+	if c.Security.AuthZ.StrictNTSCEnabled {
+		log.Warn("_strict_ntsc_enabled option is removed and will not have any effect.")
+	}
+
 	return nil
+}
+
+// Deprecations describe fields which were recently or will soon be removed.
+func (c *Config) Deprecations() (errs []error) {
+	for _, rp := range c.ResourcePools {
+		if rp.AgentReattachEnabled {
+			errs = append(errs, fmt.Errorf(
+				"agent_reattach_enabled is set for resource pool %s but will be ignored; "+
+					"as of 0.21.0 this feature is always on", rp.PoolName,
+			))
+		}
+	}
+	return errs
 }
 
 // SecurityConfig is the security configuration for the master.
@@ -221,6 +271,7 @@ type SecurityConfig struct {
 	DefaultTask model.AgentUserGroup `json:"default_task"`
 	TLS         TLSConfig            `json:"tls"`
 	SSH         SSHConfig            `json:"ssh"`
+	AuthZ       AuthZConfig          `json:"authz"`
 }
 
 // SSHConfig is the configuration setting for SSH.
@@ -290,6 +341,7 @@ func readPriorityFromScheduler(conf *SchedulerConfig) *int {
 }
 
 // ReadRMPreemptionStatus resolves the preemption status for a resource manager.
+// TODO(Brad): Move these to a resource pool level API.
 func ReadRMPreemptionStatus(rpName string) bool {
 	config := GetMasterConfig()
 	return readRMPreemptionStatus(config, rpName)
@@ -375,10 +427,4 @@ func ReadWeight(rpName string, jobConf interface{}) float64 {
 		weight = conf.Resources.Weight
 	}
 	return weight
-}
-
-// IsUsingKubernetesRM returns whether the master is configured with Kubernetes.
-func IsUsingKubernetesRM() bool {
-	config := GetMasterConfig()
-	return config.ResourceManager.KubernetesRM != nil
 }

@@ -1,20 +1,26 @@
-import { Button, Col, Row } from 'antd';
+import { Space } from 'antd';
 import dayjs from 'dayjs';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
+import Button from 'components/kit/Button';
 import Section from 'components/Section';
-import useResize from 'hooks/useResize';
-import useSettings from 'hooks/useSettings';
+import { SyncProvider } from 'components/UPlot/SyncProvider';
+import { useSettings } from 'hooks/useSettings';
 import { getResourceAllocationAggregated } from 'services/api';
+import { V1ResourceAllocationAggregatedResponse } from 'services/api-ts-sdk';
+import userStore from 'stores/users';
+import handleError from 'utils/error';
+import { Loadable } from 'utils/loadable';
+import { useObservable } from 'utils/observable';
 
 import css from './ClusterHistoricalUsage.module.scss';
 import settingsConfig, { GroupBy, Settings } from './ClusterHistoricalUsage.settings';
 import ClusterHistoricalUsageChart from './ClusterHistoricalUsageChart';
-import ClusterHistoricalUsageCsvModal from './ClusterHistoricalUsageCsvModal';
+import ClusterHistoricalUsageCsvModal, { CSVGroupBy } from './ClusterHistoricalUsageCsvModal';
 import ClusterHistoricalUsageFilters, {
   ClusterHistoricalUsageFiltersInterface,
 } from './ClusterHistoricalUsageFilters';
-import { mapResourceAllocationApiToChartSeries, ResourceAllocationChartSeries } from './utils';
+import { mapResourceAllocationApiToChartSeries } from './utils';
 
 export const DEFAULT_RANGE_DAY = 14;
 export const DEFAULT_RANGE_MONTH = 6;
@@ -22,10 +28,13 @@ export const MAX_RANGE_DAY = 31;
 export const MAX_RANGE_MONTH = 36;
 
 const ClusterHistoricalUsage: React.FC = () => {
-  const [ chartSeries, setChartSeries ] = useState<ResourceAllocationChartSeries>();
-  const [ isCsvModalVisible, setIsCsvModalVisible ] = useState<boolean>(false);
-  const filterBarRef = useRef<HTMLDivElement>(null);
+  const [aggRes, setAggRes] = useState<V1ResourceAllocationAggregatedResponse>({
+    resourceEntries: [],
+  });
+  const [isCsvModalVisible, setIsCsvModalVisible] = useState<boolean>(false);
   const { settings, updateSettings } = useSettings<Settings>(settingsConfig);
+  const loadableUsers = useObservable(userStore.getUsers());
+  const users = Loadable.getOrElse([], loadableUsers);
 
   const filters = useMemo(() => {
     const filters: ClusterHistoricalUsageFiltersInterface = {
@@ -56,25 +65,21 @@ const ClusterHistoricalUsage: React.FC = () => {
     }
 
     return filters;
-  }, [ settings ]);
+  }, [settings]);
 
-  const handleFilterChange = useCallback((newFilter: ClusterHistoricalUsageFiltersInterface) => {
-    const dateFormat = 'YYYY-MM' + (newFilter.groupBy === GroupBy.Day ? '-DD' : '');
-    updateSettings({
-      after: newFilter.afterDate.format(dateFormat),
-      before: newFilter.beforeDate.format(dateFormat),
-      groupBy: newFilter.groupBy,
-    });
-  }, [ updateSettings ]);
+  const handleFilterChange = useCallback(
+    (newFilter: ClusterHistoricalUsageFiltersInterface) => {
+      const dateFormat = 'YYYY-MM' + (newFilter.groupBy === GroupBy.Day ? '-DD' : '');
+      updateSettings({
+        after: newFilter.afterDate.format(dateFormat),
+        before: newFilter.beforeDate.format(dateFormat),
+        groupBy: newFilter.groupBy,
+      });
+    },
+    [updateSettings],
+  );
 
-  /* On first load: make sure filter bar doesn't overlap charts */
-  const filterBarResize = useResize(filterBarRef);
-  useEffect(() => {
-    if (!filterBarRef.current || !filterBarRef.current.parentElement) return;
-    filterBarRef.current.parentElement.style.height = filterBarResize.height + 'px';
-  }, [ filterBarRef, filterBarResize ]);
-
-  /*
+  /**
    * When grouped by month force csv modal to display start/end of month.
    */
   let csvAfterDate = filters.afterDate;
@@ -87,98 +92,89 @@ const ClusterHistoricalUsage: React.FC = () => {
     }
   }
 
-  /*
-   * Load chart data.
-   */
-  useEffect(() => {
-    setChartSeries(undefined);
-
-    (async () => {
+  const fetchResourceAllocationAggregated = useCallback(async () => {
+    try {
       const res = await getResourceAllocationAggregated({
         endDate: filters.beforeDate,
-        period: (filters.groupBy === GroupBy.Month
-          ? 'RESOURCE_ALLOCATION_AGGREGATION_PERIOD_MONTHLY'
-          : 'RESOURCE_ALLOCATION_AGGREGATION_PERIOD_DAILY'),
+        period:
+          filters.groupBy === GroupBy.Month
+            ? 'RESOURCE_ALLOCATION_AGGREGATION_PERIOD_MONTHLY'
+            : 'RESOURCE_ALLOCATION_AGGREGATION_PERIOD_DAILY',
         startDate: filters.afterDate,
       });
+      setAggRes(res);
+    } catch (e) {
+      handleError(e);
+    }
+  }, [filters.afterDate, filters.beforeDate, filters.groupBy]);
 
-      setChartSeries(
-        mapResourceAllocationApiToChartSeries(res.resourceEntries, filters.groupBy),
-      );
-    })();
-  }, [ filters ]);
+  const chartSeries = useMemo(() => {
+    return mapResourceAllocationApiToChartSeries(aggRes.resourceEntries, filters.groupBy, users);
+  }, [aggRes.resourceEntries, filters.groupBy, users]);
+
+  useEffect(() => {
+    fetchResourceAllocationAggregated();
+  }, [fetchResourceAllocationAggregated]);
 
   return (
-    <>
-      <div>
-        <Row className={css.filter} justify="end" ref={filterBarRef}>
-          <Col>
-            <ClusterHistoricalUsageFilters value={filters} onChange={handleFilterChange} />
-          </Col>
-          <Col>
-            <Button onClick={() => setIsCsvModalVisible(true)}>
-              Download CSV
-            </Button>
-          </Col>
-        </Row>
-      </div>
-      <Section bodyBorder loading={!chartSeries} title="Compute Hours Allocated">
-        {chartSeries && (
-          <ClusterHistoricalUsageChart
-            groupBy={chartSeries.groupedBy}
-            hoursByLabel={chartSeries.hoursTotal}
-            time={chartSeries.time}
+    <div className={css.base}>
+      <SyncProvider>
+        <Space align="end" className={css.filters}>
+          <ClusterHistoricalUsageFilters value={filters} onChange={handleFilterChange} />
+          <Button onClick={() => setIsCsvModalVisible(true)}>Download CSV</Button>
+        </Space>
+        <Section bodyBorder loading={!chartSeries} title="Compute Hours Allocated">
+          {chartSeries && (
+            <ClusterHistoricalUsageChart
+              groupBy={chartSeries.groupedBy}
+              hoursByLabel={chartSeries.hoursTotal}
+              time={chartSeries.time}
+            />
+          )}
+        </Section>
+        <Section
+          bodyBorder
+          loading={Loadable.isLoading(loadableUsers)}
+          title="Compute Hours by User">
+          {chartSeries && (
+            <ClusterHistoricalUsageChart
+              groupBy={chartSeries.groupedBy}
+              hoursByLabel={chartSeries.hoursByUsername}
+              hoursTotal={chartSeries?.hoursTotal?.total}
+              time={chartSeries.time}
+            />
+          )}
+        </Section>
+        <Section bodyBorder loading={!chartSeries} title="Compute Hours by Label">
+          {chartSeries && (
+            <ClusterHistoricalUsageChart
+              groupBy={chartSeries.groupedBy}
+              hoursByLabel={chartSeries.hoursByExperimentLabel}
+              hoursTotal={chartSeries?.hoursTotal?.total}
+              time={chartSeries.time}
+            />
+          )}
+        </Section>
+        <Section bodyBorder loading={!chartSeries} title="Compute Hours by Resource Pool">
+          {chartSeries && (
+            <ClusterHistoricalUsageChart
+              groupBy={chartSeries.groupedBy}
+              hoursByLabel={chartSeries.hoursByResourcePool}
+              hoursTotal={chartSeries?.hoursTotal?.total}
+              time={chartSeries.time}
+            />
+          )}
+        </Section>
+        {isCsvModalVisible && (
+          <ClusterHistoricalUsageCsvModal
+            afterDate={csvAfterDate}
+            beforeDate={csvBeforeDate}
+            groupBy={CSVGroupBy.Workloads}
+            onVisibleChange={setIsCsvModalVisible}
           />
         )}
-      </Section>
-      <Section bodyBorder loading={!chartSeries} title="Compute Hours by User">
-        {chartSeries && (
-          <ClusterHistoricalUsageChart
-            groupBy={chartSeries.groupedBy}
-            hoursByLabel={chartSeries.hoursByUsername}
-            hoursTotal={chartSeries?.hoursTotal?.total}
-            time={chartSeries.time}
-          />
-        )}
-      </Section>
-      <Section bodyBorder loading={!chartSeries} title="Compute Hours by Label">
-        {chartSeries && (
-          <ClusterHistoricalUsageChart
-            groupBy={chartSeries.groupedBy}
-            hoursByLabel={chartSeries.hoursByExperimentLabel}
-            hoursTotal={chartSeries?.hoursTotal?.total}
-            time={chartSeries.time}
-          />
-        )}
-      </Section>
-      <Section bodyBorder loading={!chartSeries} title="Compute Hours by Resource Pool">
-        {chartSeries && (
-          <ClusterHistoricalUsageChart
-            groupBy={chartSeries.groupedBy}
-            hoursByLabel={chartSeries.hoursByResourcePool}
-            hoursTotal={chartSeries?.hoursTotal?.total}
-            time={chartSeries.time}
-          />
-        )}
-      </Section>
-      <Section bodyBorder loading={!chartSeries} title="Compute Hours by Agent Label">
-        {chartSeries && (
-          <ClusterHistoricalUsageChart
-            groupBy={chartSeries.groupedBy}
-            hoursByLabel={chartSeries.hoursByAgentLabel}
-            hoursTotal={chartSeries?.hoursTotal?.total}
-            time={chartSeries.time}
-          />
-        )}
-      </Section>
-      {isCsvModalVisible && (
-        <ClusterHistoricalUsageCsvModal
-          afterDate={csvAfterDate}
-          beforeDate={csvBeforeDate}
-          onVisibleChange={setIsCsvModalVisible}
-        />
-      )}
-    </>
+      </SyncProvider>
+    </div>
   );
 };
 

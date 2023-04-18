@@ -5,7 +5,7 @@ SHORT_GIT_HASH := $(shell git rev-parse --short HEAD)
 ARTIFACTS_DIR := /tmp/artifacts
 
 # Model-hub library environments will be built on top of the default GPU and CPU images in master/pkg/model/defaults.go
-DEFAULT_GPU_IMAGE := determinedai/environments:cuda-11.3-pytorch-1.10-lightning-1.5-tf-2.8-gpu-ed66d8a
+DEFAULT_GPU_IMAGE := determinedai/environments:cuda-11.3-pytorch-1.12-tf-2.8-gpu-9b5db1b
 
 ############REMINDER############
 # When bumping third-party library versions, remember to bump versions in
@@ -18,9 +18,9 @@ DATASETS_VERSION := 1.9.0
 TRANSFORMERS_ENVIRONMENT_ROOT := determinedai/model-hub-transformers
 # MMDetection Args
 MMCV_CUDA_VERSION := cu113 # Needs to match DEFAULT_GPU_IMAGE
-TORCH_VERSION := 1.10.0 # Needs to match DEFAULT_GPU_IMAGE
-MMCV_VERSION := 1.4.5
-MMDETECTION_VERSION := 2.21.0
+TORCH_VERSION := 1.12.0 # Needs to match DEFAULT_GPU_IMAGE
+MMCV_VERSION := 1.7.1 # Needs to support the above Torch version
+MMDETECTION_VERSION := 2.27.0
 MMDETECTION_ENVIRONMENT_ROOT := determinedai/model-hub-mmdetection
 
 # Example dirs
@@ -45,15 +45,19 @@ clean:
 build:
 	python setup.py -q bdist_wheel
 
-.PHONY: examples
-examples: $(HF_EXAMPLES_DIRS) $(MMDET_EXAMPLE_DIR)
+build-examples/stamp: $(HF_EXAMPLES_DIRS) $(MMDET_EXAMPLE_DIR)
+	touch $@
 
-build-examples/%.tgz: examples/*/%/
+.PHONY: examples
+examples: build-examples/stamp
+
+# the first `examples/*/%` defines `$<` and the second sets file dependencies
+build-examples/%.tgz: examples/*/% examples/*/%/*
 	find "$<" \( -name __pycache__ -o -name \*.pyc \) -delete
 	mkdir -p $$(dirname "$@")
 	tar -czf "$@" -C $$(dirname "$<") $$(basename "$<")
 
-build-examples/%.tgz: examples/%/
+build-examples/%.tgz: examples/%/ examples/%/*
 	find "$<" \( -name __pycache__ -o -name \*.pyc \) -delete
 	mkdir -p $$(dirname "$@")
 	tar -czf "$@" -C $$(dirname "$<") $$(basename "$<")
@@ -98,7 +102,7 @@ build-mmdetection-dev:
 	if [[ "$(DEFAULT_GPU_IMAGE)" != *"cuda-11.3"* ]]; then \
 	  echo "Expected $(DEFAULT_GPU_IMAGE) to have cuda version $(MMCV_CUDA_VERSION)."; \
 	  exit 1; \
-	elif [[ "$(DEFAULT_GPU_IMAGE)" != *"pytorch-1.10"* ]]; then \
+	elif [[ "$(DEFAULT_GPU_IMAGE)" != *"pytorch-1.12"* ]]; then \
 	  echo "Expected $(DEFAULT_GPU_IMAGE) to have pytorch version $(TORCH_VERSION)."; \
 	  exit 1; \
 	else \
@@ -146,7 +150,7 @@ build-mmdetection:
 	if [[ "$(DEFAULT_GPU_IMAGE)" != *"cuda-11.3"* ]]; then \
 	  echo "Expected $(DEFAULT_GPU_IMAGE) to have cuda version $(MMCV_CUDA_VERSION)."; \
 	  exit 1; \
-	elif [[ "$(DEFAULT_GPU_IMAGE)" != *"pytorch-1.10"* ]]; then \
+	elif [[ "$(DEFAULT_GPU_IMAGE)" != *"pytorch-1.12"* ]]; then \
 	  echo "Expected $(DEFAULT_GPU_IMAGE) to have pytorch version $(TORCH_VERSION)."; \
 	  exit 1; \
 	else \

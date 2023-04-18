@@ -1,31 +1,40 @@
 package internal
 
 import (
-	"net/http"
-
-	"github.com/determined-ai/determined/master/pkg/model"
-
 	"github.com/labstack/echo/v4"
 
-	"github.com/determined-ai/determined/master/internal/api"
+	"github.com/determined-ai/determined/master/internal/context"
+	expauth "github.com/determined-ai/determined/master/internal/experiment"
 	"github.com/determined-ai/determined/master/internal/sproto"
 )
 
 func (m *Master) getTasks(c echo.Context) (interface{}, error) {
-	return m.system.Ask(m.rm, sproto.GetTaskSummaries{}).Get(), nil
-}
-
-func (m *Master) getTask(c echo.Context) (interface{}, error) {
-	args := struct {
-		AllocationID string `path:"allocation_id"`
-	}{}
-	if err := api.BindArgs(&args, c); err != nil {
+	summary, err := m.rm.GetAllocationSummaries(m.system, sproto.GetAllocationSummaries{})
+	if err != nil {
 		return nil, err
 	}
-	id := model.AllocationID(args.AllocationID)
-	resp := m.system.Ask(m.rm, sproto.GetTaskSummary{ID: &id})
-	if resp.Empty() {
-		return nil, echo.NewHTTPError(http.StatusNotFound, "task not found: %s", args.AllocationID)
+
+	curUser := c.(*context.DetContext).MustGetUser()
+	ctx := c.Request().Context()
+	for allocationID, allocationSummary := range summary {
+		isExp, exp, err := expFromTaskID(m, allocationSummary.TaskID)
+		if err != nil {
+			return nil, err
+		}
+
+		var ok bool
+		if !isExp {
+			ok, err = canAccessNTSCTask(ctx, curUser, summary[allocationID].TaskID)
+		} else {
+			ok, err = expauth.AuthZProvider.Get().CanGetExperiment(ctx, curUser, exp)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if !ok {
+			delete(summary, allocationID)
+		}
 	}
-	return resp.Get(), nil
+	return summary, nil
 }

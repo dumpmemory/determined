@@ -56,10 +56,25 @@ func filterToSQL(
 		_, _ = fragment.WriteString(strings.Join(paramFragments, ","))
 		_, _ = fragment.WriteString(")")
 		return fmt.Sprintf(fragment.String(), field)
+	case api.FilterOperationInOrNull:
+		var fragment strings.Builder
+		_, _ = fragment.WriteString("AND %s IS NULL OR %s IN (")
+		var paramFragments []string
+		for i := range values {
+			paramFragments = append(paramFragments, fmt.Sprintf("$%d", paramID+i))
+		}
+		_, _ = fragment.WriteString(strings.Join(paramFragments, ","))
+		_, _ = fragment.WriteString(")")
+		return fmt.Sprintf(fragment.String(), field, field)
 	case api.FilterOperationGreaterThan:
 		return fmt.Sprintf("AND %s > $%d", field, paramID)
 	case api.FilterOperationLessThanEqual:
 		return fmt.Sprintf("AND %s <= $%d", field, paramID)
+	case api.FilterOperationStringContainment:
+		// Works for both bytea and text fields
+		return fmt.Sprintf("AND encode(%s::bytea, 'escape') ILIKE  ('%%%%' || $%d || '%%%%')",
+			field,
+			paramID)
 	default:
 		panic(fmt.Sprintf("cannot convert operation %d to SQL", f.Operation))
 	}
@@ -72,6 +87,8 @@ func filterToParams(f api.Filter) []interface{} {
 		for _, v := range vs {
 			params = append(params, v)
 		}
+	case string:
+		params = append(params, vs)
 	case []int64:
 		for _, v := range vs {
 			params = append(params, v)
@@ -88,7 +105,8 @@ func filterToParams(f api.Filter) []interface{} {
 	return params
 }
 
-func orderByToSQL(order apiv1.OrderBy) string {
+// OrderByToSQL computes the SQL keyword corresponding to the given ordering type.
+func OrderByToSQL(order apiv1.OrderBy) string {
 	switch order {
 	case apiv1.OrderBy_ORDER_BY_UNSPECIFIED:
 		return asc

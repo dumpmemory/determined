@@ -1,17 +1,17 @@
-<p align="center"><img src="determined-logo.png" alt="Determined AI Logo"></p>
-
 # Determined: Deep Learning Training Platform
+
+<p align="center"><img src="determined-logo.png" alt="Determined AI Logo"></p>
 
 Determined is an open-source deep learning training platform that makes building
 models fast and easy. Determined enables you to:
 
-- **Train models faster** using state-of-the-art distributed training, without
+* **Train models faster** using state-of-the-art distributed training, without
   changing your model code
-- **Automatically find high-quality models** with advanced hyperparameter tuning
+* **Automatically find high-quality models** with advanced hyperparameter tuning
   from the creators of Hyperband
-- **Get more from your GPUs** with smart scheduling and cut cloud GPU costs by
+* **Get more from your GPUs** with smart scheduling and cut cloud GPU costs by
   seamlessly using preemptible instances
-- **Track and reproduce your work** with experiment tracking that works
+* **Track and reproduce your work** with experiment tracking that works
   out-of-the-box, covering code versions, metrics, checkpoints, and
   hyperparameters
 
@@ -38,7 +38,7 @@ det deploy local cluster-up --no-gpu
 # Access web UI at localhost:8080. By default, "determined" user accepts a blank password.
 
 # Navigate to a Determined example.
-git clone https://github.com/determined-ai/determined
+git clone --recurse-submodules https://github.com/determined-ai/determined
 cd determined/examples/computer_vision/cifar10_pytorch
 
 # Submit job to train a single model on a single node.

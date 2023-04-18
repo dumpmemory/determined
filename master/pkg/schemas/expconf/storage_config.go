@@ -18,8 +18,9 @@ const (
 	DefaultSharedFSPropagation = "rprivate"
 )
 
-//go:generate ../gen.sh
 // CheckpointStorageConfigV0 has the common checkpoint config params.
+//
+//go:generate ../gen.sh
 type CheckpointStorageConfigV0 struct {
 	RawSharedFSConfig *SharedFSConfigV0 `union:"type,shared_fs" json:"-"`
 	RawHDFSConfig     *HDFSConfigV0     `union:"type,hdfs" json:"-"`
@@ -33,8 +34,8 @@ type CheckpointStorageConfigV0 struct {
 }
 
 // Merge implements schemas.Mergeable.
-func (c CheckpointStorageConfigV0) Merge(other interface{}) interface{} {
-	return schemas.UnionMerge(c, other)
+func (c CheckpointStorageConfigV0) Merge(othr CheckpointStorageConfigV0) CheckpointStorageConfigV0 {
+	return schemas.UnionMerge(c, othr)
 }
 
 // MarshalJSON implements the json.Marshaler interface.
@@ -53,7 +54,7 @@ func (c *CheckpointStorageConfigV0) UnmarshalJSON(data []byte) error {
 
 // Printable returns a copy the object with secrets hidden.
 func (c CheckpointStorageConfigV0) Printable() CheckpointStorageConfigV0 {
-	out := schemas.Copy(c).(CheckpointStorageConfigV0)
+	out := schemas.Copy(c)
 	hiddenValue := "********"
 	if out.RawS3Config != nil {
 		if out.RawS3Config.RawAccessKey != nil {
@@ -66,8 +67,9 @@ func (c CheckpointStorageConfigV0) Printable() CheckpointStorageConfigV0 {
 	return out
 }
 
-//go:generate ../gen.sh
 // TensorboardStorageConfigV0 is a legacy config.
+//
+//go:generate ../gen.sh
 type TensorboardStorageConfigV0 struct {
 	RawSharedFSConfigV0 *SharedFSConfigV0 `union:"type,shared_fs" json:"-"`
 	RawHDFSConfig       *HDFSConfigV0     `union:"type,hdfs" json:"-"`
@@ -77,7 +79,9 @@ type TensorboardStorageConfigV0 struct {
 }
 
 // Merge implements schemas.Mergeable.
-func (t TensorboardStorageConfigV0) Merge(other interface{}) interface{} {
+func (t TensorboardStorageConfigV0) Merge(
+	other TensorboardStorageConfigV0,
+) TensorboardStorageConfigV0 {
 	return schemas.UnionMerge(t, other)
 }
 
@@ -91,8 +95,9 @@ func (t *TensorboardStorageConfigV0) UnmarshalJSON(data []byte) error {
 	return union.Unmarshal(data, t)
 }
 
-//go:generate ../gen.sh
 // SharedFSConfigV0 is a config for shared filesystem storage.
+//
+//go:generate ../gen.sh
 type SharedFSConfigV0 struct {
 	RawHostPath        *string `json:"host_path"`
 	RawContainerPath   *string `json:"container_path,omitempty"`
@@ -117,16 +122,18 @@ func (s SharedFSConfigV0) PathInContainer() string {
 	return filepath.Join(DefaultSharedFSContainerPath, *s.RawStoragePath)
 }
 
-//go:generate ../gen.sh
 // HDFSConfigV0 configures storing checkpoints in HDFS.
+//
+//go:generate ../gen.sh
 type HDFSConfigV0 struct {
 	RawURL  *string `json:"hdfs_url"`
 	RawPath *string `json:"hdfs_path"`
 	RawUser *string `json:"user"`
 }
 
-//go:generate ../gen.sh
 // S3ConfigV0 configures storing checkpoints on S3.
+//
+//go:generate ../gen.sh
 type S3ConfigV0 struct {
 	RawBucket      *string `json:"bucket"`
 	RawAccessKey   *string `json:"access_key"`
@@ -138,20 +145,29 @@ type S3ConfigV0 struct {
 // Validate implements the check.Validatable interface.
 func (c S3ConfigV0) Validate() []error {
 	var errs []error
-	if c.RawPrefix != nil {
-		rawPrefix := *c.RawPrefix
-		if rawPrefix == ".." || strings.HasPrefix(rawPrefix, "../") ||
-			strings.HasSuffix(rawPrefix, "/..") || strings.Contains(rawPrefix, "/../") {
-			errs = append(errs, errors.New("'prefix' must not contain /../"))
-		}
+	if err := validateStoragePrefix(c.RawPrefix); err != nil {
+		errs = append(errs, err)
 	}
 	return errs
 }
 
-//go:generate ../gen.sh
+func validateStoragePrefix(prefix *string) error {
+	if prefix != nil {
+		rawPrefix := *prefix
+		if rawPrefix == ".." || strings.HasPrefix(rawPrefix, "../") ||
+			strings.HasSuffix(rawPrefix, "/..") || strings.Contains(rawPrefix, "/../") {
+			return errors.New("'prefix' must not contain /../")
+		}
+	}
+	return nil
+}
+
 // GCSConfigV0 configures storing checkpoints on GCS.
+//
+//go:generate ../gen.sh
 type GCSConfigV0 struct {
 	RawBucket *string `json:"bucket"`
+	RawPrefix *string `json:"prefix"`
 }
 
 // Validate implements the check.Validatable interface.
@@ -160,11 +176,15 @@ func (c GCSConfigV0) Validate() []error {
 	if c.RawBucket == nil {
 		errs = append(errs, errors.New("'bucket' must be specified"))
 	}
+	if err := validateStoragePrefix(c.RawPrefix); err != nil {
+		errs = append(errs, err)
+	}
 	return errs
 }
 
-//go:generate ../gen.sh
 // AzureConfigV0 configures storing checkpoints on Azure.
+//
+//go:generate ../gen.sh
 type AzureConfigV0 struct {
 	RawContainer        *string `json:"container"`
 	RawConnectionString *string `json:"connection_string,omitempty"`
@@ -173,20 +193,19 @@ type AzureConfigV0 struct {
 }
 
 // Merge implements schemas.Mergeable.
-func (c AzureConfigV0) Merge(other interface{}) interface{} {
-	otherConfig := other.(AzureConfigV0)
+func (c AzureConfigV0) Merge(other AzureConfigV0) AzureConfigV0 {
 	var credSource AzureConfigV0
 	if c.RawConnectionString != nil || c.RawAccountURL != nil {
 		credSource = c
 	} else {
-		credSource = otherConfig
+		credSource = other
 	}
 
 	return AzureConfigV0{
-		RawContainer:        schemas.Merge(c.RawContainer, otherConfig.RawContainer).(*string),
-		RawConnectionString: schemas.Copy(credSource.RawConnectionString).(*string),
-		RawAccountURL:       schemas.Copy(credSource.RawAccountURL).(*string),
-		RawCredential:       schemas.Copy(credSource.RawCredential).(*string),
+		RawContainer:        schemas.Merge(c.RawContainer, other.RawContainer),
+		RawConnectionString: schemas.Copy(credSource.RawConnectionString),
+		RawAccountURL:       schemas.Copy(credSource.RawAccountURL),
+		RawCredential:       schemas.Copy(credSource.RawCredential),
 	}
 }
 

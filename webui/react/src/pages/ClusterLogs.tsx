@@ -1,9 +1,13 @@
 import React, { useCallback } from 'react';
 
-import LogViewer, { FetchConfig, FetchDirection, FetchType } from 'components/LogViewer/LogViewer';
+import LogViewer, {
+  FetchConfig,
+  FetchDirection,
+  FetchType,
+} from 'components/kit/LogViewer/LogViewer';
 import { detApi } from 'services/apiConfig';
 import { jsonToClusterLog } from 'services/decoder';
-import { isNumber } from 'utils/data';
+import { isNumber } from 'shared/utils/data';
 
 import css from './ClusterLogs.module.scss';
 
@@ -24,22 +28,14 @@ const ClusterLogs: React.FC = () => {
       options.limit = 0;
     }
 
-    return detApi.StreamingCluster.masterLogs(
-      options.offset,
-      options.limit,
-      options.follow,
-      { signal: config.canceler.signal },
-    );
+    return detApi.StreamingCluster.masterLogs(options.offset, options.limit, options.follow, {
+      signal: config.canceler.signal,
+    });
   }, []);
 
   return (
     <div className={css.base}>
-      <LogViewer
-        decoder={jsonToClusterLog}
-        sortKey="id"
-        title={<div className={css.title}>Cluster Logs</div>}
-        onFetch={handleFetch}
-      />
+      <LogViewer decoder={jsonToClusterLog} sortKey="id" onFetch={handleFetch} />
     </div>
   );
 };

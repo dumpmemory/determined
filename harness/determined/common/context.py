@@ -3,120 +3,109 @@ import collections
 import os
 import pathlib
 import tarfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import pathspec
 
-from determined.common import check, constants
+from determined.common import constants
+from determined.common.api import bindings
 from determined.common.util import sizeof_fmt
 
-
-class ContextItem:
-    """
-    ContextItem wraps the content and metadata of a file or a directory.
-    """
-
-    def __init__(self, path: str):
-        self.path = path
-        self.type = ord(tarfile.REGTYPE)
-        self.uid = 0
-        self.gid = 0
-        self.content = bytes()
-        self.mtime = -1
-        self.mode = -1
-
-    @property
-    def size(self) -> int:
-        if self.content:
-            # The content is already base64-encoded, and we want the real length.
-            return len(self.content) // 4 * 3
-        return 0
-
-    def dict(self) -> Dict[str, Any]:
-        d = {"path": self.path, "type": self.type, "uid": self.uid, "gid": self.gid}
-        if self.type in (ord(tarfile.REGTYPE), ord(tarfile.DIRTYPE)):
-            d["content"] = self.content
-        if self.mtime != -1:
-            d["mtime"] = self.mtime
-        if self.mode != -1:
-            d["mode"] = self.mode
-        return d
-
-    @classmethod
-    def from_content_str(cls, path: str, content: str) -> "ContextItem":
-        context_item = ContextItem(path)
-        context_item.type = ord(tarfile.REGTYPE)
-        context_item.content = base64.b64encode(content.encode("utf-8"))
-        return context_item
-
-    @classmethod
-    def from_local_file(cls, path: str, local_path: pathlib.Path) -> "ContextItem":
-        context_item = ContextItem(path)
-        context_item.type = ord(tarfile.REGTYPE)
-        context_item.mtime = int(local_path.stat().st_mtime)
-        context_item.mode = local_path.stat().st_mode
-        with local_path.open("rb") as f:
-            content = f.read()
-            context_item.content = base64.b64encode(content)
-        return context_item
-
-    @classmethod
-    def from_local_dir(cls, path: str, local_path: pathlib.Path) -> "ContextItem":
-        context_item = ContextItem(path)
-        context_item.type = ord(tarfile.DIRTYPE)
-        context_item.mtime = int(local_path.stat().st_mtime)
-        context_item.mode = local_path.stat().st_mode
-        return context_item
+LegacyContext = List[Dict[str, Any]]
 
 
-class Context:
-    """
-    Context wraps the content and metadata of a collection of files and directories.
-    """
+def v1File_size(f: bindings.v1File) -> int:
+    if f.content:
+        # The content is already base64-encoded, and we want the real length.
+        return len(f.content) // 4 * 3
+    return 0
 
-    def __init__(self) -> None:
-        self._items = {}  # type: Dict[str, ContextItem]
-        self._size = 0
 
-    def __len__(self) -> int:
-        return len(self._items)
+def v1File_to_dict(f: bindings.v1File) -> Dict[str, Any]:
+    d = {
+        "path": f.path,
+        "type": f.type,
+        "uid": f.uid,
+        "gid": f.gid,
+        # Echo API expects int-type int64 value
+        "mtime": int(f.mtime),
+        "mode": f.mode,
+    }
+    if f.type in (ord(tarfile.REGTYPE), ord(tarfile.DIRTYPE)):
+        d["content"] = f.content
+    return d
 
-    @property
-    def size(self) -> int:
-        return self._size
 
-    @property
-    def entries(self) -> collections.abc.ValuesView:
-        return self._items.values()
+def v1File_from_local_file(archive_path: str, path: pathlib.Path) -> bindings.v1File:
+    with path.open("rb") as f:
+        content = base64.b64encode(f.read()).decode("utf8")
+    st = path.stat()
+    return bindings.v1File(
+        path=archive_path,
+        type=ord(tarfile.REGTYPE),
+        content=content,
+        # Protobuf expects string-encoded int64
+        mtime=str(int(st.st_mtime)),
+        mode=st.st_mode,
+        uid=0,
+        gid=0,
+    )
 
-    def add_item(self, entry: ContextItem) -> None:
-        self._items[entry.path] = entry
-        self._size += entry.size
 
-    @classmethod
-    def from_local(
-        cls,
-        local_path: pathlib.Path,
-        limit: int = constants.MAX_CONTEXT_SIZE,
-    ) -> "Context":
-        """
-        Given the path to a local directory, return a Context object.
+def v1File_from_local_dir(archive_path: str, path: pathlib.Path) -> bindings.v1File:
+    st = path.stat()
+    return bindings.v1File(
+        path=archive_path,
+        type=ord(tarfile.DIRTYPE),
+        content="",
+        # Protobuf expects string-encoded int64
+        mtime=str(int(st.st_mtime)),
+        mode=st.st_mode,
+        uid=0,
+        gid=0,
+    )
 
-        A .detignore file in the directory, if specified, indicates the wildcard paths
-        that should be ignored. File paths are represented as relative paths (relative to
-        the root directory).
-        """
 
-        context = Context()
-        local_path = local_path.resolve()
+class _Builder:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.size = 0
+        self.items = []  # type: List[bindings.v1File]
+        self.msg = f"Preparing files to send to master... {sizeof_fmt(0)} and 0 files"
+        print(self.msg, end="\r", flush=True)
 
-        if not local_path.exists():
-            raise Exception("Path '{}' doesn't exist".format(local_path))
+    def add_v1File(self, f: bindings.v1File) -> None:
+        self.items.append(f)
+        self.size += v1File_size(f)
+        if self.size > self.limit:
+            raise ValueError(
+                "The total size of context directory and included files and directories exceeds "
+                f" the maximum allowed size {sizeof_fmt(self.limit)}.\n"
+                "Consider using either .detignore files inside directories to specify that certain "
+                "files or subdirectories should be omitted."
+            )
 
-        if local_path.is_file():
-            raise ValueError("Path '{}' must be a directory".format(local_path))
+    def update_msg(self) -> None:
+        print(" " * len(self.msg), end="\r")
+        self.msg = (
+            "Preparing files to send to master... "
+            f"{sizeof_fmt(self.size)} and {len(self.items)} files"
+        )
+        print(self.msg, end="\r", flush=True)
 
-        root_path = local_path
+    def add(self, root_path: pathlib.Path, entry_prefix: pathlib.Path) -> None:
+        root_path = root_path.resolve()
+
+        if not root_path.exists():
+            raise ValueError(f"Path '{root_path}' doesn't exist")
+
+        if root_path.is_file():
+            self.add_v1File(v1File_from_local_file(root_path.name, root_path))
+            return
+
+        if str(entry_prefix) != ".":
+            # For non-context directories, include the root directory.
+            self.add_v1File(v1File_from_local_dir(str(entry_prefix), root_path))
 
         ignore = list(constants.DEFAULT_DETIGNORE)
         ignore_path = root_path.joinpath(".detignore")
@@ -125,28 +114,29 @@ class Context:
                 ignore.extend(detignore_file)
         ignore_spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, ignore)
 
-        msg = "Preparing files (in {}) to send to master... {} and {} files".format(
-            root_path, sizeof_fmt(0), 0
-        )
-        print(msg, end="\r", flush=True)
-
         # We could use pathlib.Path.rglob for scanning the directory;
         # however, the Python documentation claims a warning that rglob may be
         # inefficient on large directory trees, so we use the older os.walk().
         for parent, dirs, files in os.walk(str(root_path)):
+            keep_dirs = []
             for directory in dirs:
                 dir_path = pathlib.Path(parent).joinpath(directory)
                 dir_rel_path = dir_path.relative_to(root_path)
 
-                # If the file matches any path specified in .detignore, then ignore it.
+                # If the directory matches any path specified in .detignore, then ignore it.
+                if ignore_spec.match_file(str(dir_rel_path)):
+                    continue
                 if ignore_spec.match_file(str(dir_rel_path) + "/"):
                     continue
-
+                keep_dirs.append(directory)
                 # Determined only supports POSIX-style file paths.  Use as_posix() in case this code
                 # is executed in a non-POSIX environment.
-                entry_path = dir_rel_path.as_posix()
+                entry_path = (entry_prefix / dir_rel_path).as_posix()
 
-                context.add_item(ContextItem.from_local_dir(entry_path, dir_path))
+                self.add_v1File(v1File_from_local_dir(entry_path, dir_path))
+            # We can modify dirs in-place so that we do not recurse into ignored directories
+            #  See https://docs.python.org/3/library/os.html#os.walk
+            dirs[:] = keep_dirs
 
             for file in files:
                 file_path = pathlib.Path(parent).joinpath(file)
@@ -161,63 +151,70 @@ class Context:
 
                 # Determined only supports POSIX-style file paths.  Use as_posix() in case this code
                 # is executed in a non-POSIX environment.
-                entry_path = file_rel_path.as_posix()
+                entry_path = (entry_prefix / file_rel_path).as_posix()
 
                 try:
-                    entry = ContextItem.from_local_file(entry_path, file_path)
+                    entry = v1File_from_local_file(entry_path, file_path)
                 except OSError:
-                    print("Error reading '{}', skipping this file.".format(entry_path))
+                    print(f"Error reading '{entry_path}', skipping this file.")
                     continue
 
-                context.add_item(entry)
-                if context.size > limit:
-                    print()
-                    raise ValueError(
-                        "Directory '{}' exceeds the maximum allowed size {}.\n"
-                        "Consider using a .detignore file to specify that certain files "
-                        "or directories should be omitted from the model.".format(
-                            root_path, sizeof_fmt(constants.MAX_CONTEXT_SIZE)
-                        )
-                    )
+                self.add_v1File(entry)
+                self.update_msg()
 
-                print(" " * len(msg), end="\r")
-                msg = "Preparing files ({}) to send to master... {} and {} files".format(
-                    root_path, sizeof_fmt(context.size), len(context)
-                )
-                print(msg, end="\r", flush=True)
+    def get_items(self) -> List[bindings.v1File]:
         print()
-        return context
+
+        # Check for conflicting root items, which may arise when --include conflicts with either
+        # the --context or another --include.
+        root_items = (f.path for f in self.items if "/" not in f.path.rstrip("/"))
+        duplicates = [k for k, v in collections.Counter(root_items).items() if v > 1]
+        if len(duplicates) == 1:
+            raise ValueError(f"duplicate path detected: {repr(duplicates[0])}")
+        elif duplicates:
+            raise ValueError(f"duplicate paths detected: {duplicates}")
+
+        return self.items
 
 
-def read_context(
-    local_path: pathlib.Path,
+def read_v1_context(
+    context_root: Optional[pathlib.Path],
+    includes: Iterable[pathlib.Path] = (),
     limit: int = constants.MAX_CONTEXT_SIZE,
-) -> Tuple[List[Dict[str, Any]], int]:
-    context = Context.from_local(local_path, limit)
-    return [e.dict() for e in context.entries], context.size
-
-
-def read_single_file(file_path: Optional[pathlib.Path]) -> Tuple[bytes, int]:
+) -> List[bindings.v1File]:
     """
-    Given a path to a file, return the base64-encoded contents of the file and its original size.
+    Return a list of v1Files suitable for submitting a context directory over the v1 REST API.
+
+    A .detignore file in a context or include directory, if specified, indicates the wildcard paths
+    that should be ignored.  File paths inside the context_root are relative to the context_root.
+    File paths from includes are prefixed by the basename of the included directory.
     """
-    if not file_path:
-        return b"", 0
 
-    check.check_true(file_path.is_file(), 'The file at "{}" could not be found'.format(file_path))
+    if context_root is None and not includes:
+        return []
 
-    content = file_path.read_bytes()
+    builder = _Builder(limit)
 
-    return base64.b64encode(content), len(content)
+    if context_root is not None:
+        # --context must always be a directory.
+        if context_root.is_file():
+            raise ValueError(
+                f"context path '{context_root}' must be a directory, maybe use an include instead?"
+            )
+        builder.add(context_root, pathlib.Path(""))
+    for i in includes:
+        # Some paths like "/" don't have a name we can assign within the tarball.
+        name = i.resolve().name
+        if not name:
+            raise ValueError(f"unable to determine the name of include '{i}'")
+        builder.add(i, pathlib.Path(name))
+
+    return builder.get_items()
 
 
-def get_invalid_model_def_path_message() -> str:
-    """
-    get_invalid_model_def_path_message is used by get_all_file_entries to generate an appropriate
-    error message to display when a user tries to create an experiment using a model definition
-    contained in a directory whose name conflicts with the Determined package name
-    (i.e. "determined").
-
-    The function is also used in test_cli.py::test_create_reject_bad_path.
-    """
-    return 'A model definition cannot be contained in a directory named "determined"'
+def read_legacy_context(
+    context_root: Optional[pathlib.Path],
+    includes: Iterable[pathlib.Path] = (),
+    limit: int = constants.MAX_CONTEXT_SIZE,
+) -> LegacyContext:
+    return [v1File_to_dict(f) for f in read_v1_context(context_root, includes, limit)]

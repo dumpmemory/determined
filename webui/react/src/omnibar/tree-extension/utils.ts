@@ -1,4 +1,4 @@
-import { isAsyncFunction } from 'utils/data';
+import { isAsyncFunction } from 'shared/utils/data';
 
 import { BaseNode, Children, LeafNode, NonLeafNode, TreeNode, TreePath } from './types';
 
@@ -8,8 +8,7 @@ export const isLeafNode = (obj: unknown): obj is LeafNode =>
   isBaseNode(obj) && 'onAction' in obj && !('options' in obj);
 export const isNLNode = (obj: unknown): obj is NonLeafNode =>
   isBaseNode(obj) && !('onAction' in obj) && ('options' in obj || 'onCustomInput' in obj);
-export const isTreeNode = (obj: unknown): obj is TreeNode =>
-  isNLNode(obj) || isLeafNode(obj);
+export const isTreeNode = (obj: unknown): obj is TreeNode => isNLNode(obj) || isLeafNode(obj);
 
 export const getNodeChildren = async (node: TreeNode): Promise<Children> => {
   if (isLeafNode(node)) return [];
@@ -34,11 +33,11 @@ export const traverseTree = async (
   startNode: NonLeafNode,
 ): Promise<TreePath> => {
   let curNode: TreeNode = startNode;
-  const path: TreePath = [ curNode ];
+  const path: TreePath = [curNode];
   let i = 0;
-  while(isNLNode(curNode) && i < address.length) {
+  while (isNLNode(curNode) && i < address.length) {
     const children: Children = await getNodeChildren(curNode);
-    const rv = children.find(n => n.title === address[i]);
+    const rv = children.find((n) => n.title === address[i]);
     if (rv === undefined) break;
     curNode = rv;
     i++;
@@ -59,8 +58,9 @@ export const dfsStaticRoutes = (
   curPath.push(node);
   if (isLeafNode(node)) {
     allRoutes.push(curPath);
-  } else if (Array.isArray(node.options)) { // only follow statically defined children.
-    node.options.forEach(child => dfsStaticRoutes(allRoutes, [ ...curPath ], child));
+  } else if (Array.isArray(node.options)) {
+    // only follow statically defined children.
+    node.options.forEach((child) => dfsStaticRoutes(allRoutes, [...curPath], child));
   } else {
     allRoutes.push(curPath);
   }

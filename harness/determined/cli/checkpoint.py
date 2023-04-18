@@ -1,43 +1,15 @@
 import json
 from argparse import Namespace
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
-from determined.cli.session import setup_session
-from determined.common import constants, experimental
+from determined import cli, errors
+from determined.common import experimental
 from determined.common.api import authentication, bindings
 from determined.common.declarative_argparse import Arg, Cmd
 from determined.common.experimental import Determined
+from determined.experimental.client import DownloadMode
 
 from . import render
-
-
-def format_validation(validation: Dict[str, Any]) -> List[Any]:
-    if not validation:
-        return [None, None]
-
-    if validation["state"] == constants.COMPLETED:
-        return [constants.COMPLETED, json.dumps(validation["metrics"], indent=4)]
-    elif validation["state"] in (constants.ACTIVE, constants.ERROR):
-        return [validation["state"], None]
-    else:
-        raise AssertionError("Invalid validation state: {}".format(validation["state"]))
-
-
-# TODO(neilc): Report more info about checkpoints and validations.
-def format_checkpoint(checkpoint: Dict[str, Any]) -> List[Any]:
-    if not checkpoint:
-        return [None, None, None]
-
-    if checkpoint["state"] in (constants.COMPLETED, constants.DELETED):
-        return [
-            checkpoint["state"],
-            checkpoint["uuid"],
-            json.dumps(checkpoint["metadata"], indent=4),
-        ]
-    elif checkpoint["state"] in (constants.ACTIVE, constants.ERROR):
-        return [checkpoint["state"], None, json.dumps(checkpoint["metadata"], indent=4)]
-    else:
-        raise AssertionError("Invalid checkpoint state: {}".format(checkpoint["state"]))
 
 
 def render_checkpoint(checkpoint: experimental.Checkpoint, path: Optional[str] = None) -> None:
@@ -47,12 +19,19 @@ def render_checkpoint(checkpoint: experimental.Checkpoint, path: Optional[str] =
 
     # Print information about the downloaded step/checkpoint.
     table = [
-        ["Experiment ID", checkpoint.experiment_id],
-        ["Trial ID", checkpoint.trial_id],
-        ["Batch #", checkpoint.batch_number],
-        ["Report Time", render.format_time(checkpoint.end_time)],
+        ["Experiment ID", checkpoint.training.experiment_id if checkpoint.training else None],
+        ["Trial ID", checkpoint.training.trial_id if checkpoint.training else None],
+        ["Steps Completed", checkpoint.metadata.get("steps_completed")],
+        ["Report Time", render.format_time(checkpoint.report_time)],
         ["Checkpoint UUID", checkpoint.uuid],
-        ["Validation Metrics", json.dumps(checkpoint.validation["metrics"], indent=4)],
+        [
+            "Validation Metrics",
+            (
+                json.dumps(checkpoint.training.validation_metrics, indent=4)
+                if checkpoint.training
+                else None
+            ),
+        ],
         ["Metadata", json.dumps(checkpoint.metadata or {}, indent=4)],
     ]
 
@@ -64,11 +43,11 @@ def render_checkpoint(checkpoint: experimental.Checkpoint, path: Optional[str] =
 @authentication.required
 def list_checkpoints(args: Namespace) -> None:
     if args.best:
-        sorter = bindings.v1GetExperimentCheckpointsRequestSortBy.SORT_BY_SEARCHER_METRIC
+        sorter = bindings.v1GetExperimentCheckpointsRequestSortBy.SEARCHER_METRIC
     else:
-        sorter = bindings.v1GetExperimentCheckpointsRequestSortBy.SORT_BY_END_TIME
+        sorter = bindings.v1GetExperimentCheckpointsRequestSortBy.END_TIME
     r = bindings.get_GetExperimentCheckpoints(
-        setup_session(args),
+        cli.setup_session(args),
         id=args.experiment_id,
         limit=args.best,
         sortBy=sorter,
@@ -76,17 +55,17 @@ def list_checkpoints(args: Namespace) -> None:
     checkpoints = r.checkpoints
     searcher_metric = ""
     if len(checkpoints) > 0:
-        config = checkpoints[0].experimentConfig or {}
+        config = checkpoints[0].training.experimentConfig or {}
         if "searcher" in config and "metric" in config["searcher"]:
             searcher_metric = str(config["searcher"]["metric"])
 
     def get_validation_metric(c: bindings.v1Checkpoint, metric: str) -> str:
         if (
-            c.metrics
-            and c.metrics.validationMetrics
-            and searcher_metric in c.metrics.validationMetrics
+            c.training.validationMetrics
+            and c.training.validationMetrics.avgMetrics
+            and metric in c.training.validationMetrics.avgMetrics
         ):
-            return str(c.metrics.validationMetrics[searcher_metric])
+            return str(c.training.validationMetrics.avgMetrics[metric])
         return ""
 
     headers = [
@@ -100,9 +79,9 @@ def list_checkpoints(args: Namespace) -> None:
     ]
     values = [
         [
-            c.trialId,
-            c.batchNumber,
-            c.state.value.replace("STATE_", ""),
+            c.training.trialId,
+            c.metadata.get("steps_completed", None),
+            c.state.value.replace("STATE_", "") if c.state is not None else "UNSPECIFIED",
             get_validation_metric(c, searcher_metric),
             c.uuid,
             render.format_resources(c.resources),
@@ -117,7 +96,10 @@ def list_checkpoints(args: Namespace) -> None:
 def download(args: Namespace) -> None:
     checkpoint = Determined(args.master, None).get_checkpoint(args.uuid)
 
-    path = checkpoint.download(path=args.output_dir)
+    try:
+        path = checkpoint.download(path=args.output_dir, mode=args.mode)
+    except errors.CheckpointStateException as ex:
+        raise cli.errors.CliError(str(ex))
 
     if args.quiet:
         print(path)
@@ -128,6 +110,20 @@ def download(args: Namespace) -> None:
 def describe(args: Namespace) -> None:
     checkpoint = Determined(args.master, None).get_checkpoint(args.uuid)
     render_checkpoint(checkpoint)
+
+
+@authentication.required
+def delete_checkpoints(args: Namespace) -> None:
+    if args.yes or render.yes_or_no(
+        "Deleting checkpoints will result in deletion of all data associated\n"
+        "with each checkpoint in the checkpoint storage. Do you still want to proceed?"
+    ):
+        c_uuids = args.checkpoints_uuids.split(",")
+        delete_body = bindings.v1DeleteCheckpointsRequest(checkpointUuids=c_uuids)
+        bindings.delete_DeleteCheckpoints(cli.setup_session(args), body=delete_body)
+        print("Deletion of checkpoints {} is in progress".format(args.checkpoints_uuids))
+    else:
+        print("Aborting deletion of checkpoints.")
 
 
 main_cmd = Cmd(
@@ -153,6 +149,19 @@ main_cmd = Cmd(
                     action="store_true",
                     help="Only print the path to the checkpoint.",
                 ),
+                Arg(
+                    "--mode",
+                    choices=list(DownloadMode),
+                    default=DownloadMode.AUTO,
+                    type=DownloadMode,
+                    help=(
+                        "Select different download modes: "
+                        f"'{DownloadMode.DIRECT}' to directly download from checkpoint storage; "
+                        f"'{DownloadMode.MASTER}' to download via the master; "
+                        f"'{DownloadMode.AUTO}' to first attempt a direct download and fall "
+                        f"back to '{DownloadMode.MASTER}'."
+                    ),
+                ),
             ],
         ),
         Cmd(
@@ -160,6 +169,20 @@ main_cmd = Cmd(
             describe,
             "describe checkpoint",
             [Arg("uuid", type=str, help="checkpoint uuid to describe")],
+        ),
+        Cmd(
+            "delete",
+            delete_checkpoints,
+            "delete checkpoints",
+            [
+                Arg("checkpoints_uuids", help="comma-separated list of checkpoints to delete"),
+                Arg(
+                    "--yes",
+                    action="store_true",
+                    default=False,
+                    help="automatically answer yes to prompts",
+                ),
+            ],
         ),
     ],
 )

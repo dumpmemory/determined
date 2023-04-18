@@ -1,3 +1,4 @@
+import { RawJson } from 'shared/types';
 import * as Type from 'types';
 
 import * as utils from './experiment';
@@ -5,17 +6,22 @@ import * as utils from './experiment';
 describe('Experiment Utilities', () => {
   describe('isExperiment', () => {
     it('should validate experiment tasks', () => {
-      const experimentTask = {
+      const experimentTask: Type.ExperimentItem = {
         archived: false,
-        config: {},
+        config: {} as Type.ExperimentConfig,
+        configRaw: {},
+        hyperparameters: {},
         id: 123,
+        jobId: '',
         labels: [],
         name: 'ResNet-50',
         numTrials: 1,
+        projectId: 0,
         resourcePool: 'gpu-pool',
+        searcherType: 'single',
         startTime: '2021-11-29T00:00:00Z',
         state: Type.RunState.Active,
-        username: 'Kenzo',
+        userId: 345,
       };
       expect(utils.isExperiment(experimentTask)).toBe(true);
     });
@@ -26,9 +32,10 @@ describe('Experiment Utilities', () => {
         name: 'Count Active Processed',
         resourcePool: 'cpu-pool',
         startTime: '2021-11-29T00:00:00Z',
-        state: Type.CommandState.Assigned,
+        state: Type.CommandState.Queued,
         type: Type.CommandType.Command,
-        username: 'Kenzo',
+        userId: 345,
+        workspaceId: 0,
       };
       expect(utils.isExperiment(commandTask)).toBe(false);
     });
@@ -54,7 +61,7 @@ describe('Experiment Utilities', () => {
       },
     ];
     it('should detect single trial experiment from config', () => {
-      tests.forEach(test => {
+      tests.forEach((test) => {
         const result = utils.isSingleTrialExperiment(test.input as Type.ExperimentBase);
         expect(result).toStrictEqual(test.output);
       });
@@ -62,7 +69,7 @@ describe('Experiment Utilities', () => {
   });
 
   describe('trialHParamsToExperimentHParams', () => {
-    const tests: { input: Type.TrialHyperparameters, output: Type.RawJson }[] = [
+    const tests: { input: Type.TrialHyperparameters; output: RawJson }[] = [
       {
         input: {
           'arch.n_filters1': 62,
@@ -89,7 +96,7 @@ describe('Experiment Utilities', () => {
       },
     ];
     it('should convert trial hyperparameters to experiment config hyperparameters', () => {
-      tests.forEach(test => {
+      tests.forEach((test) => {
         const result = utils.trialHParamsToExperimentHParams(test.input);
         expect(result).toStrictEqual(test.output);
       });
@@ -124,7 +131,7 @@ describe('Experiment Utilities', () => {
           output: { searcher: { max_length: { batches: 1000 } } },
         },
       ];
-      tests.forEach(test => {
+      tests.forEach((test) => {
         expect(utils.upgradeConfig(test.input)).toStrictEqual(test.output);
       });
     });

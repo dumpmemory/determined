@@ -7,17 +7,44 @@ import (
 	"strings"
 )
 
-// Defaultable means an object can have custom behvaiors for schemas.WithDefaults.  This is useful
-// for implementing "runtime default" behaviors, like experiment seed or name.  It is also
-// useful for working around types we do not own and which schemas.WithDefaults() would puke on.
-type Defaultable interface {
-	// Defaultable should return the same type.  It must not be defined as a method against a
-	// pointer of the type or it will not work.
-	WithDefaults() interface{}
+// defaultIfDefaultable checks if obj implements our Defaultable psuedointerface and calls
+// .WithDefaults if it does.
+//
+// The Defaultable psuedointerface is defined as:
+//
+//	"x.WithDefaults() returns another object with the same type as x".
+//
+// Defaultable is not a real go interface, it's more of a "psuedointerface".  See explanation on
+// copyIfCopyable.
+//
+// In practice, Defaultable means an object can have custom behvaiors for schemas.WithDefaults.
+// This is useful for implementing "runtime default" behaviors, like experiment seed or name.  It is
+// also useful for working around types we do not own and which schemas.WithDefaults() would puke
+// on.
+func defaultIfDefaultable(obj reflect.Value) (reflect.Value, bool) {
+	var out reflect.Value
+
+	// Look for the .WithDefaults method.
+	meth, ok := obj.Type().MethodByName("WithDefaults")
+	if !ok {
+		return out, false
+	}
+
+	// Verify the signature matches our Defaultable psuedointerface:
+	// - one input (the receiver), and one output
+	// - input type matches output type exactly (without the usual pointer receiver semantics)
+	if meth.Type.NumIn() != 1 || meth.Type.NumOut() != 1 || meth.Type.In(0) != meth.Type.Out(0) {
+		return out, false
+	}
+
+	// Psuedointerface matches, call the .WithDefaults method.
+	out = meth.Func.Call([]reflect.Value{obj})[0]
+
+	return out, true
 }
 
 // WithDefaults will recurse through structs, maps, and slices, setting default values for any
-// struct fields whose struct implements the Defaultable interface.  This lets us read default
+// struct fields whose struct implements the Defaultable pusedointerface.  This lets us read default
 // values out of json-schema automatically.
 //
 // There are some forms of defaults which must be filled at runtimes, such as giving a default
@@ -26,20 +53,19 @@ type Defaultable interface {
 //
 // Example usage:
 //
-//    config, err := expconf.ParseAnyExperimentConfigYAML(bytes)
+//	config, err := expconf.ParseAnyExperimentConfigYAML(bytes)
 //
-//    // Use the cluster checkpoint storage if the user did not specify one.
-//    config.RawCheckpointStorage = schemas.Merge(
-//        config.RawCheckpointStorage, &cluster_default_storage
-//    ).(*expconf.CheckpointStorageConfig)
+//	// Use the cluster checkpoint storage if the user did not specify one.
+//	config.RawCheckpointStorage = schemas.Merge(
+//	    config.RawCheckpointStorage, &cluster_default_storage
+//	)
 //
-//    // Define any remaining undefined values.
-//    config = schemas.WithDefaults(config).(expconf.ExperimentConfig)
-//
-func WithDefaults(obj interface{}) interface{} {
+//	// Define any remaining undefined values.
+//	config = schemas.WithDefaults(config)
+func WithDefaults[T any](obj T) T {
 	vObj := reflect.ValueOf(obj)
 	name := fmt.Sprintf("%T", obj)
-	return withDefaults(vObj, nil, name).Interface()
+	return withDefaults(vObj, nil, name).Interface().(T)
 }
 
 func getDefaultSource(obj reflect.Value) interface{} {
@@ -86,10 +112,8 @@ func withDefaults(obj reflect.Value, defaultBytes []byte, name string) reflect.V
 		}
 	}
 
-	if obj.Kind() != reflect.Ptr {
-		if defaultable, ok := obj.Interface().(Defaultable); ok {
-			return reflect.ValueOf(defaultable.WithDefaults())
-		}
+	if out, ok := defaultIfDefaultable(obj); ok {
+		return out
 	}
 
 	var out reflect.Value
@@ -175,20 +199,20 @@ func jsonNameFromJSONTag(tag string) string {
 //
 // For example, with the schema:
 //
-//     {
-//         "properties": {
-//             "hello": {
-//                 "type": ["string", "null"],
-//                 "default": "world"
-//             }
-//          }
-//      }
+//	{
+//	    "properties": {
+//	        "hello": {
+//	            "type": ["string", "null"],
+//	            "default": "world"
+//	        }
+//	     }
+//	 }
 //
 // and with the struct:
 //
-//     type X struct {
-//         Hello    string `json:"hello"`
-//     }
+//	type X struct {
+//	    Hello    string `json:"hello"`
+//	}
 //
 // then findDefaultInSchema(schema, reflect.TypeOf(x).FieldByName("Hello")) returns "world".
 func findDefaultInSchema(schema interface{}, field reflect.StructField) []byte {

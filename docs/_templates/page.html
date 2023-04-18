@@ -1,27 +1,21 @@
-{%- extends "!page.html" %}
+{# We are modifying the theme's page.html directly here.  We aren't totally
+   overwriting it or we would extend "base.html" like the theme's page.html does,
+   but rather we are just overwriting specific blocks from it. #}
+{% extends "!page.html" %}
 
-{#-
+{# Include a link tag to the root of the tree from this page.  This is used to
+   calculate the relative search results from Algolia.  Also embed the version,
+   which we also need for configuring algolia search. #}
+{% block linktags %}
+{{ super() }}
+<link rel="root" title="{{ _("Root") }}"
+      version="{{ version }}" href="{{ pathto("index") }}"/>
+{% endblock %}
 
-This template exists as a way to implement a version menu without changing what
-the theme normally renders the menu on local builds and on builds on Read the
-Docs. This is for local testing purposes only.
+{# Include an analytics script. #}
+{% block extrahead %}
+{% include "analytics.html" %}
 
-#}
-
-{% block theme_scripts -%}
-<!-- Analytics -->
-<script>
-    window.ga=window.ga||function(){(ga.q=ga.q||[]).push(arguments)};ga.l=+new Date;
-
-    ga('create', 'UA-110089850-1', 'auto');
-    ga('set', 'transport', 'beacon');
-    ga('send', 'pageview');
-</script>
-<script async src='https://www.google-analytics.com/analytics.js'></script>
-
-<script type="text/javascript">
-    var DID=258260;
-    var MyPageName = window.location.href.replace("http://","");
-</script>
-<script async src="//stats.sa-as.com/live.js"></script>
-{%- endblock theme_scripts -%}
+{# Provide a location for the `make live` to inject a reload script. #}
+<!--dev-reload-script-location-->
+{% endblock %}

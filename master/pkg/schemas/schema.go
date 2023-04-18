@@ -9,6 +9,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/santhosh-tekuri/jsonschema/v2"
+	"github.com/sirupsen/logrus"
 
 	"github.com/determined-ai/determined/master/pkg/schemas/extensions"
 )
@@ -54,9 +55,11 @@ func IsComplete(schema Schema) error {
 	return nil
 }
 
-var validatorCacheLock sync.RWMutex
-var sanityValidators = map[string]*jsonschema.Schema{}
-var completenessValidators = map[string]*jsonschema.Schema{}
+var (
+	validatorCacheLock     sync.RWMutex
+	sanityValidators       = map[string]*jsonschema.Schema{}
+	completenessValidators = map[string]*jsonschema.Schema{}
+)
 
 // Create a jsonschema.Compiler with all the schemas preloaded.
 func newCompiler() *jsonschema.Compiler {
@@ -64,6 +67,7 @@ func newCompiler() *jsonschema.Compiler {
 
 	for url, byts := range schemaBytesMap() {
 		if err := compiler.AddResource(url, bytes.NewReader(byts)); err != nil {
+			logrus.WithError(err).Error("Invalid schema")
 			panic("invalid schema: " + url)
 		}
 	}
@@ -94,11 +98,11 @@ func GetSanityValidator(url string) *jsonschema.Schema {
 	compiler.Extensions["union"] = extensions.UnionExtension()
 	compiler.Extensions["checks"] = extensions.ChecksExtension()
 	compiler.Extensions["compareProperties"] = extensions.ComparePropertiesExtension()
-	compiler.Extensions["conditional"] = extensions.ConditionalExtension()
 	compiler.Extensions["optionalRef"] = extensions.OptionalRefExtension()
 
 	validator, err := compiler.Compile(url)
 	if err != nil {
+		logrus.WithError(err).Error("Uncompilable schema")
 		panic("uncompilable schema: " + url)
 	}
 
@@ -130,7 +134,6 @@ func GetCompletenessValidator(url string) *jsonschema.Schema {
 	compiler.Extensions["union"] = extensions.UnionExtension()
 	compiler.Extensions["checks"] = extensions.ChecksExtension()
 	compiler.Extensions["compareProperties"] = extensions.ComparePropertiesExtension()
-	compiler.Extensions["conditional"] = extensions.ConditionalExtension()
 	compiler.Extensions["optionalRef"] = extensions.OptionalRefExtension()
 	compiler.Extensions["eventuallyRequired"] = extensions.EventuallyRequiredExtension()
 	compiler.Extensions["eventually"] = extensions.EventuallyExtension()

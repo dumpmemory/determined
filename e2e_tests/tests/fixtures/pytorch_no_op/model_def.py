@@ -3,15 +3,17 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
-import yaml
 from torch import nn
 
-from determined import experimental, pytorch
+from determined import pytorch
 
 
 class OnesDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset_len: int) -> None:
+        self.dataset_len = dataset_len
+
     def __len__(self) -> int:
-        return 64
+        return self.dataset_len
 
     def __getitem__(self, index: int) -> Tuple:
         return torch.Tensor([float(1)])
@@ -20,6 +22,7 @@ class OnesDataset(torch.utils.data.Dataset):
 class NoopPyTorchTrial(pytorch.PyTorchTrial):
     def __init__(self, context: pytorch.PyTorchTrialContext):
         self.context = context
+        self.dataset_len = context.get_hparam("dataset_len")
 
         model = nn.Linear(1, 1, False)
         model.weight.data.fill_(0)
@@ -39,7 +42,9 @@ class NoopPyTorchTrial(pytorch.PyTorchTrial):
         self.context.backward(loss)
         self.context.step_optimizer(self.opt)
 
-        print("finished train_batch for rank {}".format(self.context.distributed.get_rank()))
+        rank = self.context.distributed.get_rank()
+        print(f"finished train_batch for rank {rank}")
+        print(f"rank {rank} finished batch {batch_idx} in epoch {epoch_idx}")
 
         return {"loss": loss, "w_real": w_real}
 
@@ -50,7 +55,7 @@ class NoopPyTorchTrial(pytorch.PyTorchTrial):
         torch_rand = torch.randint(1000, (1,))
         gpu_rand = torch.randint(1000, (1,), device=self.context.device)
 
-        print("finished evaluate_batch for rank {}".format(self.context.distributed.get_rank()))
+        print(f"finished evaluate_batch for rank {self.context.distributed.get_rank()}")
 
         return {
             "validation_error": val,
@@ -61,40 +66,11 @@ class NoopPyTorchTrial(pytorch.PyTorchTrial):
         }
 
     def build_training_data_loader(self):
-        return pytorch.DataLoader(OnesDataset(), batch_size=self.context.get_per_slot_batch_size())
+        return pytorch.DataLoader(
+            OnesDataset(self.dataset_len), batch_size=self.context.get_per_slot_batch_size()
+        )
 
     def build_validation_data_loader(self):
-        return pytorch.DataLoader(OnesDataset(), batch_size=self.context.get_per_slot_batch_size())
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--slots-per-trial", default="1")
-    args = parser.parse_args()
-
-    conf = yaml.safe_load(
-        f"""
-    description: noop-pytorch-native-api
-    data:
-      model_type: single_output
-    hyperparameters:
-      global_batch_size: 32
-    scheduling_unit: 1
-    searcher:
-      name: single
-      metric: validation_error
-      max_length:
-        batches: 3
-      smaller_is_better: true
-    max_restarts: 0
-    min_checkpoint_period:
-      batches: 1
-    min_validation_period:
-      batches: 1
-    resources:
-      slots_per_trial: {args.slots_per_trial}
-    """
-    )
-    experimental.create(NoopPyTorchTrial, conf, context_dir=".")
+        return pytorch.DataLoader(
+            OnesDataset(self.dataset_len), batch_size=self.context.get_per_slot_batch_size()
+        )

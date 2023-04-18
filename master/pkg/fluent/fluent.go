@@ -2,7 +2,6 @@ package fluent
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/determined-ai/determined/master/pkg/model"
@@ -16,7 +15,6 @@ const (
 	nonRootUID       = 65532
 	nonRootGroupName = "nonroot"
 	nonRootGID       = 65532
-	nonRootHome      = "/home/nonroot/"
 )
 
 // NonRootAgentUserGroup is a non-root agent user group that should exist by default
@@ -81,6 +79,10 @@ func makeOutputConfig(
   storage.total_limit_size 1G
 `, masterHost, masterPort)
 
+		if c := loggingConfig.DefaultLoggingConfig.AdditionalFluentOutputs; c != nil {
+			fmt.Fprint(config, *c)
+		}
+
 	case loggingConfig.ElasticLoggingConfig != nil:
 		elasticOpts := loggingConfig.ElasticLoggingConfig
 
@@ -109,6 +111,10 @@ func makeOutputConfig(
   HTTP_User   %s
   HTTP_Passwd %s
 `, *elasticOpts.Security.Username, *elasticOpts.Security.Password)
+		}
+
+		if c := elasticOpts.AdditionalFluentOutputs; c != nil {
+			fmt.Fprint(config, *c)
 		}
 
 	default:
@@ -150,7 +156,6 @@ func ContainerConfig(
 	filters []ConfigSection,
 	loggingConfig model.LoggingConfig,
 	tlsConfig model.TLSClientConfig,
-	asNonRoot bool,
 ) ([]string, map[string][]byte) {
 	const luaPath = "tonumber.lua"
 	const configPath = "fluent.conf"
@@ -187,18 +192,12 @@ end
 
 	var config strings.Builder
 
-	bufferDir := "/var/log/flb-buffers"
-	if asNonRoot {
-		bufferDir = filepath.Join(nonRootHome, "flb-buffers")
-	}
-
 	fmt.Fprintf(&config, `
 [SERVICE]
   # Flush every .05 seconds to reduce latency for users.
   Flush .05
   Parsers_File %s
-  storage.path %s
-`, parserConfigPath, bufferDir)
+`, parserConfigPath)
 
 	for _, input := range inputs {
 		fmt.Fprintf(&config, `[INPUT]

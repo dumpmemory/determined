@@ -1,0 +1,360 @@
+import { FilterDropdownProps } from 'antd/es/table/interface';
+import React, { Key, useCallback, useEffect, useMemo, useState } from 'react';
+
+import Badge, { BadgeType } from 'components/Badge';
+import CheckpointModalTrigger from 'components/CheckpointModalTrigger';
+import { useModal } from 'components/kit/Modal';
+import ModelCreateModal from 'components/ModelCreateModal';
+import Section from 'components/Section';
+import InteractiveTable, { ContextMenuProps } from 'components/Table/InteractiveTable';
+import SkeletonTable from 'components/Table/SkeletonTable';
+import {
+  defaultRowClassName,
+  getFullPaginationConfig,
+  HumanReadableNumberRenderer,
+} from 'components/Table/Table';
+import TableBatch from 'components/Table/TableBatch';
+import TableFilterDropdown from 'components/Table/TableFilterDropdown';
+import useModalCheckpointDelete from 'hooks/useModal/Checkpoint/useModalCheckpointDelete';
+import useModalCheckpointRegister from 'hooks/useModal/Checkpoint/useModalCheckpointRegister';
+import { UpdateSettings, useSettings } from 'hooks/useSettings';
+import { getExperimentCheckpoints } from 'services/api';
+import { Checkpointv1State, V1GetExperimentCheckpointsRequestSortBy } from 'services/api-ts-sdk';
+import { encodeCheckpointState } from 'services/decoder';
+import ActionDropdown from 'shared/components/ActionDropdown/ActionDropdown';
+import { ModalCloseReason } from 'shared/hooks/useModal/useModal';
+import usePolling from 'shared/hooks/usePolling';
+import { RecordKey } from 'shared/types';
+import { ErrorLevel, ErrorType } from 'shared/utils/error';
+import { validateDetApiEnum, validateDetApiEnumList } from 'shared/utils/service';
+import {
+  checkpointAction,
+  CheckpointAction,
+  CheckpointState,
+  CoreApiGenericCheckpoint,
+  ExperimentBase,
+} from 'types';
+import { canActionCheckpoint, getActionsForCheckpointsUnion } from 'utils/checkpoint';
+import handleError from 'utils/error';
+
+import { configForExperiment, Settings } from './ExperimentCheckpoints.settings';
+import { columns as defaultColumns } from './ExperimentCheckpoints.table';
+
+interface Props {
+  experiment: ExperimentBase;
+  pageRef: React.RefObject<HTMLElement>;
+}
+
+const batchActions = [checkpointAction.Register, checkpointAction.Delete];
+
+const ExperimentCheckpoints: React.FC<Props> = ({ experiment, pageRef }: Props) => {
+  const [total, setTotal] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  const [checkpoints, setCheckpoints] = useState<CoreApiGenericCheckpoint[]>();
+  const [canceler] = useState(new AbortController());
+
+  const config = useMemo(() => configForExperiment(experiment.id), [experiment.id]);
+  const { settings, updateSettings } = useSettings<Settings>(config);
+
+  const modelCreateModal = useModal(ModelCreateModal);
+
+  const {
+    contextHolder: modalCheckpointRegisterContextHolder,
+    modalOpen: openModalCheckpointRegister,
+  } = useModalCheckpointRegister({
+    onClose: (reason?: ModalCloseReason, checkpoints?: string[]) => {
+      // TODO: fix the behavior along with checkpoint modal migration
+      // It used to open checkpoint modal again after creating a model,
+      // but it doesn't with new create model modal since we don't use context holder anymore.
+      // This should be able to fix it along with checkpoint modal migration.
+      if (checkpoints) modelCreateModal.open();
+    },
+  });
+
+  const handleOnCloseCreateModel = useCallback(
+    (reason?: ModalCloseReason, checkpoints?: string[], modelName?: string) => {
+      if (checkpoints) openModalCheckpointRegister({ checkpoints, selectedModelName: modelName });
+    },
+    [openModalCheckpointRegister],
+  );
+
+  const {
+    contextHolder: modalCheckpointDeleteContextHolder,
+    modalOpen: openModalCheckpointDelete,
+  } = useModalCheckpointDelete({});
+
+  const clearSelected = useCallback(() => {
+    updateSettings({ row: undefined });
+  }, [updateSettings]);
+
+  const handleStateFilterApply = useCallback(
+    (states: string[]) => {
+      updateSettings({
+        row: undefined,
+        state: states.length !== 0 ? (states as CheckpointState[]) : undefined,
+      });
+    },
+    [updateSettings],
+  );
+
+  const handleStateFilterReset = useCallback(() => {
+    updateSettings({ row: undefined, state: undefined });
+  }, [updateSettings]);
+
+  const stateFilterDropdown = useCallback(
+    (filterProps: FilterDropdownProps) => {
+      return (
+        <TableFilterDropdown
+          {...filterProps}
+          multiple
+          values={settings.state}
+          onFilter={handleStateFilterApply}
+          onReset={handleStateFilterReset}
+        />
+      );
+    },
+    [handleStateFilterApply, handleStateFilterReset, settings.state],
+  );
+
+  const handleRegisterCheckpoint = useCallback(
+    (checkpoints: string[]) => {
+      openModalCheckpointRegister({ checkpoints });
+    },
+    [openModalCheckpointRegister],
+  );
+
+  const handleDeleteCheckpoint = useCallback(
+    (checkpoints: string[]) => {
+      openModalCheckpointDelete({ checkpoints });
+    },
+    [openModalCheckpointDelete],
+  );
+
+  const dropDownOnTrigger = useCallback(
+    (checkpoints: string | string[]) => {
+      const checkpointsArr = Array.isArray(checkpoints) ? checkpoints : [checkpoints];
+      return {
+        [checkpointAction.Register]: () => handleRegisterCheckpoint(checkpointsArr),
+        [checkpointAction.Delete]: () => handleDeleteCheckpoint(checkpointsArr),
+      };
+    },
+    [handleDeleteCheckpoint, handleRegisterCheckpoint],
+  );
+
+  const CheckpointActionDropdown: React.FC<ContextMenuProps<CoreApiGenericCheckpoint>> =
+    useCallback(
+      ({ record, onVisibleChange, children }) => {
+        return (
+          <ActionDropdown<CheckpointAction>
+            actionOrder={batchActions}
+            danger={{ [checkpointAction.Delete]: true }}
+            disabled={{
+              [checkpointAction.Register]: !canActionCheckpoint(checkpointAction.Register, record),
+              [checkpointAction.Delete]: !canActionCheckpoint(checkpointAction.Delete, record),
+            }}
+            id={record.uuid}
+            kind="checkpoint"
+            trigger={['contextMenu']}
+            onError={handleError}
+            onTrigger={dropDownOnTrigger(record.uuid)}
+            onVisibleChange={onVisibleChange}>
+            {children}
+          </ActionDropdown>
+        );
+      },
+      [dropDownOnTrigger],
+    );
+
+  const columns = useMemo(() => {
+    const actionRenderer = (_: string, record: CoreApiGenericCheckpoint): React.ReactNode => (
+      <ActionDropdown<CheckpointAction>
+        actionOrder={batchActions}
+        danger={{ [checkpointAction.Delete]: true }}
+        disabled={{
+          [checkpointAction.Register]: !canActionCheckpoint(checkpointAction.Register, record),
+          [checkpointAction.Delete]: !canActionCheckpoint(checkpointAction.Delete, record),
+        }}
+        id={record.uuid}
+        kind="checkpoint"
+        onError={handleError}
+        onTrigger={dropDownOnTrigger(record.uuid)}
+      />
+    );
+
+    const checkpointRenderer = (_: string, record: CoreApiGenericCheckpoint): React.ReactNode => {
+      return (
+        <CheckpointModalTrigger
+          checkpoint={record}
+          experiment={experiment}
+          title={`Checkpoint ${record.uuid}`}
+        />
+      );
+    };
+
+    const newColumns = [...defaultColumns].map((column) => {
+      column.sortOrder = null;
+      if (column.key === 'checkpoint') {
+        column.render = checkpointRenderer;
+      } else if (column.key === V1GetExperimentCheckpointsRequestSortBy.STATE) {
+        column.filterDropdown = stateFilterDropdown;
+        column.isFiltered = (settings) => !!(settings as Settings).state;
+        column.filters = Object.values(CheckpointState)
+          .filter((value) => value !== CheckpointState.Unspecified)
+          .map((value) => ({
+            text: <Badge state={value} type={BadgeType.State} />,
+            value,
+          }));
+      } else if (column.key === V1GetExperimentCheckpointsRequestSortBy.SEARCHERMETRIC) {
+        column.render = HumanReadableNumberRenderer;
+        column.title = `Searcher Metric (${experiment.config.searcher.metric})`;
+      } else if (column.key === 'actions') {
+        column.render = actionRenderer;
+      }
+      if (column.key === settings.sortKey) {
+        column.sortOrder = settings.sortDesc ? 'descend' : 'ascend';
+      }
+      return column;
+    });
+
+    return newColumns;
+  }, [dropDownOnTrigger, experiment, settings.sortDesc, settings.sortKey, stateFilterDropdown]);
+
+  const stateString = settings.state?.join('.');
+  const fetchExperimentCheckpoints = useCallback(async () => {
+    if (!settings) return;
+    try {
+      const states = stateString
+        ?.split('.')
+        .map((state) => encodeCheckpointState(state as CheckpointState));
+      const response = await getExperimentCheckpoints(
+        {
+          id: experiment.id,
+          limit: settings.tableLimit,
+          offset: settings.tableOffset,
+          orderBy: settings.sortDesc ? 'ORDER_BY_DESC' : 'ORDER_BY_ASC',
+          sortBy: validateDetApiEnum(V1GetExperimentCheckpointsRequestSortBy, settings.sortKey),
+          states: validateDetApiEnumList(Checkpointv1State, states),
+        },
+        { signal: canceler.signal },
+      );
+      setTotal(response.pagination.total ?? 0);
+      setCheckpoints(response.checkpoints);
+    } catch (e) {
+      handleError(e, {
+        publicSubject: `Unable to fetch experiment ${experiment.id} checkpoints.`,
+        silent: true,
+        type: ErrorType.Api,
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [experiment.id, canceler, settings, stateString]);
+
+  const submitBatchAction = useCallback(
+    async (action: CheckpointAction) => {
+      if (!settings.row) return;
+      try {
+        dropDownOnTrigger(settings.row)[action]();
+
+        // Refetch experiment list to get updates based on batch action.
+        await fetchExperimentCheckpoints();
+      } catch (e) {
+        const publicSubject = `Unable to ${action} Selected Checkpoints`;
+        handleError(e, {
+          level: ErrorLevel.Error,
+          publicMessage: 'Please try again later.',
+          publicSubject,
+          silent: false,
+          type: ErrorType.Server,
+        });
+      }
+    },
+    [dropDownOnTrigger, fetchExperimentCheckpoints, settings.row],
+  );
+
+  const { stopPolling } = usePolling(fetchExperimentCheckpoints, { rerunOnNewFn: true });
+
+  // Get new trials based on changes to the pagination, sorter and filters.
+  useEffect(() => {
+    setIsLoading(true);
+    fetchExperimentCheckpoints();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      canceler.abort();
+      stopPolling();
+    };
+  }, [canceler, stopPolling]);
+
+  const handleTableRowSelect = useCallback(
+    (rowKeys?: Key[]) => {
+      updateSettings({ row: rowKeys?.map(String) });
+    },
+    [updateSettings],
+  );
+
+  const checkpointMap = useMemo(() => {
+    return (checkpoints ?? []).reduce((acc, checkpoint) => {
+      acc[checkpoint.uuid] = checkpoint;
+      return acc;
+    }, {} as Record<RecordKey, CoreApiGenericCheckpoint>);
+  }, [checkpoints]);
+
+  const availableBatchActions = useMemo(() => {
+    const checkpoints = settings.row?.map((uuid) => checkpointMap[uuid]) ?? [];
+    return getActionsForCheckpointsUnion(checkpoints, batchActions);
+  }, [checkpointMap, settings.row]);
+
+  return (
+    <>
+      <Section>
+        <TableBatch
+          actions={batchActions.map((action) => ({
+            disabled: !availableBatchActions.includes(action),
+            label: action,
+            value: action,
+          }))}
+          selectedRowCount={(settings.row ?? []).length}
+          onAction={(action) => submitBatchAction(action)}
+          onClear={clearSelected}
+        />
+        {settings ? (
+          <InteractiveTable
+            columns={columns}
+            containerRef={pageRef}
+            ContextMenu={CheckpointActionDropdown}
+            dataSource={checkpoints}
+            loading={isLoading}
+            pagination={getFullPaginationConfig(
+              {
+                limit: settings.tableLimit,
+                offset: settings.tableOffset,
+              },
+              total,
+            )}
+            rowClassName={defaultRowClassName({ clickable: false })}
+            rowKey="uuid"
+            rowSelection={{
+              onChange: handleTableRowSelect,
+              preserveSelectedRowKeys: true,
+              selectedRowKeys: settings.row ?? [],
+            }}
+            settings={settings}
+            showSorterTooltip={false}
+            size="small"
+            updateSettings={updateSettings as UpdateSettings}
+          />
+        ) : (
+          <SkeletonTable columns={columns.length} />
+        )}
+      </Section>
+      <modelCreateModal.Component onClose={handleOnCloseCreateModel} />
+      {modalCheckpointRegisterContextHolder}
+      {modalCheckpointDeleteContextHolder}
+    </>
+  );
+};
+
+export default ExperimentCheckpoints;

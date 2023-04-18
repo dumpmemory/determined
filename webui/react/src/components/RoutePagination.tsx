@@ -1,6 +1,7 @@
-import { Pagination, Tooltip } from 'antd';
 import React, { useCallback, useEffect, useState } from 'react';
 
+import Pagination from 'components/kit/Pagination';
+import Tooltip from 'components/kit/Tooltip';
 import { keyEmitter, KeyEvent } from 'hooks/useKeyTracker';
 
 import css from './RoutePagination.module.scss';
@@ -12,12 +13,14 @@ interface Props {
   tooltipLabel?: string;
 }
 
-const RoutePagination: React.FC<Props> =
-({ currentId, ids, onSelectId, tooltipLabel }: Props) => {
-  const [ currentPage, setCurrentPage ] = useState<number>(0);
-  const navigateToId = useCallback((page: number) => {
-    onSelectId(ids[page - 1]);
-  }, [ ids, onSelectId ]);
+const RoutePagination: React.FC<Props> = ({ currentId, ids, onSelectId, tooltipLabel }: Props) => {
+  const [currentPage, setCurrentPage] = useState<number>(0);
+  const navigateToId = useCallback(
+    (page: number) => {
+      onSelectId(ids[page - 1]);
+    },
+    [ids, onSelectId],
+  );
 
   useEffect(() => {
     const keyUpListener = (e: KeyboardEvent) => {
@@ -33,21 +36,22 @@ const RoutePagination: React.FC<Props> =
     return () => {
       keyEmitter.off(KeyEvent.KeyUp, keyUpListener);
     };
-  }, [ currentPage, ids, navigateToId ]);
+  }, [currentPage, ids, navigateToId]);
 
   useEffect(() => {
     const idx = ids.findIndex((i: number) => i === currentId);
     setCurrentPage(idx + 1);
-  }, [ ids, currentId, setCurrentPage ]);
+  }, [ids, currentId, setCurrentPage]);
 
   return (
     <div className={css.base}>
       <Pagination
         current={currentPage}
         itemRender={(page, type, originalElement) => {
-          if (tooltipLabel &&
-            (type === 'prev' && currentPage > 1) ||
-            (type === 'next' && currentPage < ids.length)) {
+          if (
+            (tooltipLabel && type === 'prev' && currentPage > 1) ||
+            (type === 'next' && currentPage < ids.length)
+          ) {
             return (
               <Tooltip
                 placement="bottom"

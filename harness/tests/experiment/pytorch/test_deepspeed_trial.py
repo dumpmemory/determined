@@ -39,7 +39,7 @@ def manual_init_distributed() -> Iterator[None]:
 @pytest.mark.gpu
 class TestDeepSpeedTrial:
     def setup_method(self) -> None:
-        # These environment variables are usually set by the launcher but we set them manually here
+        # These environment variables are usually set by the launcher, but we set them manually here
         # since they are required internally by the deepspeed model engine.
         os.environ["RANK"] = "0"
         os.environ["LOCAL_RANK"] = "0"
@@ -462,7 +462,7 @@ class TestDeepSpeedTrial:
             workloads: workload.Stream,
             checkpoint_dir: Optional[str] = None,
             latest_checkpoint: Optional[Dict[str, Any]] = None,
-            latest_batch: int = 0,
+            steps_completed: int = 0,
         ) -> determined.TrialController:
             return utils.make_trial_controller_from_trial_implementation(
                 trial_class=deepspeed_linear_model.LinearPipelineEngineTrial,
@@ -471,7 +471,7 @@ class TestDeepSpeedTrial:
                 trial_seed=self.trial_seed,
                 checkpoint_dir=checkpoint_dir,
                 latest_checkpoint=latest_checkpoint,
-                latest_batch=latest_batch,
+                steps_completed=steps_completed,
                 expose_gpus=True,
             )
 
@@ -481,7 +481,7 @@ class TestDeepSpeedTrial:
         # Build, train, and save a checkpoint with the normal hyperparameters.
         checkpoint_dir = str(tmp_path.joinpath("checkpoint"))
         latest_checkpoint = None
-        latest_batch = 0
+        steps_completed = 0
 
         def make_workloads_1() -> workload.Stream:
             trainer = utils.TrainAndValidate()
@@ -492,9 +492,9 @@ class TestDeepSpeedTrial:
             )
             interceptor = workload.WorkloadResponseInterceptor()
             yield from interceptor.send(workload.checkpoint_workload())
-            nonlocal latest_checkpoint, latest_batch
+            nonlocal latest_checkpoint, steps_completed
             latest_checkpoint = interceptor.metrics_result()["uuid"]
-            latest_batch = trainer.get_latest_batch()
+            steps_completed = trainer.get_steps_completed()
 
         controller1 = utils.make_trial_controller_from_trial_implementation(
             trial_class=deepspeed_linear_model.LinearDeepSpeedTrial,
@@ -523,7 +523,7 @@ class TestDeepSpeedTrial:
                 trial_seed=self.trial_seed,
                 checkpoint_dir=checkpoint_dir,
                 latest_checkpoint=latest_checkpoint,
-                latest_batch=latest_batch,
+                steps_completed=steps_completed,
                 expose_gpus=True,
             )
             controller2.run()
@@ -543,7 +543,7 @@ class TestDeepSpeedTrial:
     def test_callbacks(self, tmp_path: pathlib.Path) -> None:
         checkpoint_dir = tmp_path.joinpath("checkpoint")
         latest_checkpoint = None
-        latest_batch = 0
+        steps_completed = 0
 
         controller = None
 
@@ -557,10 +557,12 @@ class TestDeepSpeedTrial:
                 "trial_startups": 1,
                 "validation_steps_started": 0,
                 "validation_steps_ended": 0,
-                "checkpoints_ended": 0,
+                "checkpoints_written": 0,
+                "checkpoints_uploaded": 0,
                 "training_started_times": 1,
                 "training_epochs_started": 2,
                 "training_epochs_ended": 2,
+                "training_workloads_ended": 1,
                 "trial_shutdowns": 0,
             }
 
@@ -569,26 +571,30 @@ class TestDeepSpeedTrial:
                 "trial_startups": 1,
                 "validation_steps_started": 1,
                 "validation_steps_ended": 1,
-                "checkpoints_ended": 0,
+                "checkpoints_written": 0,
+                "checkpoints_uploaded": 0,
                 "training_started_times": 1,
                 "training_epochs_started": 2,
                 "training_epochs_ended": 2,
+                "training_workloads_ended": 1,
                 "trial_shutdowns": 0,
             }
 
             interceptor = workload.WorkloadResponseInterceptor()
             yield from interceptor.send(workload.checkpoint_workload())
-            nonlocal latest_checkpoint, latest_batch
+            nonlocal latest_checkpoint, steps_completed
             latest_checkpoint = interceptor.metrics_result()["uuid"]
-            latest_batch = 1
+            steps_completed = 1
             assert controller.trial.counter.__dict__ == {
                 "trial_startups": 1,
                 "validation_steps_started": 1,
                 "validation_steps_ended": 1,
-                "checkpoints_ended": 1,
+                "checkpoints_written": 1,
+                "checkpoints_uploaded": 1,
                 "training_started_times": 1,
                 "training_epochs_started": 2,
                 "training_epochs_ended": 2,
+                "training_workloads_ended": 1,
                 "trial_shutdowns": 0,
             }
 
@@ -613,18 +619,23 @@ class TestDeepSpeedTrial:
             workloads=make_workloads2(),
             checkpoint_dir=str(checkpoint_dir),
             latest_checkpoint=latest_checkpoint,
-            latest_batch=latest_batch,
+            steps_completed=steps_completed,
             expose_gpus=True,
         )
         controller.run()
         assert controller.trial.counter.__dict__ == {
+            # Note: trial_startups will get reset by the loading logic.
             "trial_startups": 1,
             "validation_steps_started": 1,
             "validation_steps_ended": 1,
-            "checkpoints_ended": 0,
+            # Note: checkpoints_written, checkpoints_uploaded, and trial_shutdowns, cannot be
+            # persisted, as they are all updated after checkpointing.
+            "checkpoints_written": 0,
+            "checkpoints_uploaded": 0,
             "training_started_times": 2,
             "training_epochs_started": 3,
             "training_epochs_ended": 3,
+            "training_workloads_ended": 2,
             "trial_shutdowns": 1,
         }
 

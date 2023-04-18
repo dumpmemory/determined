@@ -1,14 +1,20 @@
 package internal
 
 import (
+	"context"
 	"fmt"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/determined-ai/determined/master/internal/prom"
+	"github.com/determined-ai/determined/master/internal/rm"
 	"github.com/determined-ai/determined/master/internal/task"
 
 	"github.com/determined-ai/determined/master/pkg/actor/actors"
 	"github.com/determined-ai/determined/master/pkg/logger"
+	"github.com/determined-ai/determined/master/pkg/mathx"
 	"github.com/determined-ai/determined/master/pkg/ptrs"
 
 	"github.com/pkg/errors"
@@ -23,11 +29,19 @@ import (
 	"github.com/determined-ai/determined/master/pkg/tasks"
 )
 
+// A list of errors for which we don't want to attempt any retries of the experiment.
+// These are errors that no matter how many times we retry, the outcome will still result
+// in the same error.
+var nonRetryableErrors = []*regexp.Regexp{
+	// This error is typically seen when you request resources that SLURM is not able to satisfy.
+	regexp.MustCompile("sbatch: error: Batch job submission failed"),
+}
+
 // A trial is a task actor which is responsible for handling:
-//  - messages from the resource manager,
-//  - messages from the experiment,
-//  - messages from the trial container(s), and
-//  - keeping the trial table of the database up-to-date.
+//   - messages from the resource manager,
+//   - messages from the experiment,
+//   - messages from the trial container(s), and
+//   - keeping the trial table of the database up-to-date.
 //
 // The trial's desired state is dictated to it by the experiment, searcher and user; they push
 // it to states like 'ACTIVE', 'PAUSED' and kill or wake it when more work is available. It takes
@@ -40,11 +54,12 @@ type trial struct {
 	jobSubmissionTime time.Time
 	idSet             bool
 	experimentID      int
+	restored          bool
 
 	// System dependencies.
-	rm         *actor.Ref
 	taskLogger *task.Logger
 	db         db.DB
+	rm         rm.ResourceManager
 
 	// Fields that are essentially configuration for the trial.
 	config              expconf.ExperimentConfig
@@ -80,11 +95,13 @@ func newTrial(
 	experimentID int,
 	initialState model.State,
 	searcher trialSearcherState,
-	rm *actor.Ref, taskLogger *task.Logger,
+	taskLogger *task.Logger,
+	rm rm.ResourceManager,
 	db db.DB,
 	config expconf.ExperimentConfig,
 	warmStartCheckpoint *model.Checkpoint,
 	taskSpec *tasks.TaskSpec,
+	restored bool,
 ) *trial {
 	return &trial{
 		taskID:            taskID,
@@ -94,9 +111,9 @@ func newTrial(
 		state:             initialState,
 		searcher:          searcher,
 
-		rm:         rm,
 		taskLogger: taskLogger,
 		db:         db,
+		rm:         rm,
 
 		config:              config,
 		taskSpec:            taskSpec,
@@ -106,7 +123,19 @@ func newTrial(
 			"task-id":   taskID,
 			"task-type": model.TaskTypeTrial,
 		}),
+		restored: restored,
 	}
+}
+
+// Returns true if the error message matches one of the errors in the non-retryable list.
+func isNonRetryableError(err error) bool {
+	for _, nonRetryableError := range nonRetryableErrors {
+		if nonRetryableError.MatchString(err.Error()) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (t *trial) Receive(ctx *actor.Context) error {
@@ -122,13 +151,17 @@ func (t *trial) Receive(ctx *actor.Context) error {
 			})
 		}
 		ctx.AddLabels(t.logCtx)
+
 		return t.maybeAllocateTask(ctx)
 	case actor.PostStop:
 		if !t.idSet {
 			return nil
 		}
 		if !model.TerminalStates[t.state] {
-			return t.transition(ctx, model.ErrorState)
+			return t.transition(ctx, model.StateWithReason{
+				State:               model.ErrorState,
+				InformationalReason: "trial did not finish properly",
+			})
 		}
 		return nil
 	case actor.ChildStopped:
@@ -145,6 +178,8 @@ func (t *trial) Receive(ctx *actor.Context) error {
 		}
 
 	case model.State:
+		return t.patchState(ctx, model.StateWithReason{State: msg})
+	case model.StateWithReason:
 		return t.patchState(ctx, msg)
 	case trialSearcherState:
 		t.searcher = msg
@@ -152,7 +187,10 @@ func (t *trial) Receive(ctx *actor.Context) error {
 		case !t.searcher.Complete:
 			return t.maybeAllocateTask(ctx)
 		case t.searcher.Complete && t.searcher.Closed:
-			return t.patchState(ctx, model.StoppingCompletedState)
+			return t.patchState(ctx, model.StateWithReason{
+				State:               model.StoppingCompletedState,
+				InformationalReason: "hp search is finished",
+			})
 		}
 		return nil
 	case sproto.ChangeRP:
@@ -173,10 +211,12 @@ func (t *trial) Receive(ctx *actor.Context) error {
 			ctx.Respond(err)
 		}
 	case *task.AllocationExited:
-		return t.allocationExited(ctx, msg)
+		if t.allocation != nil && t.runID == mustParseTrialRunID(ctx.Sender()) {
+			return t.allocationExited(ctx, msg)
+		}
 	case sproto.ContainerLog:
 		if log, err := t.enrichTaskLog(model.TaskLog{
-			ContainerID: ptrs.Ptr(string(msg.Container.ID)),
+			ContainerID: ptrs.Ptr(string(msg.ContainerID)),
 			Log:         msg.Message(),
 			Level:       msg.Level,
 		}); err != nil {
@@ -204,7 +244,7 @@ func (t *trial) recover() error {
 	if err != nil {
 		return errors.Wrap(err, "restoring old trial state")
 	}
-	t.runID = runID + 1
+	t.runID = runID
 	t.restarts = restarts
 	return nil
 }
@@ -228,29 +268,79 @@ func (t *trial) maybeAllocateTask(ctx *actor.Context) error {
 	}
 
 	ctx.Log().Info("decided to allocate trial")
-	t.runID++
 	t.logCtx = logger.MergeContexts(t.logCtx, logger.Context{"trial-run-id": t.runID})
 	ctx.AddLabel("trial-run-id", t.runID)
+	if err := t.addTask(); err != nil {
+		return err
+	}
 
-	t.allocation, _ = ctx.ActorOf(t.runID, taskAllocator(t.logCtx, sproto.AllocateRequest{
-		AllocationID:      model.NewAllocationID(fmt.Sprintf("%s.%d", t.taskID, t.runID)),
+	restoredAllocation, err := t.maybeRestoreAllocation(ctx)
+	if err != nil {
+		ctx.Log().WithError(err).Warn("failed to restore trial allocation")
+	} else if restoredAllocation != nil {
+		ar := sproto.AllocateRequest{
+			AllocationID:      restoredAllocation.AllocationID,
+			TaskID:            t.taskID,
+			JobID:             t.jobID,
+			JobSubmissionTime: t.jobSubmissionTime,
+			IsUserVisible:     true,
+			Name:              name,
+			AllocationRef:     ctx.Self(),
+			Group:             ctx.Self().Parent(),
+			SlotsNeeded:       t.config.Resources().SlotsPerTrial(),
+			ResourcePool:      t.config.Resources().ResourcePool(),
+			FittingRequirements: sproto.FittingRequirements{
+				SingleAgent: false,
+			},
+
+			Preemptible: true,
+			Restore:     true,
+			ProxyPorts: sproto.NewProxyPortConfig(
+				tasks.TrialSpecProxyPorts(t.taskSpec, t.config), t.taskID),
+		}
+		ctx.Log().
+			WithField("allocation-id", ar.AllocationID).
+			Infof("starting restored trial allocation")
+		t.allocation, _ = ctx.ActorOf(t.runID, taskAllocator(
+			t.logCtx, ar, t.db, t.rm, t.taskLogger,
+		))
+		return nil
+	}
+
+	if err := t.addTask(); err != nil {
+		return err
+	}
+
+	t.runID++
+
+	ar := sproto.AllocateRequest{
+		AllocationID:      model.AllocationID(fmt.Sprintf("%s.%d", t.taskID, t.runID)),
 		TaskID:            t.taskID,
 		JobID:             t.jobID,
 		JobSubmissionTime: t.jobSubmissionTime,
 		IsUserVisible:     true,
 		Name:              name,
-		TaskActor:         ctx.Self(),
+		AllocationRef:     ctx.Self(),
 		Group:             ctx.Self().Parent(),
 
 		SlotsNeeded:  t.config.Resources().SlotsPerTrial(),
-		Label:        t.config.Resources().AgentLabel(),
 		ResourcePool: t.config.Resources().ResourcePool(),
 		FittingRequirements: sproto.FittingRequirements{
 			SingleAgent: false,
 		},
 
 		Preemptible: true,
-	}, t.db, t.rm, t.taskLogger))
+		ProxyPorts:  sproto.NewProxyPortConfig(tasks.TrialSpecProxyPorts(t.taskSpec, t.config), t.taskID),
+	}
+
+	ctx.Log().
+		WithField("allocation-id", ar.AllocationID).
+		Debugf("starting new trial allocation")
+
+	prom.AssociateJobExperiment(t.jobID, strconv.Itoa(t.experimentID), t.config.Labels())
+	t.allocation, _ = ctx.ActorOf(t.runID, taskAllocator(t.logCtx, ar, t.db, t.rm, t.taskLogger))
+	ctx.Ask(t.allocation, actor.Ping{}).Get()
+
 	return nil
 }
 
@@ -266,11 +356,21 @@ func (t *trial) handleUserInitiatedStops(ctx *actor.Context, msg userInitiatedEa
 		// After a short time, force us to clean up if we're still handling messages.
 		actors.NotifyAfter(ctx, InvalidHPKillDelay, model.StoppingKilledState)
 		return nil
-	case model.UserCanceled, model.Errored:
+	case model.UserRequestedStop, model.Errored:
 		return fmt.Errorf("should not report special exit reason %s to the master", msg.reason)
 	default:
 		return actor.ErrUnexpectedMessage(ctx)
 	}
+}
+
+func (t *trial) addTask() error {
+	return t.db.AddTask(&model.Task{
+		TaskID:     t.taskID,
+		TaskType:   model.TaskTypeTrial,
+		StartTime:  t.jobSubmissionTime,
+		JobID:      &t.jobID,
+		LogVersion: model.CurrentTaskLogVersion,
+	})
 }
 
 func (t *trial) buildTaskSpec(ctx *actor.Context) (tasks.TaskSpec, error) {
@@ -304,13 +404,14 @@ func (t *trial) buildTaskSpec(ctx *actor.Context) (tasks.TaskSpec, error) {
 		if err := t.db.AddTrial(modelTrial); err != nil {
 			return tasks.TaskSpec{}, errors.Wrap(err, "failed to save trial to database")
 		}
+
 		t.id = modelTrial.ID
 		t.idSet = true
 		t.logCtx = logger.MergeContexts(t.logCtx, logger.Context{"trial-id": t.id})
 		ctx.AddLabel("trial-id", t.id)
-		ctx.Tell(t.rm, sproto.SetTaskName{
-			Name:        fmt.Sprintf("Trial %d (Experiment %d)", t.id, t.experimentID),
-			TaskHandler: t.allocation,
+		t.rm.SetAllocationName(ctx, sproto.SetAllocationName{
+			Name:          fmt.Sprintf("Trial %d (Experiment %d)", t.id, t.experimentID),
+			AllocationRef: t.allocation,
 		})
 		ctx.Tell(ctx.Self().Parent(), trialCreated{requestID: t.searcher.Create.RequestID})
 	}
@@ -319,7 +420,7 @@ func (t *trial) buildTaskSpec(ctx *actor.Context) (tasks.TaskSpec, error) {
 		return tasks.TaskSpec{}, errors.Wrap(err, "failed to save trial run ID")
 	}
 
-	var latestBatch int
+	var stepsCompleted int
 	latestCheckpoint, err := t.db.LatestCheckpointForTrial(t.id)
 	switch {
 	case err != nil:
@@ -327,7 +428,7 @@ func (t *trial) buildTaskSpec(ctx *actor.Context) (tasks.TaskSpec, error) {
 	case latestCheckpoint == nil:
 		latestCheckpoint = t.warmStartCheckpoint
 	default:
-		latestBatch = latestCheckpoint.TotalBatches
+		stepsCompleted = latestCheckpoint.StepsCompleted
 	}
 
 	return tasks.TrialSpec{
@@ -336,10 +437,10 @@ func (t *trial) buildTaskSpec(ctx *actor.Context) (tasks.TaskSpec, error) {
 		ExperimentID:     t.experimentID,
 		TrialID:          t.id,
 		TrialRunID:       t.runID,
-		ExperimentConfig: schemas.Copy(t.config).(expconf.ExperimentConfig),
+		ExperimentConfig: schemas.Copy(t.config),
 		HParams:          t.searcher.Create.Hparams,
 		TrialSeed:        t.searcher.Create.TrialSeed,
-		LatestBatch:      latestBatch,
+		StepsCompleted:   stepsCompleted,
 		LatestCheckpoint: latestCheckpoint,
 	}.ToTaskSpec(t.generatedKeys), nil
 }
@@ -351,19 +452,57 @@ func (t *trial) allocationExited(ctx *actor.Context, exit *task.AllocationExited
 	}
 	t.allocation = nil
 
+	prom.DisassociateJobExperiment(t.jobID, strconv.Itoa(t.experimentID), t.config.Labels())
+
 	// Decide if this is permanent.
 	switch {
 	case model.StoppingStates[t.state]:
 		if exit.Err != nil {
-			return t.transition(ctx, model.ErrorState)
+			return t.transition(ctx, model.StateWithReason{
+				State: model.ErrorState,
+				InformationalReason: fmt.Sprintf(
+					"trial allocation exited with an error while trial was stopping %v", exit.Err),
+			})
 		}
-		return t.transition(ctx, model.StoppingToTerminalStates[t.state])
+		return t.transition(ctx, model.StateWithReason{
+			State:               model.StoppingToTerminalStates[t.state],
+			InformationalReason: "trial stopped",
+		})
 	case t.searcher.Complete && t.searcher.Closed:
 		if exit.Err != nil {
-			return t.transition(ctx, model.ErrorState)
+			return t.transition(ctx, model.StateWithReason{
+				State: model.ErrorState,
+				InformationalReason: fmt.Sprintf(
+					"trial allocation exited with an error but hp search was complete %v", exit.Err),
+			})
 		}
-		return t.transition(ctx, model.CompletedState)
-	case exit.Err != nil && !sproto.IsRestartableSystemError(exit.Err):
+		return t.transition(ctx, model.StateWithReason{
+			State:               model.CompletedState,
+			InformationalReason: "hp search is finished",
+		})
+	case exit.Err != nil && sproto.IsUnrecoverableSystemError(exit.Err):
+		ctx.Log().
+			WithError(exit.Err).
+			Errorf("trial encountered unrecoverable failure")
+		return t.transition(ctx, model.StateWithReason{
+			State: model.ErrorState,
+			InformationalReason: fmt.Sprintf(
+				"trial allocation exited with unrecoverable failure %v", exit.Err),
+		})
+	case exit.Err != nil && isNonRetryableError(exit.Err):
+		// These are errors that no matter how many times we retry, the outcome will
+		// be the same, so don't bother retrying. Fail right away to allow the user
+		// to make any adjustments to the experiment and try again.
+		return t.transition(ctx, model.StateWithReason{
+			State: model.ErrorState,
+			InformationalReason: fmt.Sprintf(
+				"trial allocation exited with unrecoverable failure %v", exit.Err),
+		})
+	case exit.Err != nil && sproto.IsTransientSystemError(exit.Err):
+		ctx.Log().
+			WithError(exit.Err).
+			Errorf("trial encountered transient system error")
+	case exit.Err != nil && !sproto.IsTransientSystemError(exit.Err):
 		ctx.Log().
 			WithError(exit.Err).
 			Errorf("trial failed (restart %d/%d)", t.restarts, t.config.MaxRestarts())
@@ -372,20 +511,30 @@ func (t *trial) allocationExited(ctx *actor.Context, exit *task.AllocationExited
 			return err
 		}
 		if t.restarts > t.config.MaxRestarts() {
-			return t.transition(ctx, model.ErrorState)
+			return t.transition(ctx, model.StateWithReason{
+				State:               model.ErrorState,
+				InformationalReason: "trial exceeded max restarts",
+			})
 		}
 	case exit.UserRequestedStop:
 		ctx.Tell(ctx.Self().Parent(), trialReportEarlyExit{
 			requestID: t.searcher.Create.RequestID,
-			reason:    model.UserCanceled,
+			reason:    model.UserRequestedStop,
 		})
-		return t.transition(ctx, model.CompletedState)
+		return t.transition(ctx, model.StateWithReason{
+			State:               model.CompletedState,
+			InformationalReason: "trial exited early due to a user requested stop",
+		})
 	case t.userInitiatedExit != nil:
 		ctx.Tell(ctx.Self().Parent(), trialReportEarlyExit{
 			requestID: t.searcher.Create.RequestID,
 			reason:    *t.userInitiatedExit,
 		})
-		return t.transition(ctx, model.CompletedState)
+		return t.transition(ctx, model.StateWithReason{
+			State: model.CompletedState,
+			InformationalReason: fmt.Sprintf(
+				"trial exited early with reason: %v", *t.userInitiatedExit),
+		})
 	}
 
 	// Maybe reschedule.
@@ -393,37 +542,37 @@ func (t *trial) allocationExited(ctx *actor.Context, exit *task.AllocationExited
 }
 
 // patchState decide if the state patch is valid. If so, we'll transition the trial.
-func (t *trial) patchState(ctx *actor.Context, state model.State) error {
+func (t *trial) patchState(ctx *actor.Context, s model.StateWithReason) error {
 	switch {
 	case model.TerminalStates[t.state]:
-		ctx.Log().Infof("ignoring transition in terminal state (%s -> %s)", t.state, state)
+		ctx.Log().Infof("ignoring transition in terminal state (%s -> %s)", t.state, s.State)
 		return nil
-	case model.TerminalStates[state]:
-		ctx.Log().Infof("ignoring patch to terminal state %s", state)
+	case model.TerminalStates[s.State]:
+		ctx.Log().Infof("ignoring patch to terminal state %s", s.State)
 		return nil
-	case t.state == state: // Order is important, else below will prevent re-sending kills.
+	case t.state == s.State: // Order is important, else below will prevent re-sending kills.
 		ctx.Log().Infof("resending actions for transition for %s", t.state)
-		return t.transition(ctx, state)
-	case model.StoppingStates[t.state] && !model.TrialTransitions[t.state][state]:
-		ctx.Log().Infof("ignoring patch to less severe stopping state (%s)", state)
+		return t.transition(ctx, s)
+	case model.StoppingStates[t.state] && !model.TrialTransitions[t.state][s.State]:
+		ctx.Log().Infof("ignoring patch to less severe stopping state (%s)", s.State)
 		return nil
 	default:
-		ctx.Log().Debugf("patching state after request (%s)", state)
-		return t.transition(ctx, state)
+		ctx.Log().Debugf("patching state after request (%s)", s.State)
+		return t.transition(ctx, s)
 	}
 }
 
 // transition the trial by rectifying the desired state with our actual state to determined
 // a target state, and then propogating the appropriate signals to the allocation if there is any.
-func (t *trial) transition(ctx *actor.Context, state model.State) error {
-	if t.state != state {
-		ctx.Log().Infof("trial changed from state %s to %s", t.state, state)
+func (t *trial) transition(ctx *actor.Context, s model.StateWithReason) error {
+	if t.state != s.State {
+		ctx.Log().Infof("trial changed from state %s to %s", t.state, s.State)
 		if t.idSet {
-			if err := t.db.UpdateTrial(t.id, state); err != nil {
+			if err := t.db.UpdateTrial(t.id, s.State); err != nil {
 				return errors.Wrap(err, "updating trial with end state")
 			}
 		}
-		t.state = state
+		t.state = s.State
 	}
 
 	// Rectify our state and the allocation state with the transition.
@@ -432,29 +581,44 @@ func (t *trial) transition(ctx *actor.Context, state model.State) error {
 		return t.maybeAllocateTask(ctx)
 	case t.state == model.PausedState:
 		if t.allocation != nil {
-			ctx.Log().Infof("decided to %s trial due to pause", task.Terminate)
-			ctx.Tell(t.allocation, task.Terminate)
+			ctx.Log().Infof("decided to %s trial due to pause", sproto.TerminateAllocation)
+			ctx.Tell(t.allocation, sproto.AllocationSignalWithReason{
+				AllocationSignal:    sproto.TerminateAllocation,
+				InformationalReason: s.InformationalReason,
+			})
 		}
 	case model.StoppingStates[t.state]:
 		switch {
 		case t.allocation == nil:
 			ctx.Log().Info("stopping trial before resources are requested")
-			return t.transition(ctx, model.StoppingToTerminalStates[t.state])
+			return t.transition(ctx, model.StateWithReason{
+				State:               model.StoppingToTerminalStates[t.state],
+				InformationalReason: s.InformationalReason,
+			})
 		default:
-			if action, ok := map[model.State]task.AllocationSignal{
-				model.StoppingCanceledState: task.Terminate,
-				model.StoppingKilledState:   task.Kill,
-				model.StoppingErrorState:    task.Kill,
+			if action, ok := map[model.State]sproto.AllocationSignal{
+				model.StoppingCanceledState: sproto.TerminateAllocation,
+				model.StoppingKilledState:   sproto.KillAllocation,
+				model.StoppingErrorState:    sproto.KillAllocation,
 			}[t.state]; ok {
 				ctx.Log().Infof("decided to %s trial", action)
-				ctx.Tell(t.allocation, action)
+				ctx.Tell(t.allocation, sproto.AllocationSignalWithReason{
+					AllocationSignal:    action,
+					InformationalReason: s.InformationalReason,
+				})
 			}
 		}
 	case model.TerminalStates[t.state]:
-		if t.state == model.ErrorState {
+		switch t.state {
+		case model.ErrorState:
 			ctx.Tell(ctx.Self().Parent(), trialReportEarlyExit{
 				requestID: t.searcher.Create.RequestID,
 				reason:    model.Errored,
+			})
+		case model.CanceledState:
+			ctx.Tell(ctx.Self().Parent(), trialReportEarlyExit{
+				requestID: t.searcher.Create.RequestID,
+				reason:    model.UserCanceled,
 			})
 		}
 		ctx.Self().Stop()
@@ -496,4 +660,59 @@ func mustParseTrialRunID(child *actor.Ref) int {
 		panic(errors.Wrapf(err, "could not parse run id %s", idStr))
 	}
 	return id
+}
+
+func (t *trial) maybeRestoreAllocation(ctx *actor.Context) (*model.Allocation, error) {
+	if !t.restored || !t.rm.IsReattachEnabled(ctx) {
+		return nil, nil
+	}
+
+	var allocations []model.Allocation
+	selectQuery := db.Bun().NewSelect().Model(&allocations).
+		Where("task_id = ?", t.taskID).
+		Where("end_time IS NULL").
+		Where("state != ?", model.AllocationStateTerminated)
+
+	if t.rm.IsReattachableOnlyAfterStarted(ctx) {
+		selectQuery.Where("start_time IS NOT NULL")
+	}
+
+	// Do we have an open allocation?
+	err := selectQuery.Scan(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	openAllocs := len(allocations)
+	switch {
+	case openAllocs == 0:
+		return nil, nil
+	case openAllocs == 1:
+		allocation := &allocations[0]
+		if !t.rm.IsReattachEnabledForRP(ctx, allocation.ResourcePool) {
+			return nil, nil
+		}
+
+		return allocation, nil
+	case openAllocs > 1:
+		const maxAllocsToLog int = 3
+		allocIDs := make([]string, 0, maxAllocsToLog)
+		for _, alloc := range allocations[0:mathx.Min(len(allocations), maxAllocsToLog)] {
+			allocIDs = append(allocIDs, alloc.AllocationID.String())
+		}
+		return nil, errors.New(
+			fmt.Sprintf(
+				"discovered %d open allocations on restore: %s",
+				len(allocations),
+				strings.Join(allocIDs, " "),
+			),
+		)
+	default:
+		return nil, errors.New(
+			fmt.Sprintf(
+				"discovered %d open allocations on restore",
+				len(allocations),
+			),
+		)
+	}
 }

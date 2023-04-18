@@ -38,17 +38,6 @@ func (e *ExperimentConfigV0) SetCheckpointStorage(val CheckpointStorageConfigV0)
 	e.RawCheckpointStorage = &val
 }
 
-func (e ExperimentConfigV0) DataLayer() DataLayerConfigV0 {
-	if e.RawDataLayer == nil {
-		panic("You must call WithDefaults on ExperimentConfigV0 before .DataLayer")
-	}
-	return *e.RawDataLayer
-}
-
-func (e *ExperimentConfigV0) SetDataLayer(val DataLayerConfigV0) {
-	e.RawDataLayer = &val
-}
-
 func (e ExperimentConfigV0) Data() map[string]interface{} {
 	return e.RawData
 }
@@ -76,12 +65,15 @@ func (e *ExperimentConfigV0) SetDescription(val *string) {
 	e.RawDescription = val
 }
 
-func (e ExperimentConfigV0) Entrypoint() *EntrypointV0 {
-	return e.RawEntrypoint
+func (e ExperimentConfigV0) Entrypoint() EntrypointV0 {
+	if e.RawEntrypoint == nil {
+		panic("You must call WithDefaults on ExperimentConfigV0 before .Entrypoint")
+	}
+	return *e.RawEntrypoint
 }
 
-func (e *ExperimentConfigV0) SetEntrypoint(val *EntrypointV0) {
-	e.RawEntrypoint = val
+func (e *ExperimentConfigV0) SetEntrypoint(val EntrypointV0) {
+	e.RawEntrypoint = &val
 }
 
 func (e ExperimentConfigV0) Environment() EnvironmentConfigV0 {
@@ -101,14 +93,6 @@ func (e ExperimentConfigV0) Hyperparameters() HyperparametersV0 {
 
 func (e *ExperimentConfigV0) SetHyperparameters(val HyperparametersV0) {
 	e.RawHyperparameters = val
-}
-
-func (e ExperimentConfigV0) Internal() *InternalConfigV0 {
-	return e.RawInternal
-}
-
-func (e *ExperimentConfigV0) SetInternal(val *InternalConfigV0) {
-	e.RawInternal = val
 }
 
 func (e ExperimentConfigV0) Labels() LabelsV0 {
@@ -193,6 +177,17 @@ func (e *ExperimentConfigV0) SetProfiling(val ProfilingConfigV0) {
 	e.RawProfiling = &val
 }
 
+func (e ExperimentConfigV0) Project() string {
+	if e.RawProject == nil {
+		panic("You must call WithDefaults on ExperimentConfigV0 before .Project")
+	}
+	return *e.RawProject
+}
+
+func (e *ExperimentConfigV0) SetProject(val string) {
+	e.RawProject = &val
+}
+
 func (e ExperimentConfigV0) RecordsPerEpoch() int {
 	if e.RawRecordsPerEpoch == nil {
 		panic("You must call WithDefaults on ExperimentConfigV0 before .RecordsPerEpoch")
@@ -262,6 +257,39 @@ func (e ExperimentConfigV0) TensorboardStorage() *TensorboardStorageConfigV0 {
 
 func (e *ExperimentConfigV0) SetTensorboardStorage(val *TensorboardStorageConfigV0) {
 	e.RawTensorboardStorage = val
+}
+
+func (e ExperimentConfigV0) Workspace() string {
+	if e.RawWorkspace == nil {
+		panic("You must call WithDefaults on ExperimentConfigV0 before .Workspace")
+	}
+	return *e.RawWorkspace
+}
+
+func (e *ExperimentConfigV0) SetWorkspace(val string) {
+	e.RawWorkspace = &val
+}
+
+func (e ExperimentConfigV0) SlurmConfig() SlurmConfigV0 {
+	if e.RawSlurmConfig == nil {
+		panic("You must call WithDefaults on ExperimentConfigV0 before .SlurmConfig")
+	}
+	return *e.RawSlurmConfig
+}
+
+func (e *ExperimentConfigV0) SetSlurmConfig(val SlurmConfigV0) {
+	e.RawSlurmConfig = &val
+}
+
+func (e ExperimentConfigV0) PbsConfig() PbsConfigV0 {
+	if e.RawPbsConfig == nil {
+		panic("You must call WithDefaults on ExperimentConfigV0 before .PbsConfig")
+	}
+	return *e.RawPbsConfig
+}
+
+func (e *ExperimentConfigV0) SetPbsConfig(val PbsConfigV0) {
+	e.RawPbsConfig = &val
 }
 
 func (e ExperimentConfigV0) ParsedSchema() interface{} {

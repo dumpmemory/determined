@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 
-import { ColorScale } from 'utils/color';
+import { ColorScale } from 'shared/utils/color';
 
 import css from './ColorLegend.module.scss';
 import HumanReadableNumber from './HumanReadableNumber';
@@ -13,7 +13,7 @@ interface Props {
 const ColorLegend: React.FC<Props> = ({ colorScale, title }: Props) => {
   const gradientStyle = useMemo(() => {
     return { background: `linear-gradient(90deg, ${colorScale[0].color}, ${colorScale[1].color})` };
-  }, [ colorScale ]);
+  }, [colorScale]);
 
   return (
     <div className={css.base}>

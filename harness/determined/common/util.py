@@ -1,13 +1,30 @@
+import datetime
 import functools
 import io
+import json
 import os
 import pathlib
 import platform
 import random
 import sys
-from typing import IO, Any, Callable, Iterator, Optional, Sequence, TypeVar, Union, overload
+from typing import (
+    IO,
+    Any,
+    Callable,
+    Iterator,
+    Optional,
+    Sequence,
+    TypeVar,
+    Union,
+    no_type_check,
+    overload,
+)
+
+import urllib3
 
 from determined.common import yaml
+
+_yaml = yaml.YAML(typ="safe", pure=True)
 
 T = TypeVar("T")
 
@@ -48,12 +65,16 @@ def get_default_master_address() -> str:
     return os.environ.get("DET_MASTER", os.environ.get("DET_MASTER_ADDR", "localhost:8080"))
 
 
-def get_container_user_name() -> Optional[str]:
+def get_det_username_from_env() -> Optional[str]:
     return os.environ.get("DET_USER")
 
 
-def get_container_user_token() -> Optional[str]:
+def get_det_user_token_from_env() -> Optional[str]:
     return os.environ.get("DET_USER_TOKEN")
+
+
+def get_det_password_from_env() -> Optional[str]:
+    return os.environ.get("DET_PASS")
 
 
 def debug_mode() -> bool:
@@ -74,7 +95,7 @@ def preserve_random_state(fn: Callable) -> Callable:
     return wrapped
 
 
-def safe_load_yaml_with_exceptions(yaml_file: Union[io.FileIO, IO[Any]]) -> Any:
+def safe_load_yaml_with_exceptions(yaml_file: Union[io.FileIO, IO[Any], str]) -> Any:
     """Attempts to use ruamel.yaml.safe_load on the specified file. If successful, returns
     the output. If not, formats a ruamel.yaml Exception so that the user does not see a traceback
     of our internal APIs.
@@ -105,14 +126,14 @@ def safe_load_yaml_with_exceptions(yaml_file: Union[io.FileIO, IO[Any]]) -> Any:
     ---------------------------------------------------------------------------------------------
     """
     try:
-        config = yaml.safe_load(yaml_file)
+        config = _yaml.load(yaml_file)
     except (
         yaml.error.MarkedYAMLWarning,
         yaml.error.MarkedYAMLError,
         yaml.error.MarkedYAMLFutureWarning,
     ) as e:
         err_msg = (
-            f"Error: invalid experiment config file {yaml_file.name!r}.\n"
+            f"Error: invalid experiment config file.\n"
             f"{e.__class__.__name__}: {e.problem}\n{e.problem_mark}"
         )
         print(err_msg)
@@ -135,3 +156,47 @@ def get_config_path() -> pathlib.Path:
         config_path = pathlib.Path.home().joinpath(".config")
 
     return config_path.joinpath("determined")
+
+
+def get_max_retries_config() -> urllib3.util.retry.Retry:
+    # Allow overriding retry settings when necessary.
+    # `DET_RETRY_CONFIG` env variable can contain `urllib3` `Retry` parameters,
+    # encoded as JSON.
+    # For example:
+    #  - disable retries: {"total":0}
+    #  - shorten the wait times {"total":10,"backoff_factor":0.5,"method_whitelist":false}
+
+    config_data = os.environ.get("DET_RETRY_CONFIG")
+    if config_data is not None:
+        config = json.loads(config_data)
+        return urllib3.util.retry.Retry(**config)
+
+    # Default retry is different with different versions of urllib3, which mypy doesn't understand.
+    @no_type_check
+    def make_default_retry():
+        try:
+            return urllib3.util.retry.Retry(
+                total=20,
+                backoff_factor=0.5,
+                allowed_methods=False,
+            )
+        except TypeError:  # Support urllib3 prior to 1.26
+            return urllib3.util.retry.Retry(
+                total=20,
+                backoff_factor=0.5,
+                method_whitelist=False,
+            )
+
+    return make_default_retry()  # type: ignore
+
+
+def parse_protobuf_timestamp(ts: str) -> datetime.datetime:
+    # Protobuf emits timestamps in RFC3339 format, which are identical to canonical JavaScript date
+    # stamps [1].  datetime.datetime.fromisoformat parses a subset of ISO8601 timestamps, but
+    # notably does not handle the trailing Z to signify the UTC timezone [2].
+    #
+    # [1] https://tc39.es/ecma262/#sec-date-time-string-format
+    # [2] https://bugs.python.org/issue35829
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.datetime.fromisoformat(ts)

@@ -15,7 +15,6 @@ FROM
       FROM
         (SELECT s.id,
                 s.trial_id,
-                s.state,
                 s.end_time,
                 s.total_batches,
 
@@ -23,22 +22,21 @@ FROM
             FROM
               (SELECT c.id,
                       c.trial_id,
-                      c.total_batches,
+                      c.steps_completed AS total_batches,
                       c.state,
-                      c.end_time,
+                      c.report_time as end_time,
                       c.uuid,
                       c.resources,
                       c.metadata
-               FROM checkpoints c
+               FROM checkpoints_view c
                WHERE c.trial_id = t.id
-                 AND c.total_batches = s.total_batches ) r3) AS CHECKPOINT,
+                 AND c.steps_completed = s.total_batches ) r3) AS CHECKPOINT,
 
            (SELECT row_to_json(r4)
             FROM
               (SELECT v.id,
                       v.trial_id,
                       v.total_batches,
-                      v.state,
                       v.end_time,
                       v.metrics
                FROM validations v

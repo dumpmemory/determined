@@ -29,53 +29,54 @@ build: build/proto.stamp $(swagger_out)
 clean:
 	rm -rf build pkg
 
+.PHONY: get-deps
 get-deps:
-	go install github.com/bufbuild/buf/cmd/buf@v0.42.1
-	go install github.com/golang/protobuf/protoc-gen-go@v1.5.2
-	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0
-	go install github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway@v1.14.6
-	go install github.com/grpc-ecosystem/grpc-gateway/protoc-gen-swagger@v1.14.6
-	go install github.com/swaggo/swag/cmd/swag@v1.7.0
+	./get-deps.sh
 
 build/proto.stamp: $(source_files)
+	protoc --version |perl -ne '/.*(\d+)\.(\d+)\.(\d+)/&&(($$1==3&&$$2<15)||$$1<3)&&print("\nERROR: \
+		Detected protoc version: $$1.$$2.$$3. Please upgrade protoc to version 3.15.0 or above\n\n.")&&exit 1;'
 	rm -rf build/proto pkg
 	mkdir -p build/proto
 	# Protobuf generation.
-	for source in $(source_files) ; do protoc -I src "$$source" --go_out=plugins=grpc:build/proto ; done
+	for source in $(source_files) ; do protoc -I src "$$source" --go_out=plugins=grpc:build/proto || exit 1; done
 	# GRPC generation.
-	protoc -I src $(grpc_in) --grpc-gateway_out=logtostderr=true:build/proto
+	protoc -I src $(grpc_in) --grpc-gateway_out=logtostderr=true:build/proto --grpc-gateway_opt allow_delete_body=true
 	mv $(build_path) pkg
+ifeq "$(shell uname)" "Darwin"
+	sed -E -i '' '/\/\/[[:space:]]*protoc/d' pkg/*/*.pb.go
+else
+	sed -E -i '/\/\/[[:space:]]*protoc/d' pkg/*/*.pb.go
+endif
 	touch $@
 
 $(echo_swagger_patch_dir):
 	mkdir -p $(echo_swagger_patch_dir)
 
 $(echo_swagger_patch): $(echo_swagger_patch_dir) $(echo_swagger_source_files)
-	swag init -g ../master/cmd/determined-master/main.go -d ../master/. -o $(echo_swagger_patch_dir)
+	swag init -g ../master/cmd/determined-master/main.go -d ../master/. -o $(echo_swagger_patch_dir) -ot json
 	jq 'del(.swagger, .info)' $(echo_swagger_patch) > $(echo_swagger_patch).tmp
 	mv $(echo_swagger_patch).tmp $(echo_swagger_patch)
 
 build/swagger:
 	mkdir -p build/swagger
 
-$(swagger_out): $(source_files) build/swagger $(echo_swagger_patch)
-	protoc -I src $(swagger_in) --swagger_out=logtostderr=true,json_names_for_fields=true:build/swagger
+$(swagger_out): $(source_files) build/swagger $(swagger_patch) $(echo_swagger_patch)
+	protoc -I src $(swagger_in) --swagger_out=logtostderr=true,allow_delete_body=true,json_names_for_fields=true:build/swagger
 	python3 scripts/swagger.py $@ $(swagger_patch)
 	python3 scripts/swagger.py $@ $(echo_swagger_patch)
 
 # Update buf image for breaking change check.
 .PHONY: gen-buf-image
 gen-buf-image:
-	# disallow untracked or dirty files.
-	# test -z "$(shell git status --porcelain)"
 	buf build -o $(buf_image)
 
 .PHONY: check
-check: check-fmt
+check: check-fmt build/proto.stamp
 	buf lint
 	buf breaking --against $(buf_image)
 	go mod tidy
-	git diff --quiet go.mod go.sum
+	git diff --quiet go.mod go.sum pkg/
 
 .PHONY: check-fmt
 check-fmt:
@@ -84,4 +85,3 @@ check-fmt:
 .PHONY: fmt
 fmt:
 	git ls-files -z 'src/determined/**/*.proto' | xargs -0 -P8 clang-format -i
-

@@ -1,19 +1,19 @@
-import abc
 import logging
+import pathlib
 from typing import Any, Dict
 
 import determined as det
-from determined import _core
+from determined import core
 
 
-class TrialContext(metaclass=abc.ABCMeta):
+class TrialContext:
     """
     TrialContext is the system-provided API to a Trial class.
     """
 
     def __init__(
         self,
-        core_context: _core.Context,
+        core_context: core.Context,
         env: det.EnvContext,
     ) -> None:
         self._core = core_context
@@ -61,6 +61,7 @@ class TrialContext(metaclass=abc.ABCMeta):
             test_mode=False,
             config=config,
             checkpoint_dir="/tmp",
+            tensorboard_path=pathlib.Path("/tmp/tensorboard"),
             limit_gpus=1,
         )
         return cls(core_context, env)
@@ -137,4 +138,10 @@ class TrialContext(metaclass=abc.ABCMeta):
         self._stop_requested = stop_requested
 
     def get_initial_batch(self) -> int:
-        return self.env.latest_batch
+        return self.env.steps_completed
+
+    def get_tensorboard_path(self) -> pathlib.Path:
+        """
+        Get the path where files for consumption by TensorBoard should be written
+        """
+        return self._core.train.get_tensorboard_path()

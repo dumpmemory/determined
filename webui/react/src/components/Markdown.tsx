@@ -1,60 +1,64 @@
-import { Tabs } from 'antd';
+import type { TabsProps } from 'antd';
 import { default as MarkdownViewer } from 'markdown-to-jsx';
-import React, { useCallback } from 'react';
+import React, { useMemo } from 'react';
+
+import Pivot from 'components/kit/Pivot';
+import Spinner from 'shared/components/Spinner/Spinner';
 
 import css from './Markdown.module.scss';
-import Spinner from './Spinner';
 
-const { TabPane } = Tabs;
 const MonacoEditor = React.lazy(() => import('components/MonacoEditor'));
 
 interface Props {
+  disabled?: boolean;
   editing?: boolean;
   markdown: string;
   onChange?: (editedMarkdown: string) => void;
-  onClick?: () => void;
+  onClick?: (e: React.MouseEvent) => void;
 }
 
 interface RenderProps {
   markdown: string;
+  onClick?: (e: React.MouseEvent) => void;
   placeholder?: string;
 }
 
-enum TabType {
-  Edit = 'edit',
-  Preview = 'preview'
-}
+const TabType = {
+  Edit: 'edit',
+  Preview: 'preview',
+} as const;
 
-const MarkdownRender: React.FC<RenderProps> = ({ markdown, placeholder }) => {
+const MarkdownRender: React.FC<RenderProps> = ({ markdown, placeholder, onClick }) => {
   const showPlaceholder = !markdown && placeholder;
   return (
-    <div className={css.render}>
+    <div className={css.render} onClick={onClick}>
       {showPlaceholder ? (
         <div className={css.placeholder}>{placeholder}</div>
       ) : (
-        <MarkdownViewer options={{ disableParsingRawHTML: true }}>
-          {markdown}
-        </MarkdownViewer>
+        <MarkdownViewer options={{ disableParsingRawHTML: true }}>{markdown}</MarkdownViewer>
       )}
     </div>
   );
 };
 
 const Markdown: React.FC<Props> = ({
+  disabled = false,
   editing = false,
   markdown,
   onChange,
   onClick,
 }: Props) => {
-  const handleRenderClick = useCallback(() => onClick?.(), [ onClick ]);
-
-  return (
-    <div aria-label="markdown-editor" className={css.base}>
-      {editing ? (
-        <Tabs className="no-padding">
-          <TabPane key={TabType.Edit} tab="Edit">
+  const tabItems: TabsProps['items'] = useMemo(() => {
+    return [
+      {
+        children: (
+          <div className={css.noOverflow}>
             <React.Suspense
-              fallback={<div><Spinner tip="Loading text editor..." /></div>}>
+              fallback={
+                <div>
+                  <Spinner tip="Loading text editor..." />
+                </div>
+              }>
               <MonacoEditor
                 defaultValue={markdown}
                 language="markdown"
@@ -72,18 +76,29 @@ const Markdown: React.FC<Props> = ({
                 onChange={onChange}
               />
             </React.Suspense>
-          </TabPane>
-          <TabPane key={TabType.Preview} tab="Preview">
-            <MarkdownRender markdown={markdown} />
-          </TabPane>
-        </Tabs>
+          </div>
+        ),
+        key: TabType.Edit,
+        label: 'Edit',
+      },
+      {
+        children: <MarkdownRender markdown={markdown} onClick={onClick} />,
+        key: TabType.Preview,
+        label: 'Preview',
+      },
+    ];
+  }, [markdown, onChange, onClick]);
+
+  return (
+    <div aria-label="markdown-editor" className={css.base} tabIndex={0}>
+      {editing && !disabled ? (
+        <Pivot items={tabItems} />
       ) : (
-        <div onClick={handleRenderClick}>
-          <MarkdownRender
-            markdown={markdown}
-            placeholder="Add Notes..."
-          />
-        </div>
+        <MarkdownRender
+          markdown={markdown}
+          placeholder={disabled ? 'No note present.' : 'Add notes...'}
+          onClick={onClick}
+        />
       )}
     </div>
   );

@@ -11,6 +11,7 @@ import (
 	"github.com/determined-ai/determined/master/pkg/cproto"
 	"github.com/determined-ai/determined/master/pkg/etc"
 	"github.com/determined-ai/determined/master/pkg/model"
+	"github.com/determined-ai/determined/master/pkg/schemas"
 	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
 	"github.com/determined-ai/determined/master/pkg/ssh"
 )
@@ -26,24 +27,25 @@ type TrialSpec struct {
 	HParams          map[string]interface{}
 	TrialSeed        uint32
 	LatestCheckpoint *model.Checkpoint
-	LatestBatch      int
+	StepsCompleted   int
 }
 
 // ToTaskSpec generates a TaskSpec.
 func (s TrialSpec) ToTaskSpec(keys *ssh.PrivateAndPublicKeys) TaskSpec {
 	res := s.Base
 
-	env := s.ExperimentConfig.Environment()
-	ports := env.Ports()
-	if ports == nil {
-		ports = make(map[string]int)
+	res.Environment = s.MakeEnvPorts()
+
+	res.UniqueExposedPortRequests = map[string]int{
+		DTrainSSHPort:              DtrainSSHPortBase,
+		InterTrainProcessCommPort1: InterTrainProcessCommPort1Base,
+		InterTrainProcessCommPort2: InterTrainProcessCommPort2Base,
+		C10DPort:                   C10DPortBase,
 	}
-	// TODO: remove this, but without breaking rendezvous api.
-	ports["trial"] = 1734
-	env.SetPorts(ports)
-	res.Environment = env
 
 	res.ResourcesConfig = s.ExperimentConfig.Resources()
+	res.SlurmConfig = s.ExperimentConfig.SlurmConfig()
+	res.PbsConfig = s.ExperimentConfig.PbsConfig()
 
 	res.WorkDir = DefaultWorkDir
 
@@ -54,7 +56,9 @@ func (s TrialSpec) ToTaskSpec(keys *ssh.PrivateAndPublicKeys) TaskSpec {
 			trialEntrypointMode,
 			tar.TypeReg,
 		),
+	}
 
+	additionalSSHFiles := archive.Archive{
 		s.Base.AgentUserGroup.OwnedArchiveItem(sshDir, nil, sshDirMode, tar.TypeDir),
 		s.Base.AgentUserGroup.OwnedArchiveItem(trialAuthorizedKeysFile,
 			keys.PublicKey,
@@ -72,6 +76,9 @@ func (s TrialSpec) ToTaskSpec(keys *ssh.PrivateAndPublicKeys) TaskSpec {
 			sshdConfigMode,
 			tar.TypeReg,
 		),
+	}
+
+	additionalRootFiles := archive.Archive{
 		archive.RootItem(
 			trialSSHConfigFile,
 			etc.MustStaticFile(etc.SSHConfigResource),
@@ -83,12 +90,14 @@ func (s TrialSpec) ToTaskSpec(keys *ssh.PrivateAndPublicKeys) TaskSpec {
 	res.ExtraArchives = []cproto.RunArchive{
 		wrapArchive(
 			archive.Archive{
-				s.Base.AgentUserGroup.OwnedArchiveItem(trainDir, nil, 0700, tar.TypeDir),
-				s.Base.AgentUserGroup.OwnedArchiveItem(modelCopy, nil, 0700, tar.TypeDir),
+				s.Base.AgentUserGroup.OwnedArchiveItem(trainDir, nil, 0o700, tar.TypeDir),
+				s.Base.AgentUserGroup.OwnedArchiveItem(modelCopy, nil, 0o700, tar.TypeDir),
 			},
 			rootDir,
 		),
 		wrapArchive(additionalFiles, rootDir),
+		wrapArchive(additionalRootFiles, rootDir),
+		wrapArchive(additionalSSHFiles, rootDir),
 	}
 
 	res.Description = fmt.Sprintf(
@@ -100,18 +109,17 @@ func (s TrialSpec) ToTaskSpec(keys *ssh.PrivateAndPublicKeys) TaskSpec {
 	res.Entrypoint = []string{"/run/determined/train/entrypoint.sh"}
 
 	envVars := map[string]string{
-		"DET_EXPERIMENT_ID":      strconv.Itoa(s.ExperimentID),
-		"DET_TRIAL_ID":           strconv.Itoa(s.TrialID),
-		"DET_TRIAL_RUN_ID":       strconv.Itoa(s.TrialRunID),
-		"DET_TRIAL_SEED":         strconv.FormatUint(uint64(s.TrialSeed), 10),
-		"DET_EXPERIMENT_CONFIG":  jsonify(s.ExperimentConfig),
-		"DET_HPARAMS":            jsonify(s.HParams),
-		"DET_LATEST_BATCH":       strconv.Itoa(s.LatestBatch),
-		"DET_UNIQUE_PORT_OFFSET": strconv.Itoa(trialUniquePortOffset(s.Base.Devices)),
-		"DET_TASK_TYPE":          string(model.TaskTypeTrial),
+		"DET_EXPERIMENT_ID":     strconv.Itoa(s.ExperimentID),
+		"DET_TRIAL_ID":          strconv.Itoa(s.TrialID),
+		"DET_TRIAL_RUN_ID":      strconv.Itoa(s.TrialRunID),
+		"DET_TRIAL_SEED":        strconv.FormatUint(uint64(s.TrialSeed), 10),
+		"DET_EXPERIMENT_CONFIG": jsonify(s.ExperimentConfig),
+		"DET_HPARAMS":           jsonify(s.HParams),
+		"DET_STEPS_COMPLETED":   strconv.Itoa(s.StepsCompleted),
+		"DET_TASK_TYPE":         string(model.TaskTypeTrial),
 	}
 	if s.LatestCheckpoint != nil && s.LatestCheckpoint.UUID != nil {
-		envVars["DET_LATEST_CHECKPOINT"] = *s.LatestCheckpoint.UUID
+		envVars["DET_LATEST_CHECKPOINT"] = s.LatestCheckpoint.UUID.String()
 	}
 
 	res.ExtraEnvVars = envVars
@@ -119,8 +127,6 @@ func (s TrialSpec) ToTaskSpec(keys *ssh.PrivateAndPublicKeys) TaskSpec {
 	res.LoggingFields = map[string]string{
 		"trial_id": strconv.Itoa(s.TrialID),
 	}
-
-	res.UseFluentLogging = true
 
 	if shm := s.ExperimentConfig.Resources().ShmSize(); shm != nil {
 		res.ShmSize = int64(*shm)
@@ -139,22 +145,56 @@ func (s TrialSpec) ToTaskSpec(keys *ssh.PrivateAndPublicKeys) TaskSpec {
 			&mount.BindOptions{Propagation: expconf.DefaultSharedFSPropagation},
 		)
 	}
-	if c := s.ExperimentConfig.DataLayer().RawSharedFSConfig; c != nil {
-		if c.HostStoragePath() != nil && c.ContainerStoragePath() != nil {
-			addMount(*c.HostStoragePath(), *c.ContainerStoragePath(), nil)
-		}
-	}
-	if c := s.ExperimentConfig.DataLayer().RawS3Config; c != nil {
-		if c.LocalCacheHostPath() != nil && c.LocalCacheContainerPath() != nil {
-			addMount(*c.LocalCacheHostPath(), *c.LocalCacheContainerPath(), nil)
-		}
-	}
-	if c := s.ExperimentConfig.DataLayer().RawGCSConfig; c != nil {
-		if c.LocalCacheHostPath() != nil && c.LocalCacheContainerPath() != nil {
-			addMount(*c.LocalCacheHostPath(), *c.LocalCacheContainerPath(), nil)
-		}
-	}
 	res.Mounts = mounts
+	res.TaskType = model.TaskTypeTrial
 
 	return res
+}
+
+// MakeEnvPorts fills in `Environment.Ports` i.e. exposed ports for container config.
+func (s *TrialSpec) MakeEnvPorts() expconf.EnvironmentConfigV0 {
+	ppc := s.ProxyPorts()
+	ports := s.ExperimentConfig.Environment().Ports()
+	if ports == nil {
+		ports = map[string]int{}
+	}
+
+	for _, pp := range ppc {
+		port := pp.ProxyPort()
+		ports[strconv.Itoa(port)] = port
+	}
+
+	// TODO: remove this, but without breaking rendezvous api.
+	ports["trial"] = 1734
+
+	env := s.ExperimentConfig.Environment()
+	env.SetPorts(ports)
+
+	return env
+}
+
+// TrialSpecProxyPorts combines user-defined and system proxy configs.
+// This static function is public because trial actor builds `TrialSpec` instances late.
+func TrialSpecProxyPorts(
+	taskSpec *TaskSpec,
+	expConfig expconf.ExperimentConfigV0,
+) expconf.ProxyPortsConfig {
+	env := expConfig.Environment()
+	epp := schemas.WithDefaults(taskSpec.ExtraProxyPorts)
+	out := make(expconf.ProxyPortsConfig, 0, len(epp)+len(env.ProxyPorts()))
+
+	for _, pp := range epp {
+		out = append(out, pp)
+	}
+
+	for _, pp := range env.ProxyPorts() {
+		out = append(out, pp)
+	}
+
+	return out
+}
+
+// ProxyPorts combines user-defined and system proxy configs.
+func (s *TrialSpec) ProxyPorts() expconf.ProxyPortsConfig {
+	return TrialSpecProxyPorts(&s.Base, s.ExperimentConfig)
 }

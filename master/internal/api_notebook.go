@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -14,18 +15,23 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/determined-ai/determined/master/internal/api"
+	"github.com/determined-ai/determined/master/internal/api/apiutils"
+	"github.com/determined-ai/determined/master/internal/command"
+	"github.com/determined-ai/determined/master/internal/db"
 	"github.com/determined-ai/determined/master/internal/grpcutil"
 	"github.com/determined-ai/determined/master/pkg/actor"
 	"github.com/determined-ai/determined/master/pkg/archive"
 	"github.com/determined-ai/determined/master/pkg/check"
+	pkgCommand "github.com/determined-ai/determined/master/pkg/command"
 	"github.com/determined-ai/determined/master/pkg/etc"
-	"github.com/determined-ai/determined/master/pkg/logger"
 	"github.com/determined-ai/determined/master/pkg/model"
 	"github.com/determined-ai/determined/master/pkg/protoutils"
+	"github.com/determined-ai/determined/master/pkg/ptrs"
 	"github.com/determined-ai/determined/master/pkg/schemas/expconf"
+	"github.com/determined-ai/determined/master/pkg/tasks"
 	"github.com/determined-ai/determined/proto/pkg/apiv1"
-	"github.com/determined-ai/determined/proto/pkg/logv1"
 	"github.com/determined-ai/determined/proto/pkg/notebookv1"
+	"github.com/determined-ai/determined/proto/pkg/workspacev1"
 )
 
 const (
@@ -41,72 +47,174 @@ const (
 	notebookDefaultPage = "/run/determined/workdir/README.ipynb"
 )
 
-var notebooksAddr = actor.Addr("notebooks")
+var notebooksAddr = actor.Addr(command.NotebookActorPath)
 
 func (a *apiServer) GetNotebooks(
-	_ context.Context, req *apiv1.GetNotebooksRequest,
+	ctx context.Context, req *apiv1.GetNotebooksRequest,
 ) (resp *apiv1.GetNotebooksResponse, err error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if req.WorkspaceId != 0 {
+		// check if the workspace exists.
+		_, err := a.GetWorkspaceByID(ctx, req.WorkspaceId, *curUser, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if err = a.ask(notebooksAddr, req, &resp); err != nil {
 		return nil, err
 	}
+
+	limitedScopes, err := command.AuthZProvider.Get().AccessibleScopes(
+		ctx, *curUser, model.AccessScopeID(req.WorkspaceId),
+	)
+	if err != nil {
+		return nil, apiutils.MapAndFilterErrors(err, nil, nil)
+	}
+	a.filter(&resp.Notebooks, func(i int) bool {
+		return limitedScopes[model.AccessScopeID(resp.Notebooks[i].WorkspaceId)]
+	})
+
 	a.sort(resp.Notebooks, req.OrderBy, req.SortBy, apiv1.GetNotebooksRequest_SORT_BY_ID)
 	return resp, a.paginate(&resp.Pagination, &resp.Notebooks, req.Offset, req.Limit)
 }
 
 func (a *apiServer) GetNotebook(
-	_ context.Context, req *apiv1.GetNotebookRequest) (resp *apiv1.GetNotebookResponse, err error) {
-	return resp, a.ask(notebooksAddr.Child(req.NotebookId), req, &resp)
+	ctx context.Context, req *apiv1.GetNotebookRequest,
+) (resp *apiv1.GetNotebookResponse, err error) {
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	addr := notebooksAddr.Child(req.NotebookId)
+	if err = a.ask(addr, req, &resp); err != nil {
+		return nil, err
+	}
+
+	if ok, err := command.AuthZProvider.Get().CanGetNSC(
+		ctx, *curUser, model.AccessScopeID(resp.Notebook.WorkspaceId),
+	); err != nil {
+		return nil, err
+	} else if !ok { // permission denied.
+		// report the error as if the notebook does not exist.
+		return nil, errActorNotFound(addr)
+	}
+	return resp, nil
+}
+
+func (a *apiServer) validateToKillNotebook(ctx context.Context, notebookID string) error {
+	targetNotebook, err := a.GetNotebook(ctx, &apiv1.GetNotebookRequest{NotebookId: notebookID})
+	if err != nil {
+		return err
+	}
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = command.AuthZProvider.Get().CanTerminateNSC(
+		ctx, *curUser, model.AccessScopeID(targetNotebook.Notebook.WorkspaceId),
+	)
+	return apiutils.MapAndFilterErrors(err, nil, nil)
 }
 
 func (a *apiServer) IdleNotebook(
-	_ context.Context, req *apiv1.IdleNotebookRequest) (resp *apiv1.IdleNotebookResponse, err error) {
+	ctx context.Context, req *apiv1.IdleNotebookRequest,
+) (resp *apiv1.IdleNotebookResponse, err error) {
+	err = a.validateToKillNotebook(ctx, req.NotebookId)
+	if err != nil {
+		return nil, err
+	}
 	return resp, a.ask(notebooksAddr.Child(req.NotebookId), req, &resp)
 }
 
 func (a *apiServer) KillNotebook(
-	_ context.Context, req *apiv1.KillNotebookRequest) (resp *apiv1.KillNotebookResponse, err error) {
+	ctx context.Context, req *apiv1.KillNotebookRequest,
+) (resp *apiv1.KillNotebookResponse, err error) {
+	err = a.validateToKillNotebook(ctx, req.NotebookId)
+	if err != nil {
+		return nil, err
+	}
 	return resp, a.ask(notebooksAddr.Child(req.NotebookId), req, &resp)
 }
 
 func (a *apiServer) SetNotebookPriority(
-	_ context.Context, req *apiv1.SetNotebookPriorityRequest,
+	ctx context.Context, req *apiv1.SetNotebookPriorityRequest,
 ) (resp *apiv1.SetNotebookPriorityResponse, err error) {
+	targetNotebook, err := a.GetNotebook(ctx, &apiv1.GetNotebookRequest{NotebookId: req.NotebookId})
+	if err != nil {
+		return nil, err
+	}
+
+	curUser, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	err = command.AuthZProvider.Get().CanSetNSCsPriority(
+		ctx, *curUser, model.AccessScopeID(targetNotebook.Notebook.WorkspaceId), int(req.Priority),
+	)
+	if err != nil {
+		return nil, apiutils.MapAndFilterErrors(err, nil, nil)
+	}
+
 	return resp, a.ask(notebooksAddr.Child(req.NotebookId), req, &resp)
 }
 
-func (a *apiServer) NotebookLogs(
-	req *apiv1.NotebookLogsRequest, resp apiv1.Determined_NotebookLogsServer,
+// isNTSCPermittedToLaunch checks authorization to launch in a given
+// workspace.
+func (a *apiServer) isNTSCPermittedToLaunch(
+	ctx context.Context, spec *tasks.GenericCommandSpec,
 ) error {
-	if err := grpcutil.ValidateRequest(
-		grpcutil.ValidateLimit(req.Limit),
-	); err != nil {
-		return err
+	workspaceID := spec.Metadata.WorkspaceID
+	if workspaceID == 0 {
+		panic("workspace ID must be set")
 	}
 
-	ctx, cancel := context.WithCancel(resp.Context())
-	defer cancel()
+	user, _, err := grpcutil.GetUser(ctx)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to get the user: %s", err)
+	}
 
-	res := make(chan api.BatchResult, taskLogsChanBuffer)
-	go a.taskLogs(ctx, &apiv1.TaskLogsRequest{
-		TaskId: req.NotebookId,
-		Limit:  req.Limit,
-		Follow: req.Follow,
-	}, res)
+	w := &workspacev1.Workspace{}
+	notFoundErr := status.Errorf(codes.NotFound, "workspace (%d) not found", workspaceID)
+	if err := a.m.db.QueryProto(
+		"get_workspace", w, workspaceID, user.ID,
+	); errors.Is(err, db.ErrNotFound) {
+		return notFoundErr
+	} else if err != nil {
+		return errors.Wrapf(err, "error fetching workspace (%d) from database", workspaceID)
+	}
+	if w.Archived {
+		return notFoundErr
+	}
 
-	return processBatches(res, func(b api.Batch) error {
-		return b.ForEach(func(r interface{}) error {
-			lr := r.(*logger.Entry)
-			return resp.Send(&apiv1.NotebookLogsResponse{
-				LogEntry: &logv1.LogEntry{Id: int32(lr.ID), Message: lr.Message},
-			})
-		})
-	})
+	if spec.TaskType == model.TaskTypeTensorboard {
+		if ok, err := command.AuthZProvider.Get().CanGetTensorboard(
+			ctx, *user, workspaceID, spec.Metadata.ExperimentIDs, spec.Metadata.TrialIDs,
+		); err != nil || !ok {
+			return err
+		}
+	} else {
+		if err := command.AuthZProvider.Get().CanCreateNSC(
+			ctx, *user, workspaceID,
+		); err != nil {
+			return apiutils.MapAndFilterErrors(err, nil, nil)
+		}
+	}
+
+	return nil
 }
 
 func (a *apiServer) LaunchNotebook(
 	ctx context.Context, req *apiv1.LaunchNotebookRequest,
 ) (*apiv1.LaunchNotebookResponse, error) {
-	spec, err := a.getCommandLaunchParams(ctx, &protoCommandParams{
+	spec, launchWarnings, err := a.getCommandLaunchParams(ctx, &protoCommandParams{
 		TemplateName: req.TemplateName,
 		Config:       req.Config,
 		Files:        req.Files,
@@ -115,10 +223,22 @@ func (a *apiServer) LaunchNotebook(
 		return nil, api.APIErrToGRPC(errors.Wrapf(err, "failed to prepare launch params"))
 	}
 
+	spec.Metadata.WorkspaceID = model.DefaultWorkspaceID
+	if req.WorkspaceId != 0 {
+		spec.Metadata.WorkspaceID = model.AccessScopeID(req.WorkspaceId)
+	}
+	if err = a.isNTSCPermittedToLaunch(ctx, spec); err != nil {
+		return nil, err
+	}
+
 	spec.WatchProxyIdleTimeout = true
 	spec.WatchRunnerIdleTimeout = true
 
 	// Postprocess the spec.
+	if spec.Config.IdleTimeout == nil && a.m.config.NotebookTimeout != nil {
+		spec.Config.IdleTimeout = ptrs.Ptr(model.Duration(
+			time.Second * time.Duration(*a.m.config.NotebookTimeout)))
+	}
 	if spec.Config.Description == "" {
 		petName := petname.Generate(expconf.TaskNameGeneratorWords, expconf.TaskNameGeneratorSep)
 		spec.Config.Description = fmt.Sprintf("JupyterLab (%s)", petName)
@@ -144,8 +264,10 @@ func (a *apiServer) LaunchNotebook(
 		"NOTEBOOK_IDLE_TYPE": spec.Config.NotebookIdleType,
 		"DET_TASK_TYPE":      string(model.TaskTypeNotebook),
 	}
-	spec.Port = &port
-	spec.Config.Environment.Ports = map[string]int{"notebook": port}
+	spec.Base.ExtraProxyPorts = append(spec.Base.ExtraProxyPorts, expconf.ProxyPort{
+		RawProxyPort:        port,
+		RawDefaultServiceID: ptrs.Ptr(true),
+	})
 
 	spec.Config.Entrypoint = []string{jupyterEntrypoint}
 
@@ -154,32 +276,32 @@ func (a *apiServer) LaunchNotebook(
 	}
 
 	spec.AdditionalFiles = archive.Archive{
-		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterDir, nil, 0700, tar.TypeDir),
-		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterConfigDir, nil, 0700, tar.TypeDir),
-		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterDataDir, nil, 0700, tar.TypeDir),
-		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterRuntimeDir, nil, 0700, tar.TypeDir),
+		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterDir, nil, 0o700, tar.TypeDir),
+		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterConfigDir, nil, 0o700, tar.TypeDir),
+		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterDataDir, nil, 0o700, tar.TypeDir),
+		spec.Base.AgentUserGroup.OwnedArchiveItem(jupyterRuntimeDir, nil, 0o700, tar.TypeDir),
 		spec.Base.AgentUserGroup.OwnedArchiveItem(
 			jupyterEntrypoint,
 			etc.MustStaticFile(etc.NotebookEntrypointResource),
-			0700,
+			0o700,
 			tar.TypeReg,
 		),
 		spec.Base.AgentUserGroup.OwnedArchiveItem(
 			jupyterIdleCheck,
 			etc.MustStaticFile(etc.NotebookIdleCheckResource),
-			0700,
+			0o700,
 			tar.TypeReg,
 		),
 		spec.Base.AgentUserGroup.OwnedArchiveItem(
 			taskReadyCheckLogs,
 			etc.MustStaticFile(etc.TaskCheckReadyLogsResource),
-			0700,
+			0o700,
 			tar.TypeReg,
 		),
 		spec.Base.AgentUserGroup.OwnedArchiveItem(
 			notebookDefaultPage,
 			etc.MustStaticFile(etc.NotebookTemplateResource),
-			0644,
+			0o644,
 			tar.TypeReg,
 		),
 	}
@@ -198,5 +320,6 @@ func (a *apiServer) LaunchNotebook(
 	return &apiv1.LaunchNotebookResponse{
 		Notebook: notebook,
 		Config:   protoutils.ToStruct(spec.Config),
+		Warnings: pkgCommand.LaunchWarningToProto(launchWarnings),
 	}, nil
 }

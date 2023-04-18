@@ -1,17 +1,14 @@
-import contextlib
-import io
 import os
-import sys
 import time
-from typing import Any, Iterator, List
+from typing import Any, List
 from unittest import mock
 
 import pytest
 from deepspeed.launcher.runner import DEEPSPEED_ENVIRONMENT_NAME
 
-import determined as det
-import determined.launch.deepspeed
+import determined.launch.deepspeed  # noqa: F401
 from determined import constants, launch
+from tests.launch import test_util
 
 
 def test_parse_args() -> None:
@@ -28,8 +25,6 @@ def test_parse_args() -> None:
         # Scripts which require -- still work.
         "script -- arg": ["script", "--", "arg"],
     }
-    for args, exp in positive_test_cases.items():
-        assert exp == launch.deepspeed.parse_args(args.split()), f"test case failed, args = {args}"
 
     negative_test_cases = {
         "--trial my_module:MyTrial script": "extra arguments",
@@ -37,21 +32,9 @@ def test_parse_args() -> None:
         "--asdf 1 script ": "unrecognized arguments",
     }
 
-    for args, msg in negative_test_cases.items():
-        old = sys.stderr
-        fake = io.StringIO()
-        sys.stderr = fake
-        try:
-            try:
-                launch.deepspeed.parse_args(args.split())
-            except SystemExit:
-                # This is expected.
-                err = fake.getvalue()
-                assert msg in err, f"test case failed, args='{args}' msg='{msg}', stderr='{err}'"
-                continue
-            raise AssertionError(f"negative test case did not fail: args='{args}'")
-        finally:
-            sys.stderr = old
+    test_util.parse_args_check(
+        positive_test_cases, negative_test_cases, launch.deepspeed.parse_args
+    )
 
 
 @mock.patch("subprocess.Popen")
@@ -64,7 +47,7 @@ def test_launch_multi_slot_chief(
     mock_cluster_info: mock.MagicMock,
     mock_subprocess: mock.MagicMock,
 ) -> None:
-    cluster_info = make_mock_cluster_info(["0.0.0.0", "0.0.0.1"], 0)
+    cluster_info = test_util.make_mock_cluster_info(["0.0.0.0", "0.0.0.1"], 0, 4)
     mock_cluster_info.return_value = cluster_info
     mock_start_time = time.time()
     mock_time.return_value = mock_start_time
@@ -74,7 +57,10 @@ def test_launch_multi_slot_chief(
         cluster_info.allocation_id, len(cluster_info.slot_ids)
     )
     deepspeed_cmd = launch.deepspeed.create_run_command(
-        cluster_info.container_addrs[0], launch.deepspeed.hostfile_path
+        cluster_info.container_addrs[0],
+        launch.deepspeed.get_hostfile_path(
+            multi_machine=True, allocation_id=cluster_info.allocation_id
+        ),
     )
     pid_client_cmd = launch.deepspeed.create_pid_client_cmd(cluster_info.allocation_id)
     log_redirect_cmd = launch.deepspeed.create_log_redirect_cmd()
@@ -93,7 +79,7 @@ def test_launch_multi_slot_chief(
 
     mock_subprocess.side_effect = mock_process
 
-    with set_resources_id_env_var():
+    with test_util.set_resources_id_env_var():
         launch.deepspeed.main(script)
 
     mock_cluster_info.assert_called_once()
@@ -135,7 +121,7 @@ def test_launch_multi_slot_fail(
     mock_cluster_info: mock.MagicMock,
     mock_subprocess: mock.MagicMock,
 ) -> None:
-    cluster_info = make_mock_cluster_info(["0.0.0.0", "0.0.0.1"], 0)
+    cluster_info = test_util.make_mock_cluster_info(["0.0.0.0", "0.0.0.1"], 0, 4)
     mock_cluster_info.return_value = cluster_info
     mock_start_time = time.time()
     mock_time.return_value = mock_start_time
@@ -147,7 +133,10 @@ def test_launch_multi_slot_fail(
         cluster_info.allocation_id, len(cluster_info.slot_ids)
     )
     deepspeed_cmd = launch.deepspeed.create_run_command(
-        cluster_info.container_addrs[0], launch.deepspeed.hostfile_path
+        cluster_info.container_addrs[0],
+        launch.deepspeed.get_hostfile_path(
+            multi_machine=True, allocation_id=cluster_info.allocation_id
+        ),
     )
     pid_client_cmd = launch.deepspeed.create_pid_client_cmd(cluster_info.allocation_id)
     log_redirect_cmd = launch.deepspeed.create_log_redirect_cmd()
@@ -166,7 +155,7 @@ def test_launch_multi_slot_fail(
 
     mock_subprocess.side_effect = mock_process
 
-    with set_resources_id_env_var():
+    with test_util.set_resources_id_env_var():
         with pytest.raises(ValueError, match="no sshd greeting"):
             launch.deepspeed.main(script)
 
@@ -198,18 +187,23 @@ def test_launch_multi_slot_fail(
 def test_launch_one_slot(
     mock_cluster_info: mock.MagicMock, mock_subprocess: mock.MagicMock
 ) -> None:
-    cluster_info = make_mock_cluster_info(["0.0.0.0"], 0)
+    cluster_info = test_util.make_mock_cluster_info(["0.0.0.0"], 0, 4)
     mock_cluster_info.return_value = cluster_info
     script = ["s1", "s2"]
     pid_server_cmd = launch.deepspeed.create_pid_server_cmd(
         cluster_info.allocation_id, len(cluster_info.slot_ids)
     )
-    deepspeed_cmd = launch.deepspeed.create_run_command("localhost", launch.deepspeed.hostfile_path)
+    deepspeed_cmd = launch.deepspeed.create_run_command(
+        "localhost",
+        launch.deepspeed.get_hostfile_path(
+            multi_machine=False, allocation_id=cluster_info.allocation_id
+        ),
+    )
     pid_client_cmd = launch.deepspeed.create_pid_client_cmd(cluster_info.allocation_id)
     log_redirect_cmd = launch.deepspeed.create_log_redirect_cmd()
     launch_cmd = pid_server_cmd + deepspeed_cmd + pid_client_cmd + log_redirect_cmd + script
 
-    with set_resources_id_env_var():
+    with test_util.set_resources_id_env_var():
         launch.deepspeed.main(script)
 
     mock_cluster_info.assert_called_once()
@@ -222,19 +216,24 @@ def test_launch_one_slot(
 @mock.patch("subprocess.Popen")
 @mock.patch("determined.get_cluster_info")
 def test_launch_fail(mock_cluster_info: mock.MagicMock, mock_subprocess: mock.MagicMock) -> None:
-    cluster_info = make_mock_cluster_info(["0.0.0.0"], 0)
+    cluster_info = test_util.make_mock_cluster_info(["0.0.0.0"], 0, 4)
     mock_cluster_info.return_value = cluster_info
     mock_subprocess.return_value.wait.return_value = 1
     script = ["s1", "s2"]
     pid_server_cmd = launch.deepspeed.create_pid_server_cmd(
         cluster_info.allocation_id, len(cluster_info.slot_ids)
     )
-    deepspeed_cmd = launch.deepspeed.create_run_command("localhost", launch.deepspeed.hostfile_path)
+    deepspeed_cmd = launch.deepspeed.create_run_command(
+        "localhost",
+        launch.deepspeed.get_hostfile_path(
+            multi_machine=False, allocation_id=cluster_info.allocation_id
+        ),
+    )
     pid_client_cmd = launch.deepspeed.create_pid_client_cmd(cluster_info.allocation_id)
     log_redirect_cmd = launch.deepspeed.create_log_redirect_cmd()
     launch_cmd = pid_server_cmd + deepspeed_cmd + pid_client_cmd + log_redirect_cmd + script
 
-    with set_resources_id_env_var():
+    with test_util.set_resources_id_env_var():
         assert launch.deepspeed.main(script) == 1
 
     mock_cluster_info.assert_called_once()
@@ -250,9 +249,9 @@ def test_launch_fail(mock_cluster_info: mock.MagicMock, mock_subprocess: mock.Ma
 def test_launch_worker(
     mock_api: mock.MagicMock, mock_cluster_info: mock.MagicMock, mock_subprocess: mock.MagicMock
 ) -> None:
-    cluster_info = make_mock_cluster_info(["0.0.0.0", "0.0.0.1"], 1)
+    cluster_info = test_util.make_mock_cluster_info(["0.0.0.0", "0.0.0.1"], 1, 4)
     mock_cluster_info.return_value = cluster_info
-    with set_resources_id_env_var():
+    with test_util.set_resources_id_env_var():
         launch.deepspeed.main(["script"])
 
     mock_cluster_info.assert_called_once()
@@ -267,30 +266,3 @@ def test_launch_worker(
 
     expected_cmd = pid_server_cmd + sshd_cmd
     mock_subprocess.assert_called_once_with(expected_cmd)
-
-
-def make_mock_cluster_info(container_addrs: List[str], container_rank: int) -> det.ClusterInfo:
-    rendezvous_info_mock = det.RendezvousInfo(
-        container_addrs=container_addrs, container_rank=container_rank
-    )
-    cluster_info_mock = det.ClusterInfo(
-        master_url="localhost",
-        cluster_id="clusterId",
-        agent_id="agentId",
-        slot_ids=[0, 1, 2, 3],
-        task_id="taskId",
-        allocation_id="allocationId",
-        session_token="sessionToken",
-        task_type="TRIAL",
-        rendezvous_info=rendezvous_info_mock,
-    )
-    return cluster_info_mock
-
-
-@contextlib.contextmanager
-def set_resources_id_env_var() -> Iterator[None]:
-    try:
-        os.environ["DET_RESOURCES_ID"] = "containerId"
-        yield
-    finally:
-        del os.environ["DET_RESOURCES_ID"]

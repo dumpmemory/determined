@@ -5,14 +5,33 @@ option go_package = "github.com/determined-ai/determined/proto/pkg/apiv1";
 
 import "google/protobuf/wrappers.proto";
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 import "protoc-gen-swagger/options/annotations.proto";
 
+import "determined/api/v1/command.proto";
 import "determined/api/v1/pagination.proto";
+import "determined/common/v1/common.proto";
 import "determined/checkpoint/v1/checkpoint.proto";
 import "determined/experiment/v1/experiment.proto";
 import "determined/job/v1/job.proto";
 import "determined/util/v1/util.proto";
 import "determined/experiment/v1/searcher.proto";
+import "determined/trial/v1/trial.proto";
+
+// One datapoint in a series of metrics from a trial in batch.
+message DataPoint {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "batches", "value", "time" ] }
+  };
+  // Total batches processed by the time this measurement is taken.
+  int32 batches = 1;
+  // Value of the requested metric at this point in the trial.
+  double value = 2;
+  // The time the measurement is taken.
+  google.protobuf.Timestamp time = 3;
+  // The epoch this measurement is taken.
+  optional int32 epoch = 4;
+}
 
 // Get a single experiment.
 message GetExperimentRequest {
@@ -22,12 +41,10 @@ message GetExperimentRequest {
 // Response to GetExperimentRequest.
 message GetExperimentResponse {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "experiment", "config" ] }
+    json_schema: { required: [ "experiment" ] }
   };
   // The requested experiment.
   determined.experiment.v1.Experiment experiment = 1;
-  // The experiment config.
-  google.protobuf.Struct config = 2;
   // Associated job summary.
   determined.job.v1.JobSummary job_summary = 3;
 }
@@ -61,6 +78,14 @@ message GetExperimentsRequest {
     SORT_BY_FORKED_FROM = 12;
     // Returns experiments sorted by resource pool.
     SORT_BY_RESOURCE_POOL = 13;
+    // Returns experiments sorted by project.
+    SORT_BY_PROJECT_ID = 14;
+    // Returns experiments sorted by checkpoint size.
+    SORT_BY_CHECKPOINT_SIZE = 15;
+    // Returns experiments sorted by checkpoint count.
+    SORT_BY_CHECKPOINT_COUNT = 16;
+    // Returns experiments sorted by searcher metric value..
+    SORT_BY_SEARCHER_METRIC_VAL = 17;
   }
   // Sort experiments by the given field.
   SortBy sort_by = 1;
@@ -90,6 +115,13 @@ message GetExperimentsRequest {
   // Limit experiments to those that are owned by users with the specified
   // userIds.
   repeated int32 user_ids = 11;
+  // Limit experiments to those within a specified project, or 0 for all
+  // projects.
+  int32 project_id = 12;
+  // filtering by experiment ids
+  determined.common.v1.Int32FieldFilter experiment_id_filter = 13;
+  // whether to surface trial specific data from the best trial
+  bool show_trial_data = 14;
 }
 // Response to GetExperimentsRequest.
 message GetExperimentsResponse {
@@ -103,7 +135,10 @@ message GetExperimentsResponse {
 }
 
 // Get a list of experiment labels.
-message GetExperimentLabelsRequest {}
+message GetExperimentLabelsRequest {
+  // Filter experiments by project.
+  int32 project_id = 1;
+}
 // Response to GetExperimentsLabelsRequest.
 message GetExperimentLabelsResponse {
   // The list of labels used across all experiments.
@@ -117,6 +152,28 @@ message DeleteExperimentRequest {
 }
 // Response to DeleteExperimentRequest.
 message DeleteExperimentResponse {}
+
+// Delete multiple experiments.
+message DeleteExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiment_ids" ] }
+  };
+
+  // Selecting experiments by id.
+  repeated int32 experiment_ids = 1;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 2;
+}
+
+// Response to DeleteExperimentsRequest.
+message DeleteExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
 
 // Get the best searcher validation.
 message GetBestSearcherValidationMetricRequest {
@@ -150,6 +207,38 @@ message ActivateExperimentRequest {
 // Response to ActivateExperimentRequest.
 message ActivateExperimentResponse {}
 
+// Message for results of individual experiments in a multi-experiment action.
+message ExperimentActionResult {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "error", "id" ] }
+  };
+  // Optional error message.
+  string error = 1;
+  // Experiment ID.
+  int32 id = 2;
+}
+
+// Activate multiple experiments.
+message ActivateExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiment_ids" ] }
+  };
+
+  // Select experiments by id.
+  repeated int32 experiment_ids = 1;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 2;
+}
+// Response to ActivateExperimentsRequest.
+message ActivateExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
+
 // Pause an experiment.
 message PauseExperimentRequest {
   // The experiment id.
@@ -157,6 +246,48 @@ message PauseExperimentRequest {
 }
 // Response to PauseExperimentRequest.
 message PauseExperimentResponse {}
+
+// Filters to apply actions to multiple experiments.
+message BulkExperimentFilters {
+  // Limit experiments to those that match the description.
+  string description = 1;
+  // Limit experiments to those that match the name.
+  string name = 2;
+  // Limit experiments to those that match the provided labels.
+  repeated string labels = 3;
+  // Limit experiments to those that are archived.
+  google.protobuf.BoolValue archived = 4;
+  // Limit experiments to those that match the provided state.
+  repeated determined.experiment.v1.State states = 5;
+  // Limit experiments to those that are owned by users with the specified
+  // userIds.
+  repeated int32 user_ids = 6;
+  // Limit experiments to those within a specified project, or 0 for all
+  // projects.
+  int32 project_id = 7;
+}
+
+// Pause multiple experiments.
+message PauseExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiment_ids" ] }
+  };
+
+  // Selecting experiments by id.
+  repeated int32 experiment_ids = 1;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 2;
+}
+
+// Response to PauseExperimentsRequest.
+message PauseExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
 
 // Cancel an experiment.
 message CancelExperimentRequest {
@@ -166,6 +297,27 @@ message CancelExperimentRequest {
 // Response to CancelExperimentRequest.
 message CancelExperimentResponse {}
 
+// Cancel multiple experiments.
+message CancelExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiment_ids" ] }
+  };
+
+  // Selecting experiments by id.
+  repeated int32 experiment_ids = 1;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 2;
+}
+// Response to CancelExperimentsRequest.
+message CancelExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
+
 // Kill an experiment.
 message KillExperimentRequest {
   // The experiment id.
@@ -173,6 +325,27 @@ message KillExperimentRequest {
 }
 // Response to KillExperimentRequest.
 message KillExperimentResponse {}
+
+// Kill multiple experiments.
+message KillExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiment_ids" ] }
+  };
+
+  // Selecting experiments by id.
+  repeated int32 experiment_ids = 1;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 2;
+}
+// Response to KillExperimentsRequest.
+message KillExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
 
 // Archive an experiment.
 message ArchiveExperimentRequest {
@@ -182,6 +355,27 @@ message ArchiveExperimentRequest {
 // Response to ArchiveExperimentRequest.
 message ArchiveExperimentResponse {}
 
+// Archive multiple experiments.
+message ArchiveExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiment_ids" ] }
+  };
+
+  // Selecting experiments by id.
+  repeated int32 experiment_ids = 1;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 2;
+}
+// Response to ArchiveExperimentsRequest.
+message ArchiveExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
+
 // Unarchive an experiment.
 message UnarchiveExperimentRequest {
   // The experiment id.
@@ -189,6 +383,27 @@ message UnarchiveExperimentRequest {
 }
 // Response to UnarchiveExperimentRequest.
 message UnarchiveExperimentResponse {}
+
+// Unarchive multiple experiments.
+message UnarchiveExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiment_ids" ] }
+  };
+
+  // Selecting experiments by id.
+  repeated int32 experiment_ids = 1;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 2;
+}
+// Response to UnarchiveExperimentsRequest.
+message UnarchiveExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
 
 // Patch an experiment by providing the updated attributes. Only description,
 // label, name, and notes fields will be updated through this endpoint, and
@@ -213,20 +428,16 @@ message GetExperimentCheckpointsRequest {
     // Returns checkpoints sorted by UUID.
     SORT_BY_UUID = 1;
     // Returns checkpoints sorted by trial id.
-    SORT_BY_TRIAL_ID = 4;
+    SORT_BY_TRIAL_ID = 2;
     // Returns checkpoints sorted by batch number.
-    SORT_BY_BATCH_NUMBER = 6;
-    // Returns checkpoints sorted by start time.
-    SORT_BY_START_TIME = 7;
+    SORT_BY_BATCH_NUMBER = 3;
     // Returns checkpoints sorted by end time.
-    SORT_BY_END_TIME = 8;
-    // Returns checkpoints sorted by validation state.
-    SORT_BY_VALIDATION_STATE = 15;
+    SORT_BY_END_TIME = 4;
     // Returns checkpoints sorted by state.
-    SORT_BY_STATE = 16;
+    SORT_BY_STATE = 5;
     // Returns checkpoints sorted by the experiment's `searcher.metric`
     // configuration setting.
-    SORT_BY_SEARCHER_METRIC = 17;
+    SORT_BY_SEARCHER_METRIC = 6;
   }
   // The experiment id.
   int32 id = 1;
@@ -240,8 +451,6 @@ message GetExperimentCheckpointsRequest {
   // Limit the number of checkpoints. A value of 0 denotes no limit.
   int32 limit = 5;
 
-  // Limit the checkpoints to those that match the validation states.
-  repeated determined.checkpoint.v1.State validation_states = 6;
   // Limit the checkpoints to those that match the states.
   repeated determined.checkpoint.v1.State states = 7;
 }
@@ -287,7 +496,20 @@ message CreateExperimentRequest {
   int32 parent_id = 4;
   // Request to auto-activate the experiment.
   bool activate = 5;
+  // Project id to contain the experiment.
+  int32 project_id = 6;
+  // Template to use for the experiment.
+  optional string template = 7;
+  // Git remote at submission time.
+  optional string git_remote = 8;
+  // Git commit at submission time.
+  optional string git_commit = 9;
+  // Git committer at submission time.
+  optional string git_committer = 10;
+  // Git commit date at submission time.
+  google.protobuf.Timestamp git_commit_date = 11;
 }
+
 // Response to CreateExperimentRequest.
 message CreateExperimentResponse {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
@@ -297,6 +519,8 @@ message CreateExperimentResponse {
   determined.experiment.v1.Experiment experiment = 1;
   // The created experiment config.
   google.protobuf.Struct config = 2;
+  // List of any related warnings.
+  repeated LaunchWarning warnings = 3;
 }
 
 // Request for the set of metrics recorded by an experiment.
@@ -321,7 +545,7 @@ message MetricNamesResponse {
   repeated string validation_metrics = 3;
 }
 
-// To distinguish the 2 different categories of metrics.
+// To distinguish the different categories of metrics.
 enum MetricType {
   // Zero-value (not allowed).
   METRIC_TYPE_UNSPECIFIED = 0;
@@ -363,7 +587,7 @@ message MetricBatchesResponse {
   repeated int32 batches = 1;
 }
 
-// Request metrics from all trials at a progress point of progress.
+// Request metrics from all trials at a point of progress.
 message TrialsSnapshotRequest {
   // The id of the experiment.
   int32 experiment_id = 1
@@ -457,16 +681,6 @@ message TrialsSampleResponse {
   option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
     json_schema: { required: [ "trials", "promoted_trials", "demoted_trials" ] }
   };
-  // One datapoint in a series of metrics from a trial.
-  message DataPoint {
-    option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-      json_schema: { required: [ "batches", "value" ] }
-    };
-    // Total batches processed by the time this measurement is taken.
-    int32 batches = 1;
-    // Value of the requested metric at this point in the trial.
-    double value = 2;
-  }
   // Metadata and metrics stream from a trial.
   message Trial {
     option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
@@ -488,62 +702,6 @@ message TrialsSampleResponse {
   repeated int32 demoted_trials = 3;
 }
 
-// Trigger the computation of hyperparameter importance on-demand for a specific
-// metric on a specific experiment.
-message ComputeHPImportanceRequest {
-  // The id of the experiment.
-  int32 experiment_id = 1;
-  // A metric name.
-  string metric_name = 2
-      [(grpc.gateway.protoc_gen_swagger.options.openapiv2_field) = {
-        required:
-          ["metric_name"];
-      }];
-  // The type of metric.
-  MetricType metric_type = 3
-      [(grpc.gateway.protoc_gen_swagger.options.openapiv2_field) = {
-        required:
-          ["metric_type"];
-      }];
-}
-
-// Response to ComputeHPImportanceRequest
-message ComputeHPImportanceResponse {}
-
-// Retrieve the status and results of hyperparameter importance computation.
-message GetHPImportanceRequest {
-  // The id of the experiment.
-  int32 experiment_id = 1;
-  // Seconds to wait when polling for updates.
-  int32 period_seconds = 2;
-}
-
-// Response to GetHPImportanceRequest
-message GetHPImportanceResponse {
-  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
-    json_schema: { required: [ "training_metrics", "validation_metrics" ] }
-  };
-  // Hyperparameter importance as computed with respect for one specific metric.
-  message MetricHPImportance {
-    // A map between hyperparameter names and their relative importance.
-    map<string, double> hp_importance = 1;
-    // The approximate portion of the experiment that was complete when the data
-    // was read.
-    double experiment_progress = 2;
-    // A description of why computation failed. Empty unless the state is (or
-    // was) 'failed'.
-    string error = 3;
-    // Whether or not a request to compute results for this metric is queued.
-    bool pending = 4;
-    // Whether or not results for this metric are currently being computed.
-    bool in_progress = 5;
-  }
-  // A map of training metric names to their respective entries.
-  map<string, MetricHPImportance> training_metrics = 1;
-  // A map of validation metric names to their respective entries.
-  map<string, MetricHPImportance> validation_metrics = 2;
-}
-
 // Request for an experiment model definition.
 message GetModelDefRequest {
   // The id of the experiment.
@@ -557,4 +715,125 @@ message GetModelDefResponse {
   };
   // The base64-encoded, gzipped, tarball.
   string b64_tgz = 1;
+}
+
+// Request to move an experiment into a project.
+message MoveExperimentRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "destination_project_id", "experiment_id" ] }
+  };
+
+  // The id of the experiment being moved.
+  int32 experiment_id = 1;
+  // The id of the new parent project.
+  int32 destination_project_id = 2;
+}
+
+// Response to MoveExperimentRequest.
+message MoveExperimentResponse {}
+
+// Request to move an experiment into a project.
+message MoveExperimentsRequest {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "destination_project_id", "experiment_ids" ] }
+  };
+
+  // The ids of the experiments being moved.
+  repeated int32 experiment_ids = 1;
+  // The id of the new parent project.
+  int32 destination_project_id = 2;
+  // Targets all experiments matching filters.
+  BulkExperimentFilters filters = 3;
+}
+
+// Response to MoveExperimentsRequest.
+message MoveExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "results" ] }
+  };
+
+  // Details on success or error for each experiment.
+  repeated ExperimentActionResult results = 1;
+}
+
+// Request to get model definition file tree of an experiment.
+message GetModelDefTreeRequest {
+  // The id of the experiment.
+  int32 experiment_id = 1;
+}
+
+// Response to GetModelDefTreeRequest.
+message GetModelDefTreeResponse {
+  // File tree of an experiment.
+  repeated determined.experiment.v1.FileNode files = 1;
+}
+
+// Request to get a file of model definition.
+message GetModelDefFileRequest {
+  // The id of the experiment.
+  int32 experiment_id = 1;
+  // The path of file.
+  string path = 2;
+}
+
+// Response to GetModelDefFileRequest.
+message GetModelDefFileResponse {
+  // Content of file.
+  bytes file = 1;
+}
+
+// Request to get the list of searcher events.
+message GetSearcherEventsRequest {
+  // The ID of the experiment.
+  int32 experiment_id = 1;
+}
+
+// Response to GetSearcherEventsRequest.
+message GetSearcherEventsResponse {
+  // The list of events in the queue.
+  repeated determined.experiment.v1.SearcherEvent searcher_events = 1;
+}
+
+// Request for sending operations from a custom search method.
+message PostSearcherOperationsRequest {
+  // The experiment ID.
+  int32 experiment_id = 1;
+  // List of operations to submit.
+  repeated determined.experiment.v1.SearcherOperation searcher_operations = 2;
+  // The event that triggered the client to send these operations to the master.
+  determined.experiment.v1.SearcherEvent triggered_by_event = 3;
+}
+
+// Response to PostSearcherOperationsResponse.
+message PostSearcherOperationsResponse {}
+
+// Request for searching experiments
+message SearchExperimentsRequest {
+  // ID of the project to look at
+  optional int32 project_id = 1;
+  // How many experiments to skip before including in the results
+  int32 offset = 2;
+  // How many results to show
+  int32 limit = 3;
+  // Sort parameters in the format <col1>=(asc|desc),<col2>=(asc|desc)
+  optional string sort = 4;
+}
+
+// combination of experiment and best trial with metrics
+message SearchExperimentExperiment {
+  // The experiment in question
+  determined.experiment.v1.Experiment experiment = 1;
+  // The best performing trial associated with the experiment
+  determined.trial.v1.Trial best_trial = 2;
+}
+
+// Response for searching experiments
+message SearchExperimentsResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "experiments", "pagination" ] }
+  };
+  // The list of returned experiments.
+  repeated SearchExperimentExperiment experiments = 1;
+  // Pagination information of the full dataset
+  Pagination pagination = 2;
 }

@@ -64,7 +64,7 @@ func checkSimulation(
 func checkReproducibility(
 	t assert.TestingT, methodGen func() SearchMethod, hparams expconf.Hyperparameters, metric string,
 ) {
-	hparams = schemas.WithDefaults(hparams).(expconf.Hyperparameters)
+	hparams = schemas.WithDefaults(hparams)
 	seed := int64(17)
 	searcher1 := NewSearcher(uint32(seed), methodGen(), hparams)
 	searcher2 := NewSearcher(uint32(seed), methodGen(), hparams)
@@ -254,8 +254,8 @@ func runValueSimulationTestCases(t *testing.T, testCases []valueSimulationTestCa
 		tc := testCase
 		t.Run(tc.name, func(t *testing.T) {
 			// Apply WithDefaults in one place to make tests easyto write.
-			config := schemas.WithDefaults(tc.config).(expconf.SearcherConfig)
-			hparams := schemas.WithDefaults(tc.hparams).(expconf.Hyperparameters)
+			config := schemas.WithDefaults(tc.config)
+			hparams := schemas.WithDefaults(tc.hparams)
 			method := NewSearchMethod(config)
 			err := checkValueSimulation(t, method, hparams, tc.expectedTrials)
 			assert.NilError(t, err)
@@ -282,14 +282,16 @@ func simulateOperationComplete(
 	}
 
 	if trial.EarlyExit != nil && opIndex == *trial.EarlyExit {
-		ops, err := method.trialExitedEarly(ctx, operation.RequestID, model.UserCanceled)
+		ops, err := method.trialExitedEarly(ctx, operation.RequestID, model.UserRequestedStop)
 		if err != nil {
 			return nil, errors.Wrap(err, "trainCompleted")
 		}
 		return ops, nil
 	}
 
-	ops, err := method.validationCompleted(ctx, operation.RequestID, trial.ValMetrics[opIndex])
+	ops, err := method.validationCompleted(
+		ctx, operation.RequestID, trial.ValMetrics[opIndex], operation,
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "validationCompleted")
 	}
@@ -306,10 +308,10 @@ func saveAndReload(method SearchMethod) error {
 	} else if state2, err := method.Snapshot(); err != nil { // Test restore is correct.
 		return err
 	} else if !bytes.Equal(state, state2) {
-		var unmarshaledState = method.Restore(state)
-		var unmarshaledState2 = method.Restore(state2)
-		fmt.Printf("%+v\n", unmarshaledState)
-		fmt.Printf("%+v\n", unmarshaledState2)
+		unmarshaledState := method.Restore(state)
+		unmarshaledState2 := method.Restore(state2)
+		fmt.Printf("%+v\n", unmarshaledState)  //nolint: forbidigo
+		fmt.Printf("%+v\n", unmarshaledState2) //nolint: forbidigo
 		return errors.New("successive snapshots were not identical")
 	}
 	return nil

@@ -5,9 +5,9 @@ option go_package = "github.com/determined-ai/determined/proto/pkg/apiv1";
 
 import "google/protobuf/struct.proto";
 
+import "determined/api/v1/command.proto";
 import "determined/api/v1/pagination.proto";
 import "determined/notebook/v1/notebook.proto";
-import "determined/log/v1/log.proto";
 import "determined/util/v1/util.proto";
 import "protoc-gen-swagger/options/annotations.proto";
 
@@ -23,6 +23,8 @@ message GetNotebooksRequest {
     SORT_BY_DESCRIPTION = 2;
     // Return notebooks sorted by start time.
     SORT_BY_START_TIME = 4;
+    // Return notebooks sorted by workspace_id
+    SORT_BY_WORKSPACE_ID = 5;
   }
   // Sort notebooks by the given field.
   SortBy sort_by = 1;
@@ -39,9 +41,15 @@ message GetNotebooksRequest {
   // Limit notebooks to those that are owned by users with the specified
   // userIds.
   repeated int32 user_ids = 6;
+  // Limit to those within a specified workspace, or 0 for all
+  // accessible workspaces.
+  int32 workspace_id = 12;
 }
 // Response to GetNotebooksRequest.
 message GetNotebooksResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "notebooks" ] }
+  };
   // The list of returned notebooks.
   repeated determined.notebook.v1.Notebook notebooks = 1;
   // Pagination information of the full dataset.
@@ -55,6 +63,9 @@ message GetNotebookRequest {
 }
 // Response to GetNotebookRequest.
 message GetNotebookResponse {
+  option (grpc.gateway.protoc_gen_swagger.options.openapiv2_schema) = {
+    json_schema: { required: [ "notebook", "config" ] }
+  };
   // The requested notebook.
   determined.notebook.v1.Notebook notebook = 1;
   // The notebook config.
@@ -95,25 +106,6 @@ message SetNotebookPriorityResponse {
   determined.notebook.v1.Notebook notebook = 1;
 }
 
-// Stream notebook logs.
-message NotebookLogsRequest {
-  // Requested Notebook id.
-  string notebook_id = 1;
-  // Skip the number of notebook logs before returning results. Negative values
-  // denote number of notebook logs to skip from the end before returning
-  // results.
-  int32 offset = 2;
-  // Limit the number of notebook logs. A value of 0 denotes no limit.
-  int32 limit = 3;
-  // Continue following logs until the notebook stops or the limit is reached.
-  bool follow = 4;
-}
-// Response to NotebookLogsRequest.
-message NotebookLogsResponse {
-  // The Notebook's log entry.
-  determined.log.v1.LogEntry log_entry = 1;
-}
-
 // Request to launch a notebook.
 message LaunchNotebookRequest {
   // Notebook config (JSON).
@@ -124,6 +116,8 @@ message LaunchNotebookRequest {
   repeated determined.util.v1.File files = 3;
   // Preview a launching request without actually creating a Notebook.
   bool preview = 4;
+  // Workspace ID. Defaults to 'Uncategorized' workspace if not specified.
+  int32 workspace_id = 5;
 }
 // Response to LaunchNotebookRequest.
 message LaunchNotebookResponse {
@@ -134,4 +128,6 @@ message LaunchNotebookResponse {
   determined.notebook.v1.Notebook notebook = 1;
   // The config;
   google.protobuf.Struct config = 2;
+  // List of any related warnings.
+  repeated LaunchWarning warnings = 3;
 }

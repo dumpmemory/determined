@@ -14,6 +14,7 @@ from tests import config
 from tests.experiment import profile_test
 from tests.nightly.compute_stats import compare_stats
 
+from .cluster.test_users import ADMIN_CREDENTIALS, logged_in_user
 from .cluster_log_manager import ClusterLogManager
 
 _INTEG_MARKERS = {
@@ -22,9 +23,12 @@ _INTEG_MARKERS = {
     "tensorflow2",
     "e2e_cpu",
     "e2e_cpu_2a",
+    "e2e_cpu_agent_connection_loss",
     "e2e_cpu_elastic",
     "e2e_gpu",
+    "e2e_k8s",
     "det_deploy_local",
+    "stress_test",
     "distributed",
     "parallel",
     "nightly",
@@ -33,6 +37,7 @@ _INTEG_MARKERS = {
     "model_hub_mmdetection",
     "deepspeed",
     "managed_devcluster",
+    "port_registry",
 }
 
 
@@ -79,18 +84,24 @@ def pytest_addoption(parser: Parser) -> None:
         help="Docker compose project name",
     )
     parser.addoption("--follow-local-logs", action="store_true", help="Follow local docker logs")
+    parser.addoption("--no-compare-stats", action="store_true", help="Disable usage stats check")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def instantiate_gpu() -> None:
+    command = ["det", "cmd", "--config", "resources.slots=1", "'sleep 30'"]
+
+    subprocess.run(command, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def cluster_log_manager(request: SubRequest) -> Iterator[Optional[ClusterLogManager]]:
-    master_config_path = request.config.getoption("--master-config-path")
-    master_config_path = Path(master_config_path) if master_config_path else None
     master_scheme = request.config.getoption("--master-scheme")
     master_host = request.config.getoption("--master-host")
     master_port = request.config.getoption("--master-port")
     det_version = request.config.getoption("--det-version")
     follow_local_logs = request.config.getoption("--follow-local-logs")
-    compose_file = request.config.getoption("--compose-file")
+    compare_stats_enabled = not request.config.getoption("--no-compare-stats")
 
     config.MASTER_SCHEME = master_scheme
     config.MASTER_IP = master_host
@@ -99,9 +110,10 @@ def cluster_log_manager(request: SubRequest) -> Iterator[Optional[ClusterLogMana
 
     if master_host == "localhost" and follow_local_logs:
         project_name = request.config.getoption("--compose-project-name")
-        project = ["-p", project_name] if project_name else []
         with ClusterLogManager(
-            lambda: subprocess.run(["docker-compose", "-f", compose_file, *project, "logs", "-f"])
+            lambda: subprocess.run(
+                ["det", "deploy", "local", "logs", "--cluster-name", project_name]
+            )
         ) as clm:
             # Yield instead of return so that `__exit__` is called when the
             # testing session is finished.
@@ -110,7 +122,8 @@ def cluster_log_manager(request: SubRequest) -> Iterator[Optional[ClusterLogMana
         # Yield `None` so that pytest handles the no log manager case correctly.
         yield None
 
-    compare_stats()
+    if compare_stats_enabled:
+        compare_stats()
 
 
 def pytest_itemcollected(item: Any) -> None:
@@ -118,8 +131,7 @@ def pytest_itemcollected(item: Any) -> None:
         pytest.exit(f"{item.nodeid} is missing an integration test mark (any of {_INTEG_MARKERS})")
 
 
-@pytest.fixture(scope="session")
-def secrets(request: SubRequest) -> Dict[str, str]:
+def s3_secrets(request: SubRequest) -> Dict[str, str]:
     """
     Connect to S3 secretsmanager to get the secret values used in integrations tests.
     """
@@ -129,15 +141,48 @@ def secrets(request: SubRequest) -> Dict[str, str]:
     # Create a Secrets Manager client
     session = boto3.session.Session()
     client = session.client(service_name="secretsmanager", region_name=region_name)
+    response = client.get_secret_value(SecretId=secret_name)
+
+    return cast(Dict[str, str], json.loads(response["SecretString"]))
+
+
+@pytest.fixture(scope="session")
+def secrets(request: SubRequest) -> Dict[str, str]:
+    response = {}
 
     try:
-        response = client.get_secret_value(SecretId=secret_name)
+        response = s3_secrets(request)
     except boto_exc.NoCredentialsError:
         if request.config.getoption("--require-secrets"):
             raise
         pytest.skip("No S3 access")
 
-    return cast(Dict[str, str], json.loads(response["SecretString"]))
+    return response
+
+
+@pytest.fixture(scope="session")
+def checkpoint_storage_config(request: SubRequest) -> Dict[str, Any]:
+    command = [
+        "det",
+        "-m",
+        config.make_master_url(),
+        "master",
+        "config",
+        "--json",
+    ]
+
+    with logged_in_user(ADMIN_CREDENTIALS):
+        output = subprocess.check_output(command, universal_newlines=True, stderr=subprocess.PIPE)
+
+    checkpoint_config = json.loads(output)["checkpoint_storage"]
+
+    if checkpoint_config["type"] == "s3":
+        secret_conf = s3_secrets(request)
+        checkpoint_config["bucket"] = secret_conf["INTEGRATIONS_S3_BUCKET"]
+        checkpoint_config["access_key"] = secret_conf["INTEGRATIONS_S3_ACCESS_KEY"]
+        checkpoint_config["secret_key"] = secret_conf["INTEGRATIONS_S3_SECRET_KEY"]
+
+    return cast(Dict[str, Any], checkpoint_config)
 
 
 @pytest.fixture(scope="session")
@@ -151,7 +196,8 @@ def using_k8s(request: SubRequest) -> bool:
         "--json",
     ]
 
-    output = subprocess.check_output(command, universal_newlines=True, stderr=subprocess.PIPE)
+    with logged_in_user(ADMIN_CREDENTIALS):
+        output = subprocess.check_output(command, universal_newlines=True, stderr=subprocess.PIPE)
 
     rp = json.loads(output)["resource_manager"]["type"]
     return bool(rp == "kubernetes")

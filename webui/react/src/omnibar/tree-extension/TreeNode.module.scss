@@ -1,14 +1,12 @@
 // Based on omnibar/src/modifier/AnchorRenderer.tsx
 
 .base {
-  border-bottom-width: 1px;
-  border-color: var(--theme-colors-monochrome-12);
-  border-left-width: 1px;
-  border-right-width: 1px;
+  background-color: var(--theme-stage);
+  border-color: var(--theme-stage-border);
   border-style: solid;
-  border-top-width: 0;
+  border-width: 0 1px 1px;
   box-sizing: border-box;
-  color: var(--theme-colors-monochrome-0);
+  color: var(--theme-stage-on-strong);
   display: flex;
   flex-direction: row;
   font-size: 24px;
@@ -21,11 +19,12 @@
   padding-right: 15px;
   text-decoration: none;
   word-break: break-word;
-  word-wrap: break-all;
 }
 .selected {
-  background-color: var(--theme-colors-monochrome-12);
+  background-color: var(--theme-stage-on);
+  color: var(--theme-ix-active);
 }
 .highlighted {
-  background-color: var(--theme-colors-monochrome-14);
+  background-color: var(--theme-stage-on-weak);
+  color: var(--theme-ix-inactive);
 }

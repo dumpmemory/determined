@@ -23,13 +23,14 @@ Usage: update-bumpenvs-yaml.py path/to/bumpenvs.yaml ENVIRONMENTS_COMMIT
 
 import argparse
 import collections
+import itertools
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
 import requests
-import yaml
+from ruamel import yaml
 
 USER = "determined-ai"
 PROJECT = "environments"
@@ -38,30 +39,34 @@ BASE_URL = f"https://circleci.com/api/v1.1/project/github/{USER}/{PROJECT}"
 JOB_SUFFIXES = [
     "tf1-cpu",
     "tf2-cpu",
-    "tf24-cpu",
-    "tf25-cpu",
-    "tf26-cpu",
     "tf27-cpu",
+    "pt-cpu",
     "tf1-gpu",
     "tf2-gpu",
-    "tf24-gpu",
-    "tf25-gpu",
-    "tf26-gpu",
     "tf27-gpu",
-    "pytorch19-tf25-rocm",
+    "pt-gpu",
+]
+
+JOB_SUFFIXES_WITHOUT_MPI = [
+    "pytorch10-tf27-rocm50",
     "deepspeed-gpu",
     "gpt-neox-deepspeed-gpu",
 ]
 
 PACKER_JOBS = {"publish-cloud-images"}
 
-DOCKER_JOBS = {f"build-and-publish-docker-{suffix}" for suffix in JOB_SUFFIXES}
+DOCKER_JOBS = {
+    f"build-and-publish-docker-{suffix}-{mpi}"
+    for (suffix, mpi) in itertools.product(JOB_SUFFIXES, [0, 1])
+} | {f"build-and-publish-docker-{suffix}-0" for suffix in JOB_SUFFIXES_WITHOUT_MPI}
 
 PACKER_ARTIFACTS = {
     "packer-log",
 }
 
-DOCKER_ARTIFACTS = {f"publish-{suffix}" for suffix in JOB_SUFFIXES}
+DOCKER_ARTIFACTS = {
+    f"publish-{suffix}-{mpi}" for (suffix, mpi) in itertools.product(JOB_SUFFIXES, [0, 1])
+} | {f"publish-{suffix}-0" for suffix in JOB_SUFFIXES_WITHOUT_MPI}
 
 
 class Build:
@@ -90,7 +95,7 @@ class Build:
 def get_all_builds(commit: str, dev: bool, cloud_images: bool) -> Dict[str, Build]:
     # Get all the recent jobs.
     print("fetching recent jobs", file=sys.stderr)
-    req = requests.get(BASE_URL, params={"limit": "50", "filter": "completed"})
+    req = requests.get(BASE_URL, params={"limit": "100", "filter": "completed"})
     req.raise_for_status()
 
     # Get all the build numbers matching this commit.
@@ -123,7 +128,9 @@ def get_all_builds(commit: str, dev: bool, cloud_images: bool) -> Dict[str, Buil
     if found_expected:
         print(f"Found {found_expected} jobs not expected")
 
-    assert expected == found, f"expected jobs ({expected}) but found ({found})"
+    assert expected == found, "expected jobs\n  {expected_list}\nbut found\n  {found_list}".format(
+        expected_list="\n  ".join(sorted(expected)), found_list="\n  ".join(sorted(found))
+    )
 
     return builds
 
@@ -139,7 +146,11 @@ def get_all_artifacts(builds: Dict[str, Build], cloud_images: bool) -> Dict[str,
         expected = DOCKER_ARTIFACTS
 
     found = set(artifacts.keys())
-    assert expected == found, f"expected artifacts ({expected}) but found ({found})"
+    assert (
+        expected == found
+    ), "expected artifacts\n  {expected_list}\nbut found\n  {found_list}".format(
+        expected_list="\n  ".join(sorted(expected)), found_list="\n  ".join(sorted(found))
+    )
 
     return artifacts
 
@@ -151,14 +162,10 @@ def parse_packer_log(packer_log: str) -> Dict[str, str]:
     lines = packer_log.strip().split("\n")
     fields = [line.split(",") for line in lines]
     # We only care about artifact lines with exactly six fields.
-    ArtifactLine = collections.namedtuple(
-        "ArtifactLine", "time builder linetype index msgtype val"
-    )
+    ArtifactLine = collections.namedtuple("ArtifactLine", "time builder linetype index msgtype val")
 
     # We only care about artifact lines with exactly 6 fields.
-    artifact_lines = [
-        ArtifactLine(*f) for f in fields if len(f) == 6 and f[2] == "artifact"
-    ]
+    artifact_lines = [ArtifactLine(*f) for f in fields if len(f) == 6 and f[2] == "artifact"]
 
     # Get the ami images, which should match lines like this one (line break for readability):
     #   1598642161,amazon-ebs,artifact,0,id,us-east-1:
@@ -168,9 +175,7 @@ def parse_packer_log(packer_log: str) -> Dict[str, str]:
         for a in artifact_lines
         if a.builder.startswith("amazon-ebs") and a.msgtype == "id" and a.val
     ]
-    assert (
-        len(ami_lines) == 2
-    ), f"expected two matching ami ids line but got: {ami_lines}"
+    assert len(ami_lines) == 2, f"expected two matching ami ids line but got: {ami_lines}"
 
     for ami_line in ami_lines:
         ami_fields = ami_line.val.split("%!(PACKER_COMMA)")
@@ -195,9 +200,7 @@ def parse_packer_log(packer_log: str) -> Dict[str, str]:
     # Get the GCP artifact ID by matching a line like this one:
     #    1598642161,det-environments-06318c7,artifact,0,id,det-environments-06318c7
     gcp_ids = [
-        a.val
-        for a in artifact_lines
-        if a.builder == gcp_builder and a.msgtype == "id" and a.val
+        a.val for a in artifact_lines if a.builder == gcp_builder and a.msgtype == "id" and a.val
     ]
     assert len(gcp_ids) == 1, f"expected one matching gcp id line but got: {gcp_ids}"
     out["gcp_env"] = gcp_ids[0]
@@ -264,6 +267,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     with open(path, "w") as f:
-        yaml.dump(conf, f, sort_keys=True)
+        yaml.dump(conf, f)
 
     print(f"done, {path} has been updated", file=sys.stderr)

@@ -6,8 +6,9 @@ from typing import Any, Dict, Tuple
 
 from dateutil import parser
 
-from determined.common.api import authentication, bindings, certs
-from determined.common.experimental import session
+from determined.common import api
+from determined.common.api import bindings
+from tests import api_utils
 from tests import config as conf
 
 ADD_KEY = "adding"
@@ -91,21 +92,20 @@ def fetch_master_log() -> bool:
     return True
 
 
-def create_test_session() -> session.Session:
-    murl = conf.make_master_url()
-    certs.cli_cert = certs.default_load(murl)
-    authentication.cli_auth = authentication.Authentication(murl, try_reauth=True)
-    return session.Session(murl, "determined", authentication.cli_auth, certs.cli_cert)
-
-
 def compare_stats() -> None:
     if not fetch_master_log():
         print("Skip compare stats because error at fetch master")
         return
     gpu_from_log, global_start, global_end = parse_log_for_gpu_stats(log_path)
-    res = bindings.get_ResourceAllocationRaw(
-        create_test_session(), timestampAfter=global_start, timestampBefore=global_end
-    )
+    try:
+        res = bindings.get_ResourceAllocationRaw(
+            api_utils.determined_test_session(),
+            timestampAfter=global_start,
+            timestampBefore=global_end,
+        )
+    except api.errors.ForbiddenException:
+        print("Skip compare stats because missing access to resource allocations")
+        return
     gpu_from_api = 0
     gpu_from_api_map = {}
     instance_from_api = 0
@@ -123,7 +123,9 @@ def compare_stats() -> None:
             instance_from_api_map[r["username"]] += r["seconds"]
     for ins in instance_from_api_map:
         # make sure instance initialization time is less than 5 mins
-        assert instance_from_api_map[ins] - gpu_from_api_map[ins] < 60 * 5
+        if ins in gpu_from_api_map:
+            assert instance_from_api_map[ins] - gpu_from_api_map[ins] < 60 * 5
 
+    print(f"Agent time: logs={gpu_from_log}, api={gpu_from_api}")
     # make sure agent stats get from script is less than 5% difference with those get from api
     assert abs(gpu_from_log - gpu_from_api) <= max(gpu_from_api, gpu_from_log) * 0.05

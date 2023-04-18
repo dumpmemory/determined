@@ -1,34 +1,40 @@
-import { BaseType, SettingsConfig } from 'hooks/useSettings';
+import { literal, string, undefined as undefinedType, union } from 'io-ts';
+
+import { SettingsConfig } from 'hooks/useSettings';
+import { ValueOf } from 'shared/types';
 
 export interface Settings {
   after?: string;
   before?: string;
-  groupBy: string;
+  groupBy: GroupBy;
 }
 
-export enum GroupBy {
-  Day = 'day',
-  Month = 'month',
-}
+export const GroupBy = {
+  Day: 'day',
+  Month: 'month',
+} as const;
 
-const config: SettingsConfig = {
-  settings: [
-    {
-      key: 'after',
-      type: { baseType: BaseType.String },
+export type GroupBy = ValueOf<typeof GroupBy>;
+
+const config: SettingsConfig<Settings> = {
+  settings: {
+    after: {
+      defaultValue: undefined,
+      storageKey: 'after',
+      type: union([undefinedType, string]),
     },
-    {
-      key: 'before',
-      type: { baseType: BaseType.String },
+    before: {
+      defaultValue: undefined,
+      storageKey: 'before',
+      type: union([undefinedType, string]),
     },
-    {
+    groupBy: {
       defaultValue: GroupBy.Day,
-      key: 'groupBy',
       storageKey: 'groupBy',
-      type: { baseType: BaseType.String },
+      type: union([literal(GroupBy.Day), literal(GroupBy.Month)]),
     },
-  ],
-  storagePath: 'cluster/historical-usage',
+  },
+  storagePath: 'cluster-historical-usage',
 };
 
 export default config;
